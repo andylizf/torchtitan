@@ -206,19 +206,21 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         history. Write it here: ``conv_state[idx]`` is ``(conv_dim, state_len)``
         holding the last ``state_len`` PRE-conv inputs, oldest at index 0 -- exactly
         what vLLM's ``causal_conv1d_fn`` stores and ``causal_conv1d_update`` reads.
-        Sequences shorter than ``state_len`` are left zero-padded on the left. The
-        per-sequence boundaries come from the prefill ``cu_seqlens`` (a small host
-        sync, acceptable on this parity/debug path).
+        Sequences shorter than ``state_len`` are left zero-padded on the left.
+        Vectorized (no ``.tolist()``/python loop -> no per-layer GPU->CPU sync):
+        gather each segment's last ``state_len`` PRE-conv inputs and scatter into
+        ``conv_state[state_idx]``.
         """
-        starts = cu_seqlens[:-1].tolist()
-        ends = cu_seqlens[1:].tolist()
-        idxs = state_idx.tolist()
-        for i, (s, e) in enumerate(zip(starts, ends)):
-            slot = conv_state[idxs[i]]
-            slot.zero_()
-            take = min(e - s, state_len)
-            if take > 0:
-                slot[:, state_len - take :] = mixed_qkv_TC[e - take : e].transpose(0, 1)
+        starts = cu_seqlens[:-1]  # [n_seq]
+        ends = cu_seqlens[1:]  # [n_seq]
+        # token index for window pos j (0=oldest): end - state_len + j
+        offs = torch.arange(state_len, device=mixed_qkv_TC.device)
+        tok_idx = ends[:, None] - state_len + offs[None, :]  # [n_seq, state_len]
+        in_seg = tok_idx >= starts[:, None]  # False = left-pad (short segment)
+        gathered = mixed_qkv_TC[tok_idx.clamp_min(0)]  # [n_seq, state_len, conv_dim]
+        gathered = gathered * in_seg[:, :, None].to(gathered.dtype)
+        # conv_state[idx] is (conv_dim, state_len) -> transpose the gathered window.
+        conv_state[state_idx] = gathered.transpose(1, 2).to(conv_state.dtype)
 
     # ---- forward -----------------------------------------------------------
     def forward(
