@@ -614,7 +614,7 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             else:
                 initial_state = ssm_state[state_idx].transpose(-1, -2).contiguous()
                 initial_state[~has_initial_state] = 0
-            # STEP 2 (MSL-style migration): eager fp32 gate + RAW q/k with in-kernel
+            # STEP 2 (own-kernel migration): eager fp32 gate + RAW q/k with in-kernel
             # l2norm + GVA head-expand, matching the trainer -- instead of vLLM's
             # fused_post_conv_prep (which rounds the l2norm in a different kernel).
             # The gate depends only on a/b (state-independent), so this applies to

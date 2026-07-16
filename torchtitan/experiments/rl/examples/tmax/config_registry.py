@@ -30,12 +30,13 @@ from __future__ import annotations
 import dataclasses
 import os
 
+from torchtitan.config import DebugConfig
+
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
-from torchtitan.config import DebugConfig
 from torchtitan.experiments.rl.controller import Controller, ValidationConfig
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
     _CKPT_DIR,
@@ -208,7 +209,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # Buffer size (run-ahead groups), DECOUPLED from the staleness cap above.
         # Unset = coupled ((off+1)*num_groups). SWE_MAX_ACTIVE_GROUPS enlarges the
         # buffer (more concurrent rollouts -> less trainer starvation) while keeping
-        # SWE_OFFPOLICY_STEPS as the stale-drop cap (msl/rl mean_age vs max_age).
+        # SWE_OFFPOLICY_STEPS as the stale-drop cap (max-age vs mean-age staleness).
         max_active_rollout_groups=(
             int(os.environ["SWE_MAX_ACTIVE_GROUPS"])
             if os.environ.get("SWE_MAX_ACTIVE_GROUPS")
