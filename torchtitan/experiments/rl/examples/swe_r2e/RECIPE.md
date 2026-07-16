@@ -2,9 +2,8 @@
 
 How to train a Qwen3 coding agent (Claude Code in a Daytona sandbox) on R2E-Gym
 with GRPO/DAPO in torchtitan's async RL loop, "fast and good". Written 2026-06-27
-after porting swe_r2e to the async loop (PR #3642) and studying three reference
-recipes: **Tmax** (arXiv 2606.23321, AllenAI, github.com/hamishivi/tmax),
-Meta-internal **msl/rl** (`genai/msl/rl/projects/agents/experiments/coding`), and
+after porting swe_r2e to the async loop (PR #3642) and studying two reference
+recipes: **Tmax** (arXiv 2606.23321, AllenAI, github.com/hamishivi/tmax) and
 **slime** (`examples/coding_agent_rl`).
 
 ## TL;DR
@@ -75,22 +74,22 @@ mast_rl/submit_swe.sh`.
 
 ## Recipe knobs: ours vs the references
 
-| Knob | titan (now) | Tmax (paper) | msl/rl | slime |
-|---|---|---|---|---|
-| reward | binary | binary outcome-only | binary (mult. judge x len, floor 0.5) | binary |
-| group size | 16 | **32** | **128-256** | 8 |
-| prompts/step | 8 | 8 | 16-32 | 1 |
-| soft filter (drop zero-std) | yes | yes | yes (zvf 1e-3 + PassRateFilter) | - |
-| data curriculum | **none (random 4.5k)** | data axes + graded verifiers | **pass-rate band 20-70%** | none |
-| loss | DAPO clip 0.2/0.28 | DAPO + **DPPO mask** | REINFORCE + logprob-corr 0.003 | GRPO+KL 0.001+clip 0.2/0.28+**TIS** |
-| off-policy stability | clip only | **DPPO** (mask train/infer logprob disagreement) | sampler/trainer fwd penalty | TIS |
-| KL | 0 | ~0 (rely on group norm) | - | 0.001 low-var |
-| context | 24576 | **65536** | - | 32k-96k |
-| max_tokens/turn | 4096 | 16384 | - | 8192-32768 |
-| async off-policy steps | 2 | fully async | **16-32** | sync (colocated) |
-| lm_head precision | fp32 | fp32 | - | fp32 |
-| steps | 40 | 500 | - | - |
-| warm start | none | **SFT on successful rollouts** | - | none |
+| Knob | titan (now) | Tmax (paper) | slime |
+|---|---|---|---|
+| reward | binary | binary outcome-only | binary |
+| group size | 16 | **32** | 8 |
+| prompts/step | 8 | 8 | 1 |
+| soft filter (drop zero-std) | yes | yes | - |
+| data curriculum | **none (random 4.5k)** | data axes + graded verifiers | none |
+| loss | DAPO clip 0.2/0.28 | DAPO + **DPPO mask** | GRPO+KL 0.001+clip 0.2/0.28+**TIS** |
+| off-policy stability | clip only | **DPPO** (mask train/infer logprob disagreement) | TIS |
+| KL | 0 | ~0 (rely on group norm) | 0.001 low-var |
+| context | 24576 | **65536** | 32k-96k |
+| max_tokens/turn | 4096 | 16384 | 8192-32768 |
+| async off-policy steps | 2 | fully async | sync (colocated) |
+| lm_head precision | fp32 | fp32 | fp32 |
+| steps | 40 | 500 | - |
+| warm start | none | **SFT on successful rollouts** | none |
 
 ## CRITICAL empirical finding (2026-06-27): full R2E starves the trainer
 
@@ -103,7 +102,8 @@ dropped by the soft filter**, so mixed (gradient-bearing) groups are <3% of grou
 The batcher waits for `num_groups_per_train_step` *surviving* groups, so it never
 fills -> the trainer starves -> no learning. (~2% overall pass rate but clustered,
 not spread.) This is the concrete proof that **binary RL on unfiltered SWE data does
-not train** -- exactly why Tmax/msl/rl filter data to a learnable pass-rate band.
+not train** -- exactly why Tmax and similar recipes filter data to a learnable
+pass-rate band.
 
 Two fixes:
 - **Quick (online): `num_groups_per_train_step=1`** -- fire a step on each mixed
@@ -119,9 +119,9 @@ Two fixes:
 
 **P0 -- data curriculum (the biggest lever for "reward rises").** Binary reward only
 learns from groups with mixed reward; at ~1% pass on random R2E tasks almost every
-group is all-fail and gets dropped, so there is ~no gradient. Both msl/rl
-(`0313_universal_pass_rate/20-70`) and Tmax (graded verifiers) get their signal from
-*learnable* data. Build a one-time rejection-sampling pass: run the base 32B k=8-16x
+group is all-fail and gets dropped, so there is ~no gradient. Both a pass-rate band
+(e.g. 20-70%) and Tmax (graded verifiers) get their signal from *learnable* data.
+Build a one-time rejection-sampling pass: run the base 32B k=8-16x
 on each R2E task, keep tasks with solve-rate ~10-70%, drop trivial and
 currently-unsolvable. This raises the surviving-group fraction far more than any
 group-size change. (Interim: `r2e_train.jsonl` (47) / `r2e_solvable.jsonl` (7) are
@@ -131,12 +131,12 @@ small hand-curated stand-ins; the 4.5k subset is unfiltered and too sparse.)
 the dominant async failure is train/inference (vLLM vs FSDP trainer) logprob
 mismatch causing collapse. Tmax's **DPPO** masks tokens where the two logprobs
 disagree (binary TV-divergence approx); slime uses **TIS** (truncated importance
-sampling); msl adds a 0.003 sampler/trainer forward-logprob penalty. We have neither
-(only DAPO clip). Adding DPPO-style masking to `DAPOLoss` is cheap (both logprobs are
-already on hand for the ratio) and is what lets Tmax run group-32 fully-async stably.
+sampling). We have neither (only DAPO clip). Adding DPPO-style masking to `DAPOLoss`
+is cheap (both logprobs are already on hand for the ratio) and is what lets Tmax run
+group-32 fully-async stably.
 
-**P1 -- bigger group size.** Tmax 32, msl 128-256, us 16. For a fixed rollout budget
-the *number* of surviving groups is ~constant, but bigger groups give lower-variance
+**P1 -- bigger group size.** Tmax 32, us 16 (some recipes go 128-256). For a fixed
+rollout budget the *number* of surviving groups is ~constant, but bigger groups give lower-variance
 advantage baselines and stronger per-group gradients. Raise toward 32 once the data
 curriculum lands (so the extra siblings aren't wasted on all-fail tasks).
 
@@ -153,7 +153,7 @@ batches before fwd (soft filter already drops groups; ensure no empty fwd/bwd);
 CPU-KV-offload so the growing transcript isn't re-prefilled each turn); (d) keep
 generators saturated -- ~2x as many in-flight rollouts as generator capacity.
 
-**P2 -- SFT warm-start.** Tmax and msl both SFT on successful rollouts before RL. If
+**P2 -- SFT warm-start.** Tmax SFTs on successful rollouts before RL. If
 cold-start pass-rate is ~0 (all groups zero-std), do a short rejection-sampling SFT
 pass to lift the base into the regime where GRPO advantages are non-degenerate. For a
 32B Claude-Code agent this matters less than for small models.
@@ -162,7 +162,7 @@ pass to lift the base into the regime where GRPO advantages are non-degenerate. 
 format/length reward -- under group normalization a stray format reward inflates long
 wrong answers (documented in open-instruct). Shape data + filtering, not the reward.
 
-## Diagnostics to watch (per Tmax/msl)
+## Diagnostics to watch (per Tmax)
 
 `rollout_reward/group_zero_std_frac` (want it falling),
 `training_sample_builder/num_groups_dropped_zero_std`, solved-count per step,
@@ -175,7 +175,5 @@ flatlining while clipfrac / mask-rate spikes.
 
 - Tmax: arXiv 2606.23321; code github.com/hamishivi/tmax (open-instruct `grpo_fast`,
   `Vanillux2Agent/agent.py`, `rl_data/comparison/adapters/r2e_gym.py`).
-- msl/rl: `genai/msl/rl/projects/agents/experiments/coding/rl_v2.py` (zvf,
-  PassRateFilter, pass-rate-band data, multiplicative judge reward).
 - slime: `examples/coding_agent_rl` (binary R2E reward, GRPO+KL+clip 0.2/0.28+TIS).
 - Async RL loop: torchtitan PR #3642; fused-QKV FSDP fix: PR #3807 (over #3714).

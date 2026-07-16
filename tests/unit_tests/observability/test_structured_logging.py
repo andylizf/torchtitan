@@ -1264,7 +1264,7 @@ class TestGenerateGanttTrace:
         """Two tasks on the same source whose spans overlap in non-LIFO order.
 
         A_start, B_start, A_end, B_end — if the pair-by-(source, tid) scheme
-        were used (as msl does), the first _end would pop B (last in stack)
+        were used, the first _end would pop B (last in stack)
         and mispair. Keying the stack on task_name isolates the two tasks.
         """
         records = [

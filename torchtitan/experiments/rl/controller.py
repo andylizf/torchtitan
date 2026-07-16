@@ -177,7 +177,7 @@ class AsyncLoopConfig(Configurable.Config):
     num_groups_per_train_step. Set LARGER to DECOUPLE run-ahead from staleness -- more
     rollouts generate concurrently (higher generator utilization, less trainer
     starvation) WITHOUT loosening max_offpolicy_steps: groups still stale-drop at the
-    batcher once they age past it. This is msl/rl's mean_age (queue size) vs max_age
+    batcher once they age past it. This is a mean_age (queue size) vs max_age
     (drop) decoupling. Generator max_num_seqs scales with this (the max rollouts on the
     fly); it is a ceiling, not a KV reservation, so vLLM pages KV on demand and admits
     fewer / preempts when tight rather than OOM-ing."""

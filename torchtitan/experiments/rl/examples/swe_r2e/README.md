@@ -5,8 +5,8 @@ Post-train a Qwen model on R2E-Gym SWE tasks where the rollout is driven by an
 sandbox (Daytona). Every model turn the agent makes is captured as on-policy
 training data, graded by the R2E hidden tests, and fed to GRPO.
 
-This is the TorchTitan analogue of THUDM/slime's `examples/coding_agent_rl` and
-Meta msl/rl's "virtual actor + reverse-proxy" pattern.
+This is the TorchTitan analogue of THUDM/slime's `examples/coding_agent_rl`
+(a virtual actor + reverse-proxy pattern).
 
 ## How a rollout works
 
@@ -42,8 +42,8 @@ grading, and training path are agent-agnostic.
 ## Layout
 
 `harness/` (shared, agent-agnostic) is split along three orthogonal axes -- WHERE
-code runs, HOW the model is served, WHICH agent runs -- mirroring Meta msl/rl's
-container-resource / wire-proxy / per-agent split:
+code runs, HOW the model is served, WHICH agent runs -- a container-resource /
+wire-proxy / per-agent split:
 
 - `harness/sandbox/`: `base.py` (the `Sandbox` contract + `make_sandbox` factory),
   `daytona.py` (backend), `bridge.py` (Daytona fs file-relay).

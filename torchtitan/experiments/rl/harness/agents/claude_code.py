@@ -47,7 +47,7 @@ SWE_BOOT_RETRIES = int(os.environ.get("SWE_BOOT_RETRIES", "2"))
 # Claude Code CDN (GCS): the self-contained ``linux-x64/claude`` binary is fetched
 # from here INSIDE the sandbox (its own fast egress) instead of uploaded from the
 # controller. ``{CDN}/stable`` -> version; ``{CDN}/{version}/linux-x64/claude`` ->
-# binary. Mirrors genai/msl/rl claude_code_download.sh.
+# binary. Matches the official Claude Code CDN layout.
 CLAUDE_CDN = os.environ.get(
     "SWE_CLAUDE_CDN",
     "https://storage.googleapis.com/"

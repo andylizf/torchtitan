@@ -17,8 +17,8 @@ then keeps only tasks inside a learnability BAND (default 0.2 < pass_rate < 0.7,
 exclusive), discarding all-fail (0.0 -- too hard or a broken env, no learning
 signal) and all-solve (1.0 -- too easy, zero within-group variance), and writes a
 curated JSONL that is a drop-in for ``SWER2EDataset`` (the original row plus
-``metadata.pass_rate`` / ``resolved`` / ``num_samples``). This mirrors the msl/rl
-recipe (rejection-sampling pass@k -> instance_summary -> exclusive-band filter);
+``metadata.pass_rate`` / ``resolved`` / ``num_samples``). This follows a
+rejection-sampling pass@k -> instance_summary -> exclusive-band filter recipe;
 the band IS the curriculum that unstarves binary-reward GRPO on sparse R2E.
 
 The reader is format-agnostic: it accepts any directory of JSON files that each
@@ -189,7 +189,7 @@ def apply_band(
 ) -> BandResult:
     """Keep source rows whose pass_rate is strictly inside (pass_min, pass_max).
 
-    Bounds are EXCLUSIVE (msl/rl convention): all-fail (<=pass_min) and all-solve
+    Bounds are EXCLUSIVE: all-fail (<=pass_min) and all-solve
     (>=pass_max) are dropped. Each kept row gets ``metadata.pass_rate`` /
     ``resolved`` / ``num_samples`` stamped for provenance and step-2 inspection.
     """
@@ -228,7 +228,7 @@ def write_jsonl(rows: list[dict], path: str) -> None:
 
 
 def write_instance_summary(stats: dict[str, TaskStats], path: str) -> None:
-    """Write the msl-style instance_summary.csv (instance_id, resolved, num_samples,
+    """Write the instance_summary.csv (instance_id, resolved, num_samples,
     pass_rate) for the full sampled pool, so the band can be re-derived offline."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
