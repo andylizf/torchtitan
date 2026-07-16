@@ -9,7 +9,9 @@ Verified `num_diff = 0`, `max |logprob diff| = 0.0` (was ~9 nats before) for BOT
 - the PACKED path (= real training): trainer packs 2 samples in one row
   (`cu_seqlens=[0, la, n]`), generator serves them as 2 requests -- bitwise per segment.
 
-Opt-in via `TT_GDN_WRAPPER_EXTERNAL_FLA=1` on the `torchtitan_wrapper` generator.
+Opt-in via `VLLMGenerator.Config.gdn_trainer_parity = True` on the `torchtitan_wrapper`
+generator (calls `set_trainer_parity_fla`). Prefill is bitwise; decode continues from the
+seeded paged state (correct, not bitwise -- see caveats).
 
 ---
 
@@ -88,12 +90,12 @@ The vLLM generator normally fuses gate + l2norm + split into one Triton kernel
 (`fused_post_conv_prep`), which rounds differently. Reproduce the eager form instead:
 
 ```python
-# generator: gdn_vllm_unified.py  (VLLMGatedDeltaNetCore._run_prefill_chunk)
+# generator: gdn_vllm_unified.py  (VLLMGatedDeltaNetCore parity path, _fla_recurrence)
 g = (
     -torch.exp(A_log.float())
-    * F.softplus(a_THv[start:end].float() + dt_bias.float())
+    * F.softplus(a_slice_THv.float() + dt_bias.float())
 ).unsqueeze(0)                                   # [1, T, HV], fp32, log-space
-beta = torch.sigmoid(b_THv[start:end].float()).unsqueeze(0)
+beta = torch.sigmoid(b_slice_THv.float()).unsqueeze(0)
 ```
 
 `a_THv`/`b_THv` are the raw `in_proj_a`/`in_proj_b` outputs (== trainer `xa`/`xb`).
@@ -132,10 +134,14 @@ conv_out_TC = _external_fla_causal_conv1d(
 conv_out_TC = (conv_out_TC[0] if isinstance(conv_out_TC, tuple) else conv_out_TC).squeeze(0)
 ```
 
-> Match the path the trainer ACTUALLY takes. For a genuine single non-packed sequence the
-> trainer uses eager `F.pad+F.conv1d+F.silu` (cu_seqlens=None); to bitwise-match THAT, use
-> the same eager conv with `cu_seqlens=None` on the chunk instead. Using the wrong one (fla
-> conv vs a non-packed trainer, or vice-versa) makes the max WORSE, not better.
+> The trainer now unifies single-sample rows onto this SAME fla+cu path: a single sample
+> yields `cu_seqlens=[0, L]` (see `_cu_seqlens_from_positions`), so a single-sequence
+> prefill is ALSO fla conv + fla chunk and bitwise-matches the per-request generator.
+> (Previously single-sample rows used eager `F.pad+F.conv1d+F.silu` with `cu_seqlens=None`,
+> a DIFFERENT kernel -- so the generator's fla+cu did NOT match a single non-packed row,
+> and a sample's logprobs depended on whether it got packed with others. Unifying the
+> trainer removed that gap. Under TP/SP the single-segment path falls back to non-packed,
+> since parity only matters under FSDP where the generator runs TP=1.)
 
 ### 2d. L2 norm: in-kernel (both sides)
 
@@ -216,8 +222,16 @@ Progression on the trace (short 1500-tok single-seq prefill, `wrapper + varlen +
 
 `bitwise_equal = True`, `num_diff = 0/1499`.
 
-PACKED path (real training; trainer packs 2 x 900-tok samples, generator serves 2 requests):
-`seg A num_diff 0/899 max 0.0`, `seg B num_diff 0/899 max 0.0` -- bitwise per segment.
+PACKED path (real training; trainer packs 2 x 2500-tok samples, generator serves 2 requests
+in one prefill batch, `cu=[0,2500,5000]`): `seg A num_diff 0/2499 max 0.0`,
+`seg B num_diff 0/2499 max 0.0` -- bitwise per segment, **provided prefill is not chunked**
+(see caveats: `max_num_batched_tokens >= max_model_len`).
+
+DECODE continuation (prefill 1500-tok, then decode 48 tokens): generated text is coherent,
+decode logprobs finite, and decode(stream) vs the generator's own 2nd-pass prefill has
+`max 0.35, ratio>2: 0` -- i.e. the seeded paged conv_state + fla decode is numerically
+consistent (a broken seed would blow up the first decode token). decode is NOT bitwise vs
+trainer prefill (recurrent vs chunk; inherent, see caveats).
 
 Every component matters: swapping only the recurrence, or only the gate, only tightens
 the chaotic tail; bitwise needs all of conv + gate + l2norm + recurrence + state layout
@@ -227,12 +241,16 @@ aligned AND the backbone batch-invariant (num_splits=1 + BI mm).
 
 ## 4. How to run
 
+In code, enable the parity path via the generator config
+`VLLMGenerator.Config.gdn_trainer_parity = True` (torchtitan_wrapper only), which calls
+`gdn_vllm_unified.set_trainer_parity_fla(True)` and raises `max_num_batched_tokens` to
+`max_model_len`. The repro (`repro_bi_gdn.py`) calls `set_trainer_parity_fla(True)` directly:
+
 ```bash
 # generator = torchtitan_wrapper, varlen attn, batch-invariant, external-fla GDN
-SWE_GEN_BACKEND=torchtitan_wrapper \
-TT_GDN_WRAPPER_EXTERNAL_FLA=1 \
-REPRO_MAX_PROMPT_TOKENS=1500 \
-  bash /home/yichuan/run_bi_gdn.sh        # -> repro_bi_gdn.py, prints gen-vs-trainer diff
+SWE_GEN_BACKEND=torchtitan_wrapper bash /home/yichuan/run_bi_gdn.sh   # single-seq prefill diff
+REPRO_PACKED=1 bash /home/yichuan/run_bi_gdn.sh                       # PACKED (real training) -> bitwise 0
+REPRO_DECODE=1 bash /home/yichuan/run_bi_gdn.sh                       # prefill -> decode continuation
 ```
 
 Needs `batch_invariant_ops` installed:
@@ -242,24 +260,40 @@ Needs `batch_invariant_ops` installed:
 
 ## 5. Caveats / scope
 
-- **Packed AND single-seq both verified.** The default recipe here uses the PACKED variant
-  (fla `causal_conv1d` + `cu_seqlens`-driven chunk) = the real-training path, verified bitwise
-  per-segment. (A genuine single non-packed sequence needs the eager `F.conv1d` + `cu_seqlens=None`
-  variant instead -- match whichever path the trainer takes.)
-- **Prefill only.** Decode carries the recurrent state through the paged cache and uses a
-  per-token recurrent kernel (not chunk); that path (and the ~5e-4 chunk-vs-recurrent
-  algorithmic gap) is not aligned here.
-- **Slow parity path.** `F.conv1d` + fla chunk + `num_splits=1` + no cudagraph is a
+- **Packed AND single-seq both bitwise.** The trainer runs the fla+cu path for BOTH multi-sample
+  packed rows AND single-sample rows (`_cu_seqlens_from_positions` returns `[0, L]` for a single
+  sample), matching the per-request generator. Verified: PACKED 2x2500 seg A/B num_diff 0/2499;
+  single-seq [prompt+gen] 2nd-pass-prefill vs trainer num_diff 0/48. (Under TP/SP the single
+  segment falls back to non-packed -- parity only applies under FSDP, generator TP=1.)
+- **Decode continues, but is NOT bitwise vs trainer prefill.** Prefill SEEDS the paged
+  conv_state (last `kw-1` pre-conv inputs, oldest first -- exactly what vLLM's
+  `causal_conv1d_fn` writes / `causal_conv1d_update` reads), then decode runs vLLM's
+  single-step conv update + the external fla chunk on length-1 segments. This keeps
+  generation correct and continuous, but decode builds the recurrent state incrementally
+  (chunk(prompt) + per-step) whereas the trainer builds it in one contiguous chunk -- a
+  different fp reduction order, so decode logprobs can't be bitwise with trainer prefill.
+  This matters because the training old-logprob comes from DECODE (`generator.py` streaming
+  logprobs -> `dppo.py generator_logprobs`), so prefill bitwise parity does NOT by itself
+  remove the DPPO ratio tail on response tokens.
+- **No chunked prefill.** Bitwise parity needs each request prefilled as ONE contiguous fla
+  chunk. vLLM's default `max_num_batched_tokens=2048` splits longer prefills; continuation
+  chunks (`has_initial_state=True`) fall back to the vendored kernels (non-bitwise). The
+  generator sets `max_num_batched_tokens = max_model_len` when `gdn_trainer_parity` is on so
+  a fresh request is not chunked (the scheduler may still chunk to co-run with decodes).
+- **Slow parity path.** external fla conv + fla chunk + `num_splits=1` + no cudagraph is a
   correctness/debug mode, not the fast serving path.
 - **Practical alternative:** for the fast path, tolerate the residual with DPPO
   `ratio_cap=2` (the "fat tail" max is a non-poisoning outlier anyway). Bitwise parity is
   the correctness ceiling; ratio_cap is the shipping mitigation.
 
 ## Related code
-- `gdn_vllm_unified.py` — `VLLMGatedDeltaNetCore`, the `TT_GDN_WRAPPER_EXTERNAL_FLA` path.
+- `gdn_vllm_unified.py` — `VLLMGatedDeltaNetCore`, the `gdn_trainer_parity` path
+  (`set_trainer_parity_fla`); prefill on external fla + `_seed_conv_state` for decode.
 - `gdn_vllm_titan.py` — `TitanFLAGatedDeltaNet` (vllm_native + `TT_GDN_UNIFIED_KERNEL`), the
   `state_v_first` state-layout fix.
 - `torchtitan/models/qwen3_5/model.py` — the trainer `GatedDeltaNet` / `GatedDeltaKernel`
-  (the reference implementation).
+  (the reference implementation). `_cu_seqlens_from_positions` now returns `[0, L]` for a
+  single sample so the trainer runs fla+cu for single-sample rows too (unified with the
+  per-request generator; TP/SP single-segment falls back to non-packed).
 - `torchtitan/models/common/attention.py`, `experiments/rl/models/attention.py` —
   `num_splits=1` under batch-invariant mode.

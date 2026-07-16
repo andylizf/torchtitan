@@ -440,6 +440,10 @@ class PolicyTrainer(Actor, Configurable):
                 generator_logprobs=generator_logprobs,
                 advantages=advantages,
                 loss_mask=loss_mask,
+                # Chunked along seq like the other tensors; used only by the
+                # SWE_DEBUG_MAX_LOGDIFF dump to record per-token positions (which
+                # reset to 0 at each packed-sample boundary).
+                positions=positions,
             )
         logger.info(f"[trainer] dp_rank={self.dp_rank}: loss done")
 

@@ -33,9 +33,13 @@ def _max_abs_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def test_cu_seqlens_from_positions():
-    # Single sample (positions [0..L-1]) has one boundary -> None -> old path.
+    # Single sample (positions [0..L-1]) -> one segment [0, L], so the trainer runs
+    # the SAME fla+cu path as the per-request generator (was None / non-packed).
     single = torch.arange(50).unsqueeze(0)
-    assert _cu_seqlens_from_positions(single) is None
+    assert _cu_seqlens_from_positions(single).tolist() == [0, 50]
+
+    # Positions that never reset to 0 (degenerate) -> None -> non-packed.
+    assert _cu_seqlens_from_positions(torch.arange(5, 15).unsqueeze(0)) is None
 
     # Packed [0..29, 0..39] -> boundaries at 0, 30 plus the total length 70.
     packed = torch.cat([torch.arange(30), torch.arange(40)]).unsqueeze(0)
@@ -85,12 +89,14 @@ def test_gated_delta_net_packing_matches_separate():
         out_fix = gdn(x_packed, pos_packed)  # packed WITH positions (the fix)
         out_bug = gdn(x_packed, None)  # packed WITHOUT positions (contaminated)
 
-    # The fix: the packed second sample matches its standalone output to bf16.
+    # The fix: standalone AND packed both use the fla+cu path, so the packed second
+    # sample matches its standalone output to bf16.
     fix_b = _max_abs_diff(out_fix[:, len_a:], out_b)
     bug_b = _max_abs_diff(out_bug[:, len_a:], out_b)
     assert fix_b < 1e-3, f"packed+positions should match separate, got {fix_b}"
     # Without positions the recurrent state / conv bleed -> clearly contaminated.
-    assert bug_b > 10 * fix_b, f"expected contamination without positions, got {bug_b}"
+    assert bug_b > 1e-2, f"expected contamination without positions, got {bug_b}"
 
-    # The first packed sample is unaffected either way (nothing precedes it).
-    assert _max_abs_diff(out_bug[:, :len_a], out_a) == 0.0
+    # First sample: nothing precedes it, so packed(+pos) seg A == standalone A (both
+    # fla+cu) to bf16.
+    assert _max_abs_diff(out_fix[:, :len_a], out_a) < 1e-3

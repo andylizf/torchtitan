@@ -277,4 +277,22 @@ class TrainingSampleBuilder(Configurable):
 
             prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 
+        # TITO / prefix-dedup invariant: every completion token is trained EXACTLY
+        # once, and no prompt/env token leaks into the trained set. So the number of
+        # loss_mask=True tokens across all packed samples must equal the sum of the
+        # per-turn completion lengths. If turn n+1's prompt (which by design contains
+        # turn n) were re-counted into the trained set, masked_total would exceed
+        # completion_total and this fires -- the exact double-training bug we guard.
+        masked_total = sum(sum(s.loss_mask) for s in training_samples)
+        completion_total = sum(
+            len(t.completion_token_ids) for t in rollout.turns if t.completion_token_ids
+        )
+        assert masked_total == completion_total, (
+            f"trained-token mismatch for rollout {rollout.group_id}/"
+            f"rollout={rollout.rollout_id}: loss_mask=True count {masked_total} != "
+            f"sum(per-turn completion lengths) {completion_total}. A turn's prompt "
+            "(which contains earlier turns) leaked into the trained set, or the "
+            "prefix-dedup broke (TITO mismatch)."
+        )
+
         return training_samples

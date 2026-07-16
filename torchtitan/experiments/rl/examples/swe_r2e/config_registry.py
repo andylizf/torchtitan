@@ -479,13 +479,20 @@ def rl_grpo_qwen3_5_9b_swe_r2e() -> Controller.Config:
         # set SWE_GEN_BACKEND=torchtitan_wrapper for the unified GDN path (TT's FLA
         # recurrence in vLLM's paged state). Keep GDN temporal state fp32 by
         # default: vLLM "auto" follows model dtype (bf16), while the trainer FLA
-        # recurrent state is fp32. Cudagraph/prefix default off (eager,
-        # non-prefix-cached) until the unified cache-copy paths are validated.
+        # recurrent state is fp32. Cudagraph default off (eager).
         cudagraph=VLLMCudagraphConfig(
             enable=(os.environ.get("SWE_GEN_CUDAGRAPH", "0") == "1"),
             mode="FULL_DECODE_ONLY",
         ),
-        enable_prefix_caching=(os.environ.get("SWE_GEN_PREFIX_CACHE", "0") == "1"),
+        # Prefix caching default ON: vLLM auto-selects align-mode mamba prefix
+        # caching for the GDN model (native or the unified wrapper), caching the
+        # conv/ssm state at block boundaries -- a big win for multi-turn agents
+        # whose prompt grows each turn. Stale state across weight syncs is dropped
+        # by reset_prefix_cache_on_weight_sync=True. Validated: on the torchtitan
+        # wrapper, a reused prefix reproduces the no-cache output token-for-token
+        # (isolated repro) and the full async RL loop runs stably (alphabet_sort
+        # 2-step e2e). Set SWE_GEN_PREFIX_CACHE=0 to disable.
+        enable_prefix_caching=(os.environ.get("SWE_GEN_PREFIX_CACHE", "1") == "1"),
         # DP-8 x TP-1 = 8 TP-1 engines per 8-GPU host (matches the paper's
         # vllm_num_engines 48 across 6 gen hosts). TP-4 used only 4 of 8 GPUs/host
         # (world_size 4) -- half idle. TP-1 fits the 9B (~18GB) on one GPU and gives

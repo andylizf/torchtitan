@@ -758,6 +758,14 @@ class VLLMGenerator(Actor, Configurable):
         """Extra engine ``additional_config`` forwarded to vLLM on the
         ``vllm_native`` path, e.g. ``{"gdn_prefill_backend": "triton"}``."""
 
+        gdn_trainer_parity: bool = False
+        """torchtitan_wrapper only: run the GDN conv + recurrence on the trainer's
+        external fla kernels so the generator's PREFILL logprobs match the trainer's
+        bitwise (kills the GDN train/infer logprob tail on freshly-prefilled tokens).
+        Decode continues from the paged state but is NOT bitwise (no trainer decode
+        equivalent). Slower than the vendored path; forces generator cudagraph off
+        (the external fla chunk decode is not cudagraph-capturable). Default off."""
+
         enable_prefix_caching: bool | None = None
         """vLLM prefix caching. ``None`` uses vLLM's default, which is OFF for
         hybrid GDN models (``is_prefix_caching_supported`` is False). Set ``True``
@@ -902,6 +910,38 @@ class VLLMGenerator(Actor, Configurable):
                 checkpoint_config=config.checkpoint,
                 override=config.override,
             )
+            if config.gdn_trainer_parity:
+                # Route the wrapper GDN core through the trainer's external fla conv +
+                # chunk so PREFILL logprobs match the trainer bitwise. Read at
+                # forward time (no-op unless the model has a GDN core).
+                from torchtitan.experiments.rl.models.gdn_vllm_unified import (
+                    set_trainer_parity_fla,
+                )
+
+                set_trainer_parity_fla(True)
+                # The external fla chunk decode is not cudagraph-capturable
+                # (host-side chunk indexing), so force generator cudagraph off.
+                if config.cudagraph.enable:
+                    logger.warning(
+                        "[gdn-unified] disabling generator cudagraph "
+                        "(gdn_trainer_parity fla decode is not cudagraph-capturable)"
+                    )
+                    config = replace(
+                        config,
+                        cudagraph=replace(config.cudagraph, enable=False),
+                    )
+                    self.config = config
+                # Prefix caching and bitwise parity are mutually exclusive: a reused
+                # prefix arrives as a continuation (has_initial_state=True) that the
+                # parity path routes to the vendored fallback (correct, NOT bitwise).
+                # Parity needs each request prefilled fresh, so disable prefix cache.
+                if config.enable_prefix_caching:
+                    logger.warning(
+                        "[gdn-unified] disabling prefix caching "
+                        "(gdn_trainer_parity needs fresh full prefills for bitwise parity)"
+                    )
+                    config = replace(config, enable_prefix_caching=False)
+                    self.config = config
             # Set vLLM environment variables from config before any vLLM init.
             # first_attention handles hybrid models (linear + full attention).
             attn_config = model_spec.model.first_attention
@@ -960,6 +1000,14 @@ class VLLMGenerator(Actor, Configurable):
         )
         engine_kwargs["max_model_len"] = model_spec.model.max_seq_len
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
+        if config.gdn_trainer_parity:
+            # Prefill bitwise parity needs each request prefilled as ONE contiguous
+            # fla chunk (matching the trainer). vLLM's default max_num_batched_tokens
+            # (2048) chunks longer prefills into continuation chunks that fall back to
+            # the vendored kernels (non-bitwise). Raise it to max_model_len so a fresh
+            # request is not chunked (the scheduler may still chunk to co-run with
+            # decodes; that residual falls back, still correct).
+            engine_kwargs["max_num_batched_tokens"] = model_spec.model.max_seq_len
         # None -> vLLM default (OFF for hybrid GDN); True forces experimental
         # 'align'-mode prefix caching so multi-turn rollouts reuse the shared prefix.
         if config.enable_prefix_caching is not None:

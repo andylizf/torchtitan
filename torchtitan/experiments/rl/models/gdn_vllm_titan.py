@@ -28,13 +28,10 @@ Opt-in via env ``TT_GDN_UNIFIED_KERNEL=1`` (default off -> vLLM-native, easy
 fallback). Call ``register_titan_gdn()`` before the vLLM engine is built.
 """
 
-import os
-
 import torch
 import torch.nn.functional as F
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
 )
 
 from torchtitan.tools.logging import logger
@@ -179,35 +176,17 @@ class TitanFLAGatedDeltaNet(QwenGatedDeltaNetAttention):
         if m.has_initial_state is not None:
             initial_state[~m.has_initial_state] = 0
 
-        # PARITY EXPERIMENT (TT_GDN_RECURRENT_PREFILL=1): route prefill through the
-        # SAME fused_recurrent kernel decode uses, matching a trainer that also runs
-        # fla_fused_recurrent. Recurrent is boundary-exact (token-by-token), so it
-        # removes both the chunk-vs-recurrent algorithmic split AND the vLLM
-        # 2048-chunk WY-boundary re-seed. Slow (per-token) -> parity/debug only.
-        if os.environ.get("TT_GDN_RECURRENT_PREFILL") == "1":
-            out, final_state = _fla_fused_recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=m.non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            out, final_state = _fla_chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=m.non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-            )
+        out, final_state = _fla_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=m.non_spec_query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+        )
         ssm_state[state_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
         core_attn_out[:n] = out.squeeze(0)
 

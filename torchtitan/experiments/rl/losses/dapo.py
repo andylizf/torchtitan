@@ -62,6 +62,9 @@ class DAPOLoss(BaseLoss):
         generator_logprobs: torch.Tensor,
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
+        positions: (
+            torch.Tensor | None
+        ) = None,  # noqa: ARG002 -- accepted for chunked-loss parity; DAPO ignores it
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the per-token clip-higher surrogate loss.
 

@@ -37,7 +37,7 @@ def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
 
 
 def _cu_seqlens_from_positions(positions: torch.Tensor) -> torch.Tensor | None:
-    """Build FLA ``cu_seqlens`` from packed ``positions`` ([B, L], restart at 0 per sample).
+    """Build FLA ``cu_seqlens`` from ``positions`` ([B, L], restart at 0 per sample).
 
     The RL batcher packs several training samples into one row and restarts
     ``positions`` at 0 at each sample (and each pad region). For linear-attention
@@ -47,8 +47,13 @@ def _cu_seqlens_from_positions(positions: torch.Tensor) -> torch.Tensor | None:
     sequence, so every boundary (row start, within-row sample start, pad start) is a
     ``positions == 0`` index. Mirrors open-instruct's ``_compute_packing_kwargs``.
 
-    Returns None when there is a single sample (no interior boundary), so the
-    non-packed / generator path is unchanged (bitwise identical).
+    A single sample (one boundary at 0) yields ``[0, total]`` -- one varlen segment --
+    so the trainer runs the SAME fla+cu path as the per-request generator (which
+    serves each rollout as its own request), i.e. a sample's logprobs no longer
+    depend on whether it happened to be packed with others. One segment is
+    mathematically identical to the non-packed path; callers fall back to non-packed
+    under TP (see ``GatedDeltaNet.forward``). Returns None only when ``positions``
+    never resets to 0 (does not happen for training rows, which start at 0).
     """
     # MRoPE passes 3D positions [B, L, 3]; the sample boundary is the reset of the
     # temporal component. Text (RL) positions are 2D [B, L].
@@ -57,8 +62,8 @@ def _cu_seqlens_from_positions(positions: torch.Tensor) -> torch.Tensor | None:
     flat = positions.reshape(-1)
     total = flat.numel()
     starts = torch.nonzero(flat == 0, as_tuple=False).squeeze(-1).to(torch.int32)
-    # No interior boundary (single sample starting at 0) -> let callers skip varlen.
-    if starts.numel() <= 1:
+    # No boundary at all (positions never reset to 0) -> cannot build cu -> non-packed.
+    if starts.numel() == 0:
         return None
     end = torch.tensor([total], device=positions.device, dtype=torch.int32)
     return torch.cat([starts, end])
@@ -486,10 +491,22 @@ class GatedDeltaNet(Module):
 
         # When several samples are packed into a row, `positions` restarts at 0 per
         # sample; derive cu_seqlens so the conv AND recurrent state reset at each
-        # boundary. None (single sample / generator decode) -> unchanged path.
+        # boundary. A single sample yields cu=[0, L] (one segment) so the trainer
+        # uses the SAME fla+cu path as the per-request generator (bitwise parity).
         cu_seqlens = (
             _cu_seqlens_from_positions(positions) if positions is not None else None
         )
+        # One segment ([0, L]) is mathematically identical to the non-packed path, and
+        # the varlen fla path can't shard activations; under TP/SP (DTensor activations)
+        # fall back to the non-packed (local_map) path. Parity only matters under FSDP
+        # (the generator runs TP=1). Multi-segment (real packing) keeps the fla+cu path
+        # and its existing non-TP assertion.
+        if (
+            cu_seqlens is not None
+            and cu_seqlens.numel() == 2
+            and isinstance(x, DTensor)
+        ):
+            cu_seqlens = None
 
         # Shapes:
         #   xq, xk: (bs, seqlen, n_key_heads * key_head_dim)

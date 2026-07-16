@@ -72,7 +72,13 @@ class PerHostProvisioner:
         self.next_gpu += num_gpus
 
         def _bootstrap():
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+            # RL_GPU_OFFSET lets a local run use a GPU subset of a shared host that
+            # does not start at absolute index 0 (e.g. GPUs 0-3 busy -> offset=4).
+            # Default 0 = unchanged behavior.
+            offset = int(os.environ.get("RL_GPU_OFFSET", "0"))
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(g + offset) for g in gpu_ids
+            )
             # TODO: Remove once Monarch/PyTorch fixes concurrent import during unpickling.
             import torch  # noqa: F401
 

@@ -33,26 +33,23 @@ Legend (tensor shape suffixes, this module):
 
 from __future__ import annotations
 
-import os
-
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
-# External fla (the SAME package the trainer uses). Opt-in via
-# TT_GDN_WRAPPER_EXTERNAL_FLA=1 so the wrapper's GDN prefill runs the trainer's
-# exact chunk + conv kernels (the vendored vLLM fla is a different copy -> a parity
-# gap). We align the GENERATOR to the TRAINER because only the trainer's fla path
-# has a backward (training needs it), so the trainer's kernels are the reference.
+# External fla (the SAME package the trainer uses). Enabled via the generator
+# config flag ``gdn_trainer_parity`` (-> set_trainer_parity_fla) so the wrapper's
+# GDN prefill runs the trainer's exact chunk + conv kernels (the vendored vLLM fla
+# is a different copy -> a parity gap). We align the GENERATOR to the TRAINER
+# because only the trainer's fla path has a backward (training needs it), so the
+# trainer's kernels are the reference.
 from fla.modules.convolution import causal_conv1d as _external_fla_causal_conv1d
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule as _external_fla_chunk_gated_delta_rule,
 )
-
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
-
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops import (
@@ -74,6 +71,20 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+# Set once at engine-build time from VLLMGenerator.Config.gdn_trainer_parity (see
+# generator.py). When True the wrapper GDN core runs the trainer's external fla
+# conv + chunk kernels on the prefill path so the generator's PREFILL logprobs
+# match the trainer's bitwise; decode continues from the paged state. Default off
+# -> vLLM vendored kernels (faster). See GDN_BITWISE_PARITY.md.
+_TRAINER_PARITY_FLA = False
+
+
+def set_trainer_parity_fla(enable: bool) -> None:
+    """Route the wrapper GDN prefill through the trainer's external fla kernels."""
+    global _TRAINER_PARITY_FLA
+    _TRAINER_PARITY_FLA = enable
+    logger.info(f"[gdn-unified] wrapper GDN trainer-parity fla kernels = {enable}")
+
 
 class VLLMGatedDeltaNetCore(Module, MambaBase):
     """Paged-cache GDN core for the unified (torchtitan_wrapper) path.
@@ -87,9 +98,18 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
     Non-speculative decoding only (asserts otherwise). Requires the generator
     cudagraph off until this custom core is captured and validated separately.
 
-    TODO(qwen3.5-gdn-unified-prefix-cache): validate vLLM align-mode prefix
-    caching before enabling prefix cache for this unified GDN path.
+    Prefix caching: validated. With ``enable_prefix_caching=True`` vLLM auto-selects
+    ``mamba_cache_mode='align'`` for this wrapper (it does not declare
+    ``supports_mamba_prefix_caching``), caching the conv/ssm state at block
+    boundaries. A repro (generate a prompt twice) confirmed the second run reuses
+    the cached state (num_cached_tokens > 0) and reproduces the no-cache output
+    token-for-token, so the cached state is reconstructed correctly. NOTE: a reused
+    prefix arrives as a continuation (``has_initial_state=True``); under the
+    trainer-parity path that hits the vendored fallback (correct, not bitwise), so
+    prefix caching and bitwise parity are mutually exclusive on the reused tokens.
     """
+
+    _logged_parity = False
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -171,6 +191,35 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             self.num_spec,
         )
 
+    def _seed_conv_state(
+        self,
+        conv_state: torch.Tensor,
+        mixed_qkv_TC: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        state_idx: torch.Tensor,
+        state_len: int,
+    ) -> None:
+        """Seed the paged conv_state for freshly-prefilled sequences.
+
+        The trainer-parity prefill runs the external fla conv (which does NOT touch
+        vLLM's paged conv_state), so a subsequent decode step would read stale
+        history. Write it here: ``conv_state[idx]`` is ``(conv_dim, state_len)``
+        holding the last ``state_len`` PRE-conv inputs, oldest at index 0 -- exactly
+        what vLLM's ``causal_conv1d_fn`` stores and ``causal_conv1d_update`` reads.
+        Sequences shorter than ``state_len`` are left zero-padded on the left. The
+        per-sequence boundaries come from the prefill ``cu_seqlens`` (a small host
+        sync, acceptable on this parity/debug path).
+        """
+        starts = cu_seqlens[:-1].tolist()
+        ends = cu_seqlens[1:].tolist()
+        idxs = state_idx.tolist()
+        for i, (s, e) in enumerate(zip(starts, ends)):
+            slot = conv_state[idxs[i]]
+            slot.zero_()
+            take = min(e - s, state_len)
+            if take > 0:
+                slot[:, state_len - take :] = mixed_qkv_TC[e - take : e].transpose(0, 1)
+
     # ---- forward -----------------------------------------------------------
     def forward(
         self,
@@ -249,31 +298,205 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         assert m.non_spec_query_start_loc.numel() >= num_seq + 1
         assert nsi.numel() >= num_seq
 
+        if _TRAINER_PARITY_FLA and not VLLMGatedDeltaNetCore._logged_parity:
+            VLLMGatedDeltaNetCore._logged_parity = True
+            logger.info(
+                "[gdn-unified] GDN prefill on trainer external fla kernels "
+                "(bitwise vs trainer); decode continues from the seeded paged state"
+            )
+
+        # split helper (nested; used by both the trainer-parity and vendored paths)
+        out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
+
+        def _split_qkv(
+            mixed_qkv_slice_TC: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            num_tokens = mixed_qkv_slice_TC.shape[0]
+            q_1THkDk = (
+                mixed_qkv_slice_TC[:, : self.key_dim]
+                .contiguous()
+                .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
+            )
+            k_1THkDk = (
+                mixed_qkv_slice_TC[:, self.key_dim : 2 * self.key_dim]
+                .contiguous()
+                .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
+            )
+            v_1THvDv = (
+                mixed_qkv_slice_TC[:, 2 * self.key_dim :]
+                .contiguous()
+                .view(1, num_tokens, self.num_v_heads, self.head_v_dim)
+            )
+            return q_1THkDk, k_1THkDk, v_1THvDv
+
+        # ================= trainer-parity path (external fla) =================
+        # Fresh prefill matches the trainer op-for-op (external fla conv + external
+        # fla chunk with initial_state=None), so the generator's PREFILL logprobs are
+        # bitwise-identical to the trainer's. Decode has no trainer equivalent (the
+        # trainer never decodes): it only has to stay correct and CONTINUE from the
+        # paged state, so it uses vLLM's single-step conv update + the external fla
+        # chunk on length-1 segments. Fresh prefill SEEDS the paged conv_state so the
+        # next decode step reads valid history. Chunked-prefill / prefix-cache
+        # continuation has no clean trainer match -> vendored fallback (correct, not
+        # bitwise). See GDN_BITWISE_PARITY.md.
+        if _TRAINER_PARITY_FLA:
+            state_len = self.conv_kernel_size - 1
+            num_decode_tokens = m.num_decode_tokens
+
+            def _fla_recurrence(
+                conv_out_slice_TC: torch.Tensor,
+                a_slice_THv: torch.Tensor,
+                b_slice_THv: torch.Tensor,
+                state_idx: torch.Tensor,
+                cu_seqlens: torch.Tensor,
+                initial_state: torch.Tensor | None,
+            ) -> torch.Tensor:
+                # Eager fp32 gate (model.py:514-517), RAW q/k with in-kernel l2norm,
+                # GVA head-expand (model.py:243-247), then the trainer's EXTERNAL fla
+                # chunk -- gate + l2norm + recurrence all match the trainer.
+                q, k, v = _split_qkv(conv_out_slice_TC)
+                if q.shape[2] != v.shape[2]:
+                    rep = v.shape[2] // q.shape[2]
+                    q = q.repeat_interleave(rep, dim=2)
+                    k = k.repeat_interleave(rep, dim=2)
+                g = (
+                    -torch.exp(A_log.float())
+                    * F.softplus(a_slice_THv.float() + dt_bias.float())
+                ).unsqueeze(0)
+                beta = torch.sigmoid(b_slice_THv.float()).unsqueeze(0)
+                out, final_state = _external_fla_chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                # Paged ssm_state is value-first [.., HV, V, K]; fla state is key-first
+                # [.., HV, K, V]. transpose(-1, -2) maps between them (also correct when
+                # head_k_dim != head_v_dim). transpose_state_layout stays False (trainer
+                # default) so the compute path matches; transpose the storage instead.
+                ssm_state[state_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
+                return out
+
+            # ---- decode segment (front slice): keep generation correct only ----
+            if num_decode_tokens > 0:
+                dec_state_idx = nsi[:num_decode_tokens]
+                dec_conv_TC = causal_conv1d_update(
+                    mixed_qkv_TC[:num_decode_tokens],
+                    conv_state,
+                    conv_weight,
+                    conv_bias,
+                    self.activation,
+                    conv_state_indices=dec_state_idx,
+                    validate_data=False,
+                )
+                dec_init = ssm_state[dec_state_idx].transpose(-1, -2).contiguous()
+                out_1THvDv[:, :num_decode_tokens] = _fla_recurrence(
+                    dec_conv_TC,
+                    a_THv[:num_decode_tokens],
+                    b_THv[:num_decode_tokens],
+                    dec_state_idx,
+                    m.non_spec_query_start_loc[: m.num_decodes + 1],
+                    dec_init,
+                )
+
+            # ---- prefill segment (back slice): bitwise-matches the trainer ----
+            if m.num_prefills > 0:
+                assert m.prefill_query_start_loc is not None
+                assert m.prefill_state_indices is not None
+                pf_start = num_decode_tokens
+                pf_state_idx = m.prefill_state_indices
+                pf_cu = m.prefill_query_start_loc
+                pf_mixed_TC = mixed_qkv_TC[pf_start:n]
+                has_init = m.prefill_has_initial_state
+                if has_init is not None and bool(has_init.any()):
+                    # Continuation (chunked prefill): no clean trainer equivalent ->
+                    # vLLM paged conv + cached-state chunk (correct, not bitwise for
+                    # these tokens). Scope the conv to the PREFILL slice only
+                    # (pf_mixed_TC + prefill-rebased query_start_loc / state_indices /
+                    # has_initial_state, which vLLM builds as the num_decodes: tail).
+                    # The decode segment above already ran causal_conv1d_update on the
+                    # decode tokens; re-running conv over the FULL batch here would
+                    # advance the decode sequences' conv_state a SECOND time and
+                    # corrupt their later decode steps. metadata=None -> the kernel
+                    # builds its grid from the prefill-only query_start_loc.
+                    pf_conv_TC = causal_conv1d_fn(
+                        pf_mixed_TC.transpose(0, 1),
+                        conv_weight,
+                        conv_bias,
+                        activation=self.activation,
+                        conv_states=conv_state,
+                        has_initial_state=has_init,
+                        cache_indices=pf_state_idx,
+                        query_start_loc=pf_cu,
+                    ).transpose(0, 1)
+                    pf_init = ssm_state[pf_state_idx].clone()
+                    pf_init[~has_init] = 0
+                    q, k, v, g, beta = fused_post_conv_prep(
+                        conv_output=pf_conv_TC,
+                        a=a_THv[pf_start:n],
+                        b=b_THv[pf_start:n],
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        num_k_heads=self.num_k_heads,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        apply_l2norm=True,
+                        output_g_exp=False,
+                    )
+                    out, final_state = _vllm_chunk_gated_delta_rule(
+                        q.unsqueeze(0),
+                        k.unsqueeze(0),
+                        v.unsqueeze(0),
+                        g.unsqueeze(0),
+                        beta.unsqueeze(0),
+                        initial_state=pf_init,
+                        output_final_state=True,
+                        cu_seqlens=pf_cu,
+                        chunk_indices=m.chunk_indices,
+                        chunk_offsets=m.chunk_offsets,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    out_1THvDv[:, pf_start:n] = out
+                    ssm_state[pf_state_idx] = final_state.to(ssm_state.dtype)
+                else:
+                    # Fresh full prefill = the trainer's packed path. external fla conv
+                    # + external fla chunk (initial_state=None, NOT a zero tensor: fla's
+                    # USE_INITIAL_STATE constexpr branches differently) match the trainer.
+                    pf_conv_TC = _external_fla_causal_conv1d(
+                        pf_mixed_TC.unsqueeze(0),
+                        weight=conv_weight,
+                        bias=conv_bias,
+                        activation="silu",
+                        cu_seqlens=pf_cu,
+                    )
+                    if isinstance(pf_conv_TC, tuple):
+                        pf_conv_TC = pf_conv_TC[0]
+                    pf_conv_TC = pf_conv_TC.squeeze(0)
+                    out_1THvDv[:, pf_start:n] = _fla_recurrence(
+                        pf_conv_TC,
+                        a_THv[pf_start:n],
+                        b_THv[pf_start:n],
+                        pf_state_idx,
+                        pf_cu,
+                        None,
+                    )
+                    # Seed paged conv_state so a later decode step continues correctly.
+                    self._seed_conv_state(
+                        conv_state, pf_mixed_TC, pf_cu, pf_state_idx, state_len
+                    )
+
+            out_BTHvDv[:, :n] = out_1THvDv[:, :n]
+            return out_BTHvDv
+
+        # ===================== vendored path (flag off) =======================
         # 1) Causal conv against the paged conv_state (reuse vLLM's kernels). A
         # batch with any prefill uses the varlen fn; pure-decode uses the update.
-        if (
-            os.environ.get("TT_GDN_WRAPPER_EXTERNAL_FLA") == "1"
-            and m.num_prefills > 0
-            and m.num_decodes == 0
-        ):
-            # Prefill-parity (PACKED / cu_seqlens path = real training): the trainer's
-            # packed GatedDeltaNet conv uses fla causal_conv1d with cu_seqlens
-            # (model.py:372-397), resetting at each sample boundary. Match it: run the
-            # trainer's EXTERNAL fla causal_conv1d with the per-request cu_seqlens
-            # instead of vLLM's paged causal_conv1d_fn. Fused q|k|v depthwise conv ==
-            # the trainer's 3 separate depthwise convs (channel-wise identical).
-            # fresh-prefill only; does NOT write the paged conv_state (decode needs it).
-            conv_out_TC = _external_fla_causal_conv1d(
-                mixed_qkv_TC.unsqueeze(0),  # [1, n, C] channels-last (as the trainer)
-                weight=conv_weight,  # [C, kw]
-                bias=conv_bias,
-                activation="silu",
-                cu_seqlens=m.non_spec_query_start_loc,
-            )
-            if isinstance(conv_out_TC, tuple):
-                conv_out_TC = conv_out_TC[0]
-            conv_out_TC = conv_out_TC.squeeze(0)  # [n, C]
-        elif m.num_prefills > 0:
+        if m.num_prefills > 0:
             conv_out_TC = causal_conv1d_fn(
                 mixed_qkv_TC.transpose(0, 1),
                 conv_weight,
@@ -300,29 +523,6 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         # decode tokens use a recurrent update path, while prefill tokens use the
         # chunk kernel. This avoids routing mixed-batch length-1 decodes through
         # the prefill kernel and keeps the unified path closer to native GDN.
-        out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
-
-        def _split_qkv(
-            mixed_qkv_slice_TC: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            num_tokens = mixed_qkv_slice_TC.shape[0]
-            q_1THkDk = (
-                mixed_qkv_slice_TC[:, : self.key_dim]
-                .contiguous()
-                .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
-            )
-            k_1THkDk = (
-                mixed_qkv_slice_TC[:, self.key_dim : 2 * self.key_dim]
-                .contiguous()
-                .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
-            )
-            v_1THvDv = (
-                mixed_qkv_slice_TC[:, 2 * self.key_dim :]
-                .contiguous()
-                .view(1, num_tokens, self.num_v_heads, self.head_v_dim)
-            )
-            return q_1THkDk, k_1THkDk, v_1THvDv
-
         def _run_decode_sigmoid_update(
             start: int,
             end: int,
@@ -380,76 +580,38 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
                 initial_state.zero_()
             else:
                 initial_state[~has_initial_state] = 0
-            if os.environ.get("TT_GDN_WRAPPER_EXTERNAL_FLA") == "1":
-                # Fully-unified prefill: drop fused_post_conv_prep and reproduce the
-                # trainer op-for-op -- eager fp32 gate (model.py:514-517), RAW q/k with
-                # in-kernel l2norm, GVA head-expand (model.py:243-247), and the trainer's
-                # EXTERNAL fla chunk. So gate + l2norm + recurrence all match the trainer;
-                # only the paged conv upstream remains vLLM's. Transpose the paged [V,K]
-                # state <-> fla's [K,V] (default transpose_state_layout=False, trainer-match).
-                q, k, v = _split_qkv(conv_out_TC[start:end])
-                if q.shape[2] != v.shape[2]:
-                    rep = v.shape[2] // q.shape[2]
-                    q = q.repeat_interleave(rep, dim=2)
-                    k = k.repeat_interleave(rep, dim=2)
-                g = (
-                    -torch.exp(A_log.float())
-                    * F.softplus(a_THv[start:end].float() + dt_bias.float())
-                ).unsqueeze(0)
-                beta = torch.sigmoid(b_THv[start:end].float()).unsqueeze(0)
-                # Match the trainer's PACKED path (real training uses cu_seqlens):
-                #  - cu_seqlens = the per-request query_start_loc (varlen), so the
-                #    chunk resets at sample boundaries exactly like the trainer.
-                #  - initial_state=None (stateless), NOT a zero tensor -- fla's
-                #    USE_INITIAL_STATE constexpr picks a different reduction for
-                #    None vs a real tensor, so a zero tensor is not bitwise-equal.
-                # Fresh-prefill only (guarded by num_decodes==0 + assumed fresh).
-                out, final_state = _external_fla_chunk_gated_delta_rule(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    initial_state=None,
-                    output_final_state=True,
-                    cu_seqlens=m.non_spec_query_start_loc,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                out_1THvDv[:, start:end] = out
-                ssm_state[state_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
-            else:
-                q, k, v, g, beta = fused_post_conv_prep(
-                    conv_output=conv_out_TC[start:end],
-                    a=a_THv[start:end],
-                    b=b_THv[start:end],
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    num_k_heads=self.num_k_heads,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    apply_l2norm=True,
-                    output_g_exp=False,
-                )
-                q = q.unsqueeze(0)
-                k = k.unsqueeze(0)
-                v = v.unsqueeze(0)
-                g = g.unsqueeze(0)
-                beta = beta.unsqueeze(0)
-                out, final_state = _vllm_chunk_gated_delta_rule(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=cu_seqlens,
-                    chunk_indices=m.chunk_indices,
-                    chunk_offsets=m.chunk_offsets,
-                    use_qk_l2norm_in_kernel=False,
-                )
-                out_1THvDv[:, start:end] = out
-                ssm_state[state_idx] = final_state.to(ssm_state.dtype)
+            q, k, v, g, beta = fused_post_conv_prep(
+                conv_output=conv_out_TC[start:end],
+                a=a_THv[start:end],
+                b=b_THv[start:end],
+                A_log=A_log,
+                dt_bias=dt_bias,
+                num_k_heads=self.num_k_heads,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                apply_l2norm=True,
+                output_g_exp=False,
+            )
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+            g = g.unsqueeze(0)
+            beta = beta.unsqueeze(0)
+            out, final_state = _vllm_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=m.chunk_indices,
+                chunk_offsets=m.chunk_offsets,
+                use_qk_l2norm_in_kernel=False,
+            )
+            out_1THvDv[:, start:end] = out
+            ssm_state[state_idx] = final_state.to(ssm_state.dtype)
 
         num_decode_tokens = m.num_decode_tokens
         if m.num_decodes > 0:

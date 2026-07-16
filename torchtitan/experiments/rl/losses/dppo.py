@@ -23,6 +23,8 @@ generator (vLLM) logprobs ARE the behavior/old policy, matching the recipe's
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -30,12 +32,20 @@ import torch
 from torchtitan.components.loss import BaseLoss, compute_logprobs
 from torchtitan.config import CompileConfig
 
+logger = logging.getLogger(__name__)
+
 # Clamp |log(pi_theta/pi_old)| before exp() so a large generator/trainer
 # logprob mismatch cannot overflow exp() to inf/NaN.
 _MAX_LOG_RATIO = 10.0
 # Clamp logprobs before exp() when forming the Bernoulli probabilities for the
 # divergence (mirrors open-instruct's compute_binary_divergence).
 _MIN_LOGPROB_FOR_PROB = -30.0
+
+# SWE_DEBUG_MAX_LOGDIFF=1 debug: only log/dump chunks whose worst |diff| exceeds
+# this, and show a +/-window of tokens around the argmax. Fixed constants (one env
+# switch, no extra knobs).
+_DEBUG_MAX_LOGDIFF_THRESH = 1.0
+_DEBUG_MAX_LOGDIFF_WINDOW = 8
 
 
 class DPPOLoss(BaseLoss):
@@ -88,6 +98,7 @@ class DPPOLoss(BaseLoss):
         generator_logprobs: torch.Tensor,
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
+        positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the DPPO (unclipped ratio + divergence-mask) surrogate loss.
 
@@ -153,6 +164,20 @@ class DPPOLoss(BaseLoss):
         with torch.no_grad():
             diff = trainer_logprobs - generator_logprobs
             diff_for_metrics = torch.where(loss_mask, diff, torch.zeros_like(diff))
+            # Debug (SWE_DEBUG_MAX_LOGDIFF=1): locate the worst |diff| token, log its
+            # token id + both logprobs + a local window, and dump the full per-token
+            # arrays (labels/diff/loss_mask/logprobs) so the max can be inspected as a
+            # heat map and reproduced. Off by default; threshold-gated so only large
+            # maxima log. Loss is not compiled, so the Python/.item() path is safe.
+            if os.environ.get("SWE_DEBUG_MAX_LOGDIFF", "0") == "1":
+                self._debug_max_logdiff(
+                    diff,
+                    diff_for_metrics,
+                    loss_mask,
+                    labels,
+                    trainer_logprobs,
+                    positions,
+                )
             masked_ratio = ratio * loss_mask
             # KL(vllm_sampling || local_trainer) via Schulman k1/k3 estimators on the
             # sampled tokens (matches open-instruct debug/vllm_local_kl_*). Sampling
@@ -210,3 +235,83 @@ class DPPOLoss(BaseLoss):
                 ).sum() / loss_denominator
 
         return loss, metrics
+
+    @staticmethod
+    def _debug_max_logdiff(
+        diff: torch.Tensor,
+        diff_for_metrics: torch.Tensor,
+        loss_mask: torch.Tensor,
+        labels: torch.Tensor,
+        trainer_logprobs: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ) -> None:
+        """Inspect the worst |trainer_logprob - generator_logprob| token.
+
+        Enabled by the single switch SWE_DEBUG_MAX_LOGDIFF=1. Only acts when the
+        chunk's max |diff| exceeds ``_DEBUG_MAX_LOGDIFF_THRESH`` so routine small
+        diffs are silent. Logs the argmax token id, both logprobs, whether it is
+        trained (loss_mask), and a +/-window of token ids / diffs / mask; and
+        torch.saves the full per-token arrays (labels/diff/loss_mask/trainer_logprobs)
+        under SWE_DUMP_DIR/max_logdiff for an offline heat map + repro. With chunked
+        loss this runs per sequence-chunk, so ``t`` is the offset within the chunk.
+        """
+        absd = diff_for_metrics.abs()
+        mx = float(absd.max())
+        if mx < _DEBUG_MAX_LOGDIFF_THRESH:
+            return
+        flat = int(absd.argmax())
+        seq_len = absd.shape[-1]
+        b, t = flat // seq_len, flat % seq_len
+        w = _DEBUG_MAX_LOGDIFF_WINDOW
+        lo, hi = max(0, t - w), min(seq_len, t + w + 1)
+        gen_lp = float(trainer_logprobs[b, t] - diff[b, t])  # gen = trainer - diff
+        # positions reset to 0 at each packed-sample boundary; report the max
+        # token's own position and its distance to the nearest sample start, so a
+        # boundary state-bleed artifact (pos small / dist ~0) is unambiguous.
+        pos_info = ""
+        if positions is not None:
+            row_pos = positions[b]
+            resets = (row_pos == 0).nonzero(as_tuple=True)[0]
+            dist = int((resets - t).abs().min()) if resets.numel() else -1
+            pos_info = f" pos={int(row_pos[t])} dist_to_sample_start={dist}"
+        logger.warning(
+            "[max_logdiff] |diff|=%.4f at (b=%d,t=%d) token_id=%d "
+            "trainer_lp=%.4f gen_lp=%.4f trained=%s%s | window[%d:%d] "
+            "token_ids=%s diffs=%s mask=%s pos=%s",
+            mx,
+            b,
+            t,
+            int(labels[b, t]),
+            float(trainer_logprobs[b, t]),
+            gen_lp,
+            bool(loss_mask[b, t]),
+            pos_info,
+            lo,
+            hi,
+            labels[b, lo:hi].tolist(),
+            [round(float(x), 3) for x in diff[b, lo:hi]],
+            [int(x) for x in loss_mask[b, lo:hi]],
+            positions[b, lo:hi].tolist() if positions is not None else None,
+        )
+        try:
+            rank = os.environ.get("RANK", "0")
+            base = os.path.join(os.environ.get("SWE_DUMP_DIR", "/tmp"), "max_logdiff")
+            os.makedirs(base, exist_ok=True)
+            path = os.path.join(base, f"maxlogdiff_r{rank}_{flat}.pt")
+            torch.save(
+                {
+                    "labels": labels.detach().cpu(),
+                    "diff": diff.detach().cpu(),
+                    "loss_mask": loss_mask.detach().cpu(),
+                    "trainer_logprobs": trainer_logprobs.detach().cpu(),
+                    "positions": (
+                        positions.detach().cpu() if positions is not None else None
+                    ),
+                    "argmax_bt": (b, t),
+                    "max_absdiff": mx,
+                },
+                path,
+            )
+            logger.warning("[max_logdiff] dumped arrays -> %s", path)
+        except Exception as e:  # noqa: BLE001 -- debug path, never fail the step
+            logger.warning("[max_logdiff] dump failed: %s", e)

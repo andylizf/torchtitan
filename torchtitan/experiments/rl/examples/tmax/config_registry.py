@@ -35,8 +35,11 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
+from torchtitan.config import DebugConfig
 from torchtitan.experiments.rl.controller import Controller, ValidationConfig
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
+    _CKPT_DIR,
+    _qwen3_rl_model_registry,
     _set_max_seq_len,
     rl_grpo_qwen3_5_27b_swe_r2e as _swe_27b,
     rl_grpo_qwen3_5_9b_swe_r2e as _swe_9b,
@@ -331,6 +334,73 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                 batch=dataclasses.replace(
                     config.async_loop.batcher.batch, local_batch_size=_lbsz
                 ),
+            ),
+        )
+    return config
+
+
+def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
+    """Qwen3-4B (DENSE softmax attention) tmax recipe in BATCH-INVARIANT mode.
+
+    A numerics control for the Qwen3.5-9B GDN recipe. It reuses every tmax delta
+    from ``rl_grpo_qwen3_5_9b_tmax`` (TMaxRollouter, group_size 32, off-policy,
+    chunked DPPO loss, 65536 context, preserve_all_thinking) but swaps the model to
+    the DENSE Qwen3-4B (no Gated DeltaNet) and turns on ``batch_invariant`` +
+    ``deterministic`` on BOTH the trainer and the generator.
+
+    The generator runs the SAME torchtitan model inside vLLM
+    (``backend="torchtitan_wrapper"``, not the 9B base's ``vllm_native`` GDN) with
+    matched varlen attention (``num_splits=1`` / FA3) and the fp32 lm_head, so batch
+    invariance makes the trainer and generator per-token logprobs bitwise-identical
+    (see ``tests/test_bitwise_parity.py``). Expectation:
+    ``bit_wise/logprob_diff/{mean,abs_mean,max}`` collapse to ~0 -- isolating how
+    much of the 9B GDN logprob drift is GDN-specific (chunk-parallel train vs
+    recurrent decode) rather than generic batch/kernel nondeterminism.
+
+    Preconditions (all already satisfied by the tmax base): bf16 trainer+generator
+    dtype and no sequence parallel. Batch invariance also requires the reset (not
+    salt) prefix-cache policy, which the generator ``__post_init__`` enforces; the
+    9B tmax base enables salt-KV, so it is turned off here.
+    """
+    _bi = DebugConfig(batch_invariant=True, deterministic=True)
+    config = rl_grpo_qwen3_5_9b_tmax()
+    # DENSE Qwen3-4B (softmax attention, varlen batch-invariant path); fp32 lm_head.
+    config.model_spec = _qwen3_rl_model_registry("4B", attn_backend="varlen")
+    _set_max_seq_len(config.model_spec, _TMAX_9B_CONTEXT)
+    config.hf_assets_path = f"{_CKPT_DIR}/Qwen3-4B"
+    # Dense Qwen3 chat template (the 9B base uses the qwen3.5 renderer).
+    config.renderer = dataclasses.replace(config.renderer, name="qwen3")
+    # Trainer: batch-invariant + deterministic; SP must be off (already is at TP=1).
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        debug=_bi,
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism, enable_sequence_parallel=False
+        ),
+    )
+    # Generator: run the SAME torchtitan model in vLLM (not vllm_native GDN), drop the
+    # GDN-only engine config + mamba cache dtype, and use the reset (not salt)
+    # prefix-cache policy required under batch invariance.
+    config.generator = dataclasses.replace(
+        config.generator,
+        backend="torchtitan_wrapper",
+        vllm_additional_config={},
+        mamba_ssm_cache_dtype="auto",
+        debug=_bi,
+        salt_prefix_cache_on_weight_sync=False,
+        reset_prefix_cache_on_weight_sync=True,
+        reset_running_requests_on_weight_sync=True,
+    )
+    # Diagnostic knob: this control run only measures logprob_diff (independent of
+    # reward), so SWE_DROP_ZERO_STD=0 accepts every finalized group -> step 1 assembles
+    # from the first 8 rollouts instead of waiting for 8 reward-mixed groups (much
+    # faster, since the small 4B yields mostly all-fail groups). Default 1 keeps the
+    # tmax recipe's reward filtering for a faithful training run.
+    if os.environ.get("SWE_DROP_ZERO_STD", "1") != "1":
+        config.async_loop = dataclasses.replace(
+            config.async_loop,
+            training_sample_builder=TrainingSampleBuilder.Config(
+                drop_zero_std_reward_groups=False
             ),
         )
     return config

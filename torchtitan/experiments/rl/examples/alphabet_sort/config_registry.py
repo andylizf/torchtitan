@@ -235,7 +235,13 @@ def rl_grpo_qwen3_5_4b_varlen_unified() -> Controller.Config:
     cfg = rl_grpo_qwen3_5_4b_varlen()
     return dataclasses.replace(
         cfg,
-        generator=dataclasses.replace(cfg.generator, backend="torchtitan_wrapper"),
+        generator=dataclasses.replace(
+            cfg.generator,
+            backend="torchtitan_wrapper",
+            # VLLMGatedDeltaNetCore requires fp32 ssm state (matches the trainer FLA
+            # recurrent state); vLLM "auto" would follow model dtype (bf16).
+            mamba_ssm_cache_dtype="float32",
+        ),
     )
 
 
