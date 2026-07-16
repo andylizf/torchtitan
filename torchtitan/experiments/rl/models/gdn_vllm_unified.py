@@ -496,7 +496,35 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         # ===================== vendored path (flag off) =======================
         # 1) Causal conv against the paged conv_state (reuse vLLM's kernels). A
         # batch with any prefill uses the varlen fn; pure-decode uses the update.
-        if m.num_prefills > 0:
+        # STEP 3: a PURE-FRESH prefill batch (no decodes, no continuation) uses the
+        # trainer's fla conv (bitwise-aligned) + seeds the paged conv_state for a
+        # later decode step; mixed/continuation keep vLLM's paged conv kernels.
+        _pf_has_init = m.prefill_has_initial_state
+        _pure_fresh_prefill = (
+            m.num_prefills > 0
+            and m.num_decodes == 0
+            and (_pf_has_init is None or not bool(_pf_has_init.any()))
+        )
+        if _pure_fresh_prefill:
+            conv_out_TC = _external_fla_causal_conv1d(
+                mixed_qkv_TC.unsqueeze(0),
+                weight=conv_weight,
+                bias=conv_bias,
+                activation="silu",
+                cu_seqlens=m.prefill_query_start_loc,
+            )
+            if isinstance(conv_out_TC, tuple):
+                conv_out_TC = conv_out_TC[0]
+            conv_out_TC = conv_out_TC.squeeze(0)
+            # fla conv is stateless -> seed the paged conv_state so decode continues.
+            self._seed_conv_state(
+                conv_state,
+                mixed_qkv_TC,
+                m.prefill_query_start_loc,
+                m.prefill_state_indices,
+                self.conv_kernel_size - 1,
+            )
+        elif m.num_prefills > 0:
             conv_out_TC = causal_conv1d_fn(
                 mixed_qkv_TC.transpose(0, 1),
                 conv_weight,
@@ -574,30 +602,35 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         ) -> None:
             if end <= start:
                 return
-            initial_state = ssm_state[state_idx]
-            initial_state = initial_state.clone()
-            if has_initial_state is None:
-                initial_state.zero_()
+            # STEP 3: fresh -> initial_state=None. fla's USE_INITIAL_STATE is a
+            # triton constexpr (+ autotune key): None and an all-zero tensor
+            # dispatch DIFFERENT compiled kernels, so a zero tensor is NOT bitwise
+            # with the trainer's None. Continuation carries the paged state
+            # (value-first [.., HV, V, K] -> transpose to fla key-first [.., HV, K, V]).
+            if has_initial_state is None or not bool(has_initial_state.any()):
+                initial_state = None
             else:
+                initial_state = ssm_state[state_idx].transpose(-1, -2).contiguous()
                 initial_state[~has_initial_state] = 0
-            q, k, v, g, beta = fused_post_conv_prep(
-                conv_output=conv_out_TC[start:end],
-                a=a_THv[start:end],
-                b=b_THv[start:end],
-                A_log=A_log,
-                dt_bias=dt_bias,
-                num_k_heads=self.num_k_heads,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
-            )
-            q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-            g = g.unsqueeze(0)
-            beta = beta.unsqueeze(0)
-            out, final_state = _vllm_chunk_gated_delta_rule(
+            # STEP 2 (MSL-style migration): eager fp32 gate + RAW q/k with in-kernel
+            # l2norm + GVA head-expand, matching the trainer -- instead of vLLM's
+            # fused_post_conv_prep (which rounds the l2norm in a different kernel).
+            # The gate depends only on a/b (state-independent), so this applies to
+            # BOTH fresh and continuation.
+            q, k, v = _split_qkv(conv_out_TC[start:end])
+            if q.shape[2] != v.shape[2]:
+                rep = v.shape[2] // q.shape[2]
+                q = q.repeat_interleave(rep, dim=2)
+                k = k.repeat_interleave(rep, dim=2)
+            g = (
+                -torch.exp(A_log.float())
+                * F.softplus(a_THv[start:end].float() + dt_bias.float())
+            ).unsqueeze(0)
+            beta = torch.sigmoid(b_THv[start:end].float()).unsqueeze(0)
+            # STEP 1: our fla chunk (same as trainer + parity), not vLLM's vendored
+            # chunk. RAW q/k -> use_qk_l2norm_in_kernel=True; fla derives
+            # chunk_indices from cu_seqlens internally.
+            out, final_state = _external_fla_chunk_gated_delta_rule(
                 q,
                 k,
                 v,
@@ -606,12 +639,10 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
-                chunk_indices=m.chunk_indices,
-                chunk_offsets=m.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=True,
             )
             out_1THvDv[:, start:end] = out
-            ssm_state[state_idx] = final_state.to(ssm_state.dtype)
+            ssm_state[state_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
 
         num_decode_tokens = m.num_decode_tokens
         if m.num_decodes > 0:
