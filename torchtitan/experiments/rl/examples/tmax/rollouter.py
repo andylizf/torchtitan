@@ -228,7 +228,9 @@ class TMaxRollouter(Rollouter):
         # Format errors (malformed tool-calls) per rollout + fraction of rollouts that
         # hit any -- surfaces the vanillux tool-call parse-failure rate on wandb.
         fmt_errors_mean = sum(fmt_errors_list) / len(fmt_errors_list)
-        fmt_error_frac = sum(1.0 for f in fmt_errors_list if f > 0) / len(fmt_errors_list)
+        fmt_error_frac = sum(1.0 for f in fmt_errors_list if f > 0) / len(
+            fmt_errors_list
+        )
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
@@ -373,6 +375,19 @@ class TMaxRollouter(Rollouter):
                 ct for ct in captured if ct.completion_token_ids
             )
         ]
+
+        # Load-bearing invariant: the off-policy age filter (controller) takes
+        # min()/max() over each sample's turn policy versions, which TypeErrors
+        # on None. Over-budget/empty turns carry version None and are dropped
+        # above; assert none leaked so a violation fails here (clear) instead of
+        # deep in the batcher.
+        assert all(
+            t.min_policy_version is not None and t.max_policy_version is not None
+            for t in turns
+        ), (
+            f"{rollout_id}: a trainable RolloutTurn has a None policy version "
+            "(empty-turn drop invariant broke)"
+        )
 
         if not turns:
             status = RolloutStatus.ERROR

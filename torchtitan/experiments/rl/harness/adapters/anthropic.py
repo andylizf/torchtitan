@@ -565,21 +565,35 @@ def _plan_prompt(
         session.tools = _anthropic_tools_to_tool_specs(body.get("tools"))
 
     seen = len(session.prev_msg_hashes)
-    can_append = (
-        session.req_count > 0
-        and bool(session.last_completion_ids)
-        and system_hash == session.prev_system_hash
-        and len(msg_hashes) > seen
-        and msg_hashes[:seen] == session.prev_msg_hashes
-        and isinstance(anth_messages[seen], dict)
+    # Diagnose per-condition (was a single `can_append` boolean) so a mid-trajectory
+    # re-render below can log WHY TITO could not continue. Same logic + short-circuit
+    # order as before: anth_messages[seen] is indexed only after len(msg_hashes) > seen.
+    # rerender_reason == "" means "can_append holds -> try the TITO bridge".
+    if session.req_count == 0:
+        rerender_reason = "first_turn"
+    elif not session.last_completion_ids:
+        rerender_reason = "prev_turn_empty_completion"
+    elif system_hash != session.prev_system_hash:
+        rerender_reason = "system_prompt_changed"
+    elif len(msg_hashes) <= seen:
+        rerender_reason = "no_new_messages"
+    elif msg_hashes[:seen] != session.prev_msg_hashes:
+        rerender_reason = "prior_message_edited"
+    elif not (
+        isinstance(anth_messages[seen], dict)
         and anth_messages[seen].get("role") == "assistant"
-    )
+    ):
+        rerender_reason = "seen_msg_not_assistant_echo"
+    else:
+        rerender_reason = ""
 
-    if can_append:
+    if not rerender_reason:
         new_messages = _translate_messages(anth_messages[seen + 1 :], system=None)
         # bridge_to_next_turn refuses assistant messages; the tail after an echoed
         # assistant turn is tool/user only, but guard anyway.
-        if all(m.get("role") != "assistant" for m in new_messages):
+        if any(m.get("role") == "assistant" for m in new_messages):
+            rerender_reason = "assistant_in_new_messages"
+        else:
             bridged = adapter.renderer.bridge_to_next_turn(
                 previous_prompt_ids=session.last_prompt_ids,
                 previous_completion_ids=session.last_completion_ids,
@@ -590,8 +604,25 @@ def _plan_prompt(
                 session.prev_msg_hashes = msg_hashes
                 session.prev_system_hash = system_hash
                 return list(bridged.token_ids), True
+            rerender_reason = "bridge_returned_none"
 
     # new / wipe: full re-render.
+    # A mid-trajectory re-render (req_count>0) means TITO could not continue this
+    # turn's tokens from the prior turn: the trainer opens a NEW packing branch and
+    # the generator loses prefix-KV reuse for this turn. Training stays correct (the
+    # trained tokens are the raw sampled completion; re-tokenized text enters only
+    # loss-masked), but warn -- a nonzero rate means TITO silently degraded (varying
+    # system prompt, edited history, or an empty prior completion). Expected 0 for a
+    # constant-system, append-only loop (e.g. tmax vanillux).
+    if session.req_count > 0:
+        logger.warning(
+            "[anthropic_adapter] %s turn=%d: mid-trajectory re-render "
+            "(TITO not continued), reason=%s -- trainer branches, generator loses "
+            "prefix-KV for this turn",
+            session.routing_session_id,
+            len(session.turns),
+            rerender_reason,
+        )
     chat = _translate_messages(anth_messages, system=system)
     prompt_ids = adapter.renderer.render_ids(
         chat, tools=session.tools, add_generation_prompt=True

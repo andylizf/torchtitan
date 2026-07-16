@@ -110,9 +110,11 @@ class RolloutWorker(Actor):
                 sampling=self._sampling,
                 renderer=self.renderer,
             )
+            # Preserve rollouter-set group metrics (e.g. tmax nonsubmit_frac /
+            # format_errors); append the standard computed ones, don't overwrite.
             group.metrics = compute_rollout_metrics(
                 prefix="rollout", rollouts=group.rollouts
-            )
+            ) + list(group.metrics)
         return group
 
     def _make_generate_fn(self) -> GenerateFn:

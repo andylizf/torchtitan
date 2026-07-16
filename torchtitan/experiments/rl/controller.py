@@ -973,9 +973,12 @@ class Controller(Configurable):
                             sampling=self._sampling,
                             renderer=self.renderer,
                         )
+                        # Preserve rollouter-set group metrics (e.g. tmax
+                        # nonsubmit_frac / format_errors); append the standard
+                        # computed ones instead of overwriting them.
                         group.metrics = compute_rollout_metrics(
                             prefix="rollout", rollouts=group.rollouts
-                        )
+                        ) + list(group.metrics)
 
                 # save rollout for inspection
                 self.rollout_recorder.record(
