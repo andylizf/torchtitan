@@ -302,6 +302,11 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         )
         out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
 
+        # Batch-independent fp32 gate scalars: hoist out of the per-segment closure
+        # (identical fp32 ops in identical order -> pure CSE, bitwise-unchanged).
+        A_neg_exp = -torch.exp(A_log.float())
+        dt_bias_f = dt_bias.float()
+
         def _recurrence(
             conv_out_TC: torch.Tensor,
             seg: slice,
@@ -321,10 +326,7 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             # This is what makes decode == prefill; the trainer upcasts identically.
             q, k, v = q.float(), k.float(), v.float()
             # fp32 eager gate, identical to the trainer.
-            g = (
-                -torch.exp(A_log.float())
-                * F.softplus(a_THv[seg].float() + dt_bias.float())
-            ).unsqueeze(0)
+            g = (A_neg_exp * F.softplus(a_THv[seg].float() + dt_bias_f)).unsqueeze(0)
             beta = torch.sigmoid(b_THv[seg].float()).unsqueeze(0)
             if has_state:
                 # paged ssm_state is stored [.., V, K]; fla wants [.., K, V].

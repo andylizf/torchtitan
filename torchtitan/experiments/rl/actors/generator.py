@@ -919,12 +919,16 @@ class VLLMGenerator(Actor, Configurable):
                 )
 
                 set_trainer_parity_fla(True)
-                # The external fla chunk decode is not cudagraph-capturable
-                # (host-side chunk indexing), so force generator cudagraph off.
-                if config.cudagraph.enable:
+                # cudagraph capturability depends on which parity decode runs. Under
+                # batch-invariant mode the wrapper uses the recurrent-everywhere decode
+                # (_forward_recurrent_bi: tensor-index gather/scatter + fla triton
+                # causal_conv1d_update + fused_recurrent), which IS FULL_DECODE_ONLY-
+                # capturable and stays bitwise (verified). The non-BI chunk-parity
+                # decode is NOT (host-side chunk indexing), so keep cudagraph off there.
+                if config.cudagraph.enable and not config.debug.batch_invariant:
                     logger.warning(
                         "[gdn-unified] disabling generator cudagraph "
-                        "(gdn_trainer_parity fla decode is not cudagraph-capturable)"
+                        "(non-BI chunk-parity fla decode is not cudagraph-capturable)"
                     )
                     config = replace(
                         config,
