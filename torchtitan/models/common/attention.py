@@ -82,6 +82,87 @@ class VarlenMetadata(NamedTuple):
 AttentionMasksType = dict[str, BlockMask] | BlockMask | VarlenMetadata
 
 
+# FA3 (Hopper) mha_bwd has no deterministic backward kernel for head_dim 256
+# (it raises "Deterministic backward not supported for hdim 256"); it supports
+# head_dim <= 192. Batch-invariant mode sets torch.use_deterministic_algorithms(
+# True) globally, and aten._flash_attention_backward reads that flag in C++ at
+# backward-execution time (no per-call override), so a head_dim-256 model
+# (e.g. Qwen3.5) crashes on the softmax-attention backward.
+_FA3_DETERMINISTIC_BWD_MAX_HEAD_DIM = 192
+
+
+class _VarlenAttnNonDetBwd(torch.autograd.Function):
+    """varlen_attn whose backward runs with deterministic algorithms disabled.
+
+    Batch-invariance is a forward property (the caller already forces
+    num_splits=1), so trainer<->generator forward parity is unaffected; the
+    backward only needs correct gradients, not run-to-run bitwise repro. The
+    determinism flag is toggled entirely inside this Function's backward (with a
+    finally restore), so no other autograd node can run in the disabled window --
+    unlike an identity "sandwich", whose nodes the engine may interleave with
+    FSDP / other-layer backward under the wrong flag. Mirrors the
+    recompute-in-backward idiom of Qwen3.5's _RecurrentFwdChunkBwd.
+    """
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx, q, k, v, cu_seq_q, cu_seq_k, max_q, max_k, scale, window_size, enable_gqa
+    ):
+        ctx.save_for_backward(q, k, v)
+        ctx.cu_seq_q = cu_seq_q
+        ctx.cu_seq_k = cu_seq_k
+        ctx.max_q = max_q
+        ctx.max_k = max_k
+        ctx.scale = scale
+        ctx.window_size = window_size
+        ctx.enable_gqa = enable_gqa
+        with torch.no_grad():
+            return varlen_attn(
+                q,
+                k,
+                v,
+                cu_seq_q,
+                cu_seq_k,
+                max_q,
+                max_k,
+                scale=scale,
+                window_size=window_size,
+                enable_gqa=enable_gqa,
+                num_splits=1,
+            )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_out):
+        q, k, v = ctx.saved_tensors
+        was_on = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        if was_on:
+            torch.use_deterministic_algorithms(False)
+        try:
+            with torch.enable_grad():
+                ins = [t.detach().requires_grad_(True) for t in (q, k, v)]
+                out = varlen_attn(
+                    ins[0],
+                    ins[1],
+                    ins[2],
+                    ctx.cu_seq_q,
+                    ctx.cu_seq_k,
+                    ctx.max_q,
+                    ctx.max_k,
+                    scale=ctx.scale,
+                    window_size=ctx.window_size,
+                    enable_gqa=ctx.enable_gqa,
+                    num_splits=1,
+                )
+                dq, dk, dv = torch.autograd.grad(out, ins, grad_out)
+        finally:
+            if was_on:
+                torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        return dq, dk, dv, None, None, None, None, None, None, None
+
+
 class VarlenAttention(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -167,21 +248,54 @@ class VarlenAttention(Module):
         if out_transform is not None:
             varlen_kwargs["return_aux"] = VarlenAuxRequest(lse=True)
 
+        # FA3 (Hopper) has no deterministic backward for head_dim > 192, so under
+        # batch-invariant mode (which forces deterministic=True) the varlen
+        # backward for head_dim 256 (e.g. Qwen3.5) must run with the global
+        # determinism flag off. Route through a Function that scopes that toggle
+        # to its own backward; the forward is identical (num_splits=1) so
+        # trainer<->generator forward parity is preserved bitwise.
+        use_non_det_bwd = (
+            is_in_batch_invariant_mode()
+            and H > _FA3_DETERMINISTIC_BWD_MAX_HEAD_DIM
+            and torch.version.hip is None
+        )
+        if use_non_det_bwd and out_transform is not None:
+            raise ValueError(
+                "Batch-invariant varlen attention with an LSE epilogue "
+                f"(out_transform) is unsupported for head_dim {H} > "
+                f"{_FA3_DETERMINISTIC_BWD_MAX_HEAD_DIM}: FA3 lacks a deterministic "
+                "backward for this head_dim."
+            )
+
         # FA3 varlen attention takes rank-local metadata tensors.
         # TODO(pianpwk): Move this op contract into pytorch/spmd_types.
         with spmd.no_typecheck():
-            result = varlen_attn(
-                q_TNH,
-                k_TNH,
-                v_TNH,
-                cu_seq_q,
-                cu_seq_k,
-                max_q,
-                max_k,
-                scale=scale,
-                window_size=self.window_size,
-                **varlen_kwargs,
-            )
+            if use_non_det_bwd:
+                result = _VarlenAttnNonDetBwd.apply(
+                    q_TNH,
+                    k_TNH,
+                    v_TNH,
+                    cu_seq_q,
+                    cu_seq_k,
+                    max_q,
+                    max_k,
+                    scale,
+                    self.window_size,
+                    varlen_kwargs.get("enable_gqa", False),
+                )
+            else:
+                result = varlen_attn(
+                    q_TNH,
+                    k_TNH,
+                    v_TNH,
+                    cu_seq_q,
+                    cu_seq_k,
+                    max_q,
+                    max_k,
+                    scale=scale,
+                    window_size=self.window_size,
+                    **varlen_kwargs,
+                )
 
         # varlen_attn returns the packed output (T, N, H), plus the LSE when an
         # out_transform epilogue was requested.
