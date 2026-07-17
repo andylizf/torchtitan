@@ -1024,6 +1024,20 @@ class Controller(Configurable):
                     rollout_group=rollout_group
                 )
 
+            # [buffer trace] classify this completed group's solve status for per-step
+            # visibility. full-solve (all rollouts pass) and not-solve (all fail) groups
+            # are zero-std -> dropped by drop_zero_std; only partial-solve groups train.
+            _rw = [r.reward for r in rollout_group.rollouts if r.reward is not None]
+            _n = len(_rw)
+            _ns = sum(1 for x in _rw if x and x > 0.0)
+            _cls = (
+                "full_solve"
+                if _n and _ns == _n
+                else "not_solve"
+                if _ns == 0
+                else "partial_solve"
+            )
+
             # Stale-drop (take-any safety). take_finalized returns groups in completion
             # order, so a slow straggler generated many steps ago can surface later than
             # the off-policy window allows. Drop it here (release its slot, do not train)
@@ -1042,12 +1056,40 @@ class Controller(Configurable):
                     ts.min_policy_version for ts in samples
                 )
                 if group_age >= self.config.async_loop.max_offpolicy_steps:
+                    logger.info(
+                        "[buffer] complete group_id=%d solved=%d/%d class=%s "
+                        "-> RELEASE(stale_dropped) cur_ver=%d",
+                        rollout_group.group_id,
+                        _ns,
+                        _n,
+                        _cls,
+                        self._trainer_policy_version,
+                    )
                     await group_buffer.release_active_groups(1, reason="stale_dropped")
                     sl.log_trace_scalar({"rollout_buffer/dropped/stale": 1.0})
                     continue
 
             if not training_sample_group.training_samples:
+                logger.info(
+                    "[buffer] complete group_id=%d solved=%d/%d class=%s "
+                    "-> RELEASE(zero_std, dropped) cur_ver=%d",
+                    rollout_group.group_id,
+                    _ns,
+                    _n,
+                    _cls,
+                    self._trainer_policy_version,
+                )
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
+            else:
+                logger.info(
+                    "[buffer] complete group_id=%d solved=%d/%d class=%s "
+                    "-> TRAINABLE cur_ver=%d",
+                    rollout_group.group_id,
+                    _ns,
+                    _n,
+                    _cls,
+                    self._trainer_policy_version,
+                )
 
             # We put a group in. We may get a batch back
             # if there are enough accumulated trainable groups to return one.
@@ -1178,6 +1220,13 @@ class Controller(Configurable):
 
                 # Release one train step's group slots after the pull; the batcher packs exactly
                 # num_groups_per_train_step trainable groups per batch.
+                logger.info(
+                    "[buffer] step %d: RELEASE(trained) %d trainable group slots "
+                    "(this step trained on %d partial-solve groups)",
+                    step,
+                    self.config.async_loop.num_groups_per_train_step,
+                    self.config.async_loop.num_groups_per_train_step,
+                )
                 await self._group_buffer.release_active_groups(
                     self.config.async_loop.num_groups_per_train_step,
                     reason="trained",

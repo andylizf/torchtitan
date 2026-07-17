@@ -42,6 +42,8 @@ Knobs read from env (the launcher sets these; see ``submit_swe_tmax_9b.sh``):
 from __future__ import annotations
 
 import asyncio
+import heapq
+import itertools
 import json
 import logging
 import os
@@ -107,6 +109,101 @@ class _RootSandbox:
         return await self._inner.read_file(sandbox_path, user="root")
 
 
+class _RolloutIssueGate:
+    """Async slot gate that admits work in ascending priority (lowest
+    ``(group_id, rollout_idx)`` first), NOT FIFO, with per-sibling release. It gives
+    open-instruct-style id-ordered issue (low-id groups get generator capacity first
+    and finish fresh), while a straggler holds only its OWN slot -- a later group
+    starts the moment capacity frees, with no wait for any group to fully complete.
+
+    Two admission modes, chosen by the caller from whether a whole group fits:
+
+      - ``acquire_group(group_id, n)`` reserves ``n`` slots ATOMICALLY, so the group's
+        n siblings dispatch together in one wave ("a group goes out in one step").
+        Used when ``capacity >= group_size``.
+      - ``acquire_sibling(priority)`` reserves 1 slot. Used only when
+        ``capacity < group_size``, where a whole group physically cannot run at once
+        (atomic issue is impossible); siblings then go strictly in id order but
+        sub-batched.
+
+    Both share one slot counter, so exactly ``capacity`` siblings run concurrently in
+    either mode; ``release()`` returns one slot per finished sibling. Admission always
+    serves the lowest-priority waiter and STOPS at the first that does not fit (never
+    skipping it), which preserves id order and lets ``acquire_group`` reserve a whole
+    wave -- at the cost of holding up to ``group_size - 1`` slots idle while a wave's
+    worth of slots accumulates (bounded, and pooled across the concurrent groups'
+    releases, so small in practice).
+
+    Single-event-loop only (no threads): asyncio runs coroutine steps serially, so the
+    counter/heap need no lock.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError(f"capacity must be >= 1, got {capacity}")
+        self._capacity = capacity
+        self._available = capacity
+        # Min-heap of (priority, tiebreak, need, future). tiebreak keeps the heap
+        # totally ordered on equal priority (and never compares futures).
+        self._waiters: list[tuple[tuple[int, int], int, int, asyncio.Future]] = []
+        self._tiebreak = itertools.count()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    async def acquire_group(self, group_id: int, n: int) -> None:
+        """Reserve ``n`` slots atomically for a group (sorts before its siblings via
+        the ``-1`` sub-key), so the group's n siblings dispatch as one wave."""
+        await self._acquire((group_id, -1), n)
+
+    async def acquire_sibling(self, priority: tuple[int, int]) -> None:
+        """Reserve a single slot (non-atomic fallback when a group cannot fit)."""
+        await self._acquire(priority, 1)
+
+    async def _acquire(self, priority: tuple[int, int], need: int) -> None:
+        if need > self._capacity:
+            raise ValueError(f"acquire need={need} exceeds capacity={self._capacity}")
+        fut = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiters, (priority, next(self._tiebreak), need, fut))
+        self._try_admit()  # may grant synchronously if this is now the head and fits
+        if fut.done():
+            return
+        try:
+            await fut
+        except asyncio.CancelledError:
+            # Granted-then-cancelled: return the `need` slots we were handed.
+            # Pending-then-cancelled: the dead future is dropped by _try_admit's
+            # done() check, so there is nothing to return.
+            if fut.done() and not fut.cancelled():
+                self._release(need)
+            raise
+
+    def release(self, count: int = 1) -> None:
+        """Return ``count`` slots (one per finished sibling) and admit any waiters
+        that now fit."""
+        self._release(count)
+
+    def _release(self, count: int) -> None:
+        self._available += count
+        self._try_admit()
+
+    def _try_admit(self) -> None:
+        # Grant from the lowest-priority waiter down while it fits; STOP at the first
+        # that does not (do not skip it -> id order + whole-wave reservation).
+        while self._waiters:
+            _, _, need, fut = self._waiters[0]
+            if fut.done():  # cancelled/settled: drop and continue
+                heapq.heappop(self._waiters)
+                continue
+            if self._available >= need:
+                heapq.heappop(self._waiters)
+                self._available -= need
+                fut.set_result(None)
+            else:
+                break
+
+
 class TMaxRollouter(Rollouter):
     """Drives a host-side ReAct agent (as root) in a sandbox per sibling, then runs
     the tmax verifier in that same sandbox."""
@@ -167,8 +264,17 @@ class TMaxRollouter(Rollouter):
         self._max_context_tokens = config.max_context_tokens
         # Whole-rollout wall-clock guard: agent budget + eval + boot buffer.
         self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300
-        # Per-worker rollout-concurrency semaphore (one rollouter per worker proc).
-        self._rollout_sem = asyncio.Semaphore(config.rollout_concurrency)
+        # Per-worker rollout-issue gate (one rollouter per worker proc). Admits work
+        # lowest-(group_id, rollout_idx)-first (not FIFO), so the lowest-id groups get
+        # generator capacity first and finish fresh (open-instruct's id-ordered pool
+        # admission). When a whole group fits (capacity >= group_size) it reserves the
+        # group atomically so its siblings dispatch in one wave; slots release per
+        # sibling, so a straggler never blocks a later group. NOTE: ordering is
+        # per-worker; with a RolloutWorker pool the controller stripes group_ids
+        # round-robin across workers, so each worker orders its own strided subset
+        # (open-instruct's pool is a single shared actor = globally ordered; a global
+        # gate would need cross-process coordination).
+        self._rollout_gate = _RolloutIssueGate(config.rollout_concurrency)
         self._adapter: AnthropicAdapter | None = None
         self._adapter_lock = asyncio.Lock()
 
@@ -196,6 +302,21 @@ class TMaxRollouter(Rollouter):
         """Run + grade one prompt group of terminal-agent rollouts."""
         adapter = await self._ensure_adapter(renderer)
 
+        # Atomic group issue when a whole group fits the gate: reserve group_size slots
+        # in id order so this group's siblings dispatch as one wave, ahead of any
+        # higher-id group. If a group cannot fit (capacity < group_size), fall back to
+        # per-sibling id-ordered admission inside _run_agent_rollout (see gate docs).
+        atomic_issue = self._rollout_gate.capacity >= group_size
+        if atomic_issue:
+            await self._rollout_gate.acquire_group(group_id, group_size)
+        # TODO(async-rl): the group_size reservation is balanced by the per-sibling
+        # release() in each _run_agent_rollout finally. If this coroutine is cancelled
+        # AFTER acquire_group grants but BEFORE the siblings enter their try, the not-yet-
+        # started siblings never release, leaking their slots. Today the only cancel is
+        # full-process shutdown (controller close), where it is harmless (the process
+        # exits). If a per-group mid-flight cancel/timeout is ever added, wrap the
+        # gather in try/finally and release the count of siblings that did not run.
+
         results = await asyncio.gather(
             *(
                 self._run_agent_rollout(
@@ -206,6 +327,7 @@ class TMaxRollouter(Rollouter):
                     rollout_idx=i,
                     sampling=sampling,
                     renderer=renderer,
+                    gate_per_sibling=not atomic_issue,
                 )
                 for i in range(group_size)
             )
@@ -286,33 +408,43 @@ class TMaxRollouter(Rollouter):
         rollout_idx: int,
         sampling: "SamplingConfig",
         renderer: Renderer,
-    ) -> tuple[Rollout, bool]:
+        gate_per_sibling: bool,
+    ) -> tuple[Rollout, bool, int]:
         """Boot a sandbox, run the agent as root, grade the task in place.
 
-        Always returns ``(Rollout, submitted)`` (errors caught + marked terminal) so
-        one bad sibling never fails the whole group. ``submitted`` is whether the agent
-        emitted the submit marker (False on any error / no-submit) -- the caller
-        aggregates it into the group's ``rollout/nonsubmit_frac`` metric.
+        Always returns ``(Rollout, submitted, fmt_errors)`` (errors caught + marked
+        terminal) so one bad sibling never fails the whole group. ``submitted`` is
+        whether the agent emitted the submit marker (False on any error / no-submit);
+        ``fmt_errors`` is the tool-call parse-failure count. The caller aggregates both
+        into the group's ``rollout/nonsubmit_frac`` and ``rollout/format_*`` metrics.
         """
         rollout_id = RolloutTurnID(
             group_id=group_id, rollout_id=rollout_idx, turn_id=0
         ).to_string(include_turn=False)
-        adapter.open_session(
-            rollout_id,
-            generate_fn=generate_fn,
-            sampling=sampling,
-            routing_session_id=rollout_id,
-            max_context_tokens=self._max_context_tokens,
-        )
 
         status = RolloutStatus.ERROR
         reward = 0.0
         error_msg = ""
         submitted = False
         fmt_errors = 0  # total format errors this rollout (from run_vanillux_loop)
-        sem = self._rollout_sem
-        await sem.acquire()
+        # Slot accounting: in atomic mode run_group_rollouts already reserved this
+        # sibling's slot as part of the group's wave, so acquire only in the per-sibling
+        # fallback (capacity < group_size). Either way we release exactly one slot in
+        # the finally, so the group's group_size reservation stays balanced.
+        if gate_per_sibling:
+            await self._rollout_gate.acquire_sibling((group_id, rollout_idx))
         try:
+            # open_session inside the try so its failure still reaches the finally
+            # (release + finish_session): the gate slot -- reserved atomically by
+            # run_group_rollouts in atomic mode, or by acquire_sibling above in the
+            # fallback -- must be released even if open_session raises.
+            adapter.open_session(
+                rollout_id,
+                generate_fn=generate_fn,
+                sampling=sampling,
+                routing_session_id=rollout_id,
+                max_context_tokens=self._max_context_tokens,
+            )
             async with asyncio.timeout(self._guard_sec):
                 # host_loop drives the sandbox with bash directly; it never runs the
                 # Claude Code CLI, so skip the curl-based install (the tmax task
@@ -355,7 +487,7 @@ class TMaxRollouter(Rollouter):
             status = RolloutStatus.ERROR
             error_msg = f"{type(e).__name__}: {e}"
         finally:
-            sem.release()
+            self._rollout_gate.release()
             captured = await adapter.finish_session(rollout_id)
 
         # Drop empty-completion turns so rollout_to_training_samples only sees
@@ -414,6 +546,8 @@ class TMaxRollouter(Rollouter):
             renderer=renderer,
             status=str(status),
             reward=reward,
+            submitted=submitted,
+            fmt_errors=fmt_errors,
             error_msg=error_msg,
         )
         return (
@@ -436,11 +570,18 @@ class TMaxRollouter(Rollouter):
         renderer: Renderer,
         status: str,
         reward: float,
+        submitted: bool = False,
+        fmt_errors: int = 0,
         error_msg: str = "",
     ) -> None:
         """Write a human-readable per-rollout training trace when
-        ``SWE_ROLLOUT_DUMP_DIR`` is set (the tmax task, grade, and every captured
-        turn's decoded completion). Best-effort; never raises into the rollout."""
+        ``SWE_ROLLOUT_DUMP_DIR`` is set. Format mirrors the open-instruct diagnostic
+        trace: a summary header (reward / finish / submitted / num tool calls /
+        response length) followed by the FULL decoded trajectory with the model's
+        actions (``<tool_call>``) and the sandbox outputs (``<tool_response>``)
+        interleaved -- reconstructed from the TITO-bridged prompts (turn N+1's prompt
+        is turn N's prompt+completion + the new tool_response, so the growing prefix
+        recovers each turn's sandbox output). Best-effort; never raises."""
         dump_dir = os.environ.get("SWE_ROLLOUT_DUMP_DIR", "")
         if not dump_dir:
             return
@@ -454,36 +595,65 @@ class TMaxRollouter(Rollouter):
                     return ""
                 return tokenizer.decode(ids, skip_special_tokens=False)
 
-            record = {
-                "rollout_id": rollout_id,
-                "instance_id": sample.instance_id,
-                "image": sample.image,
-                "status": status,
-                "error": error_msg,
-                "reward": reward,
-                "stop_token_ids": list(renderer.get_stop_token_ids()),
-                "num_turns": len(captured),
-                "turns": [
-                    {
-                        "turn": i,
-                        "prompt_tokens": len(ct.prompt_token_ids),
-                        "completion_tokens": len(ct.completion_token_ids),
-                        "finish_reason": ct.finish_reason,
-                        "stop_reason": getattr(ct, "stop_reason", None),
-                        "extends_previous": ct.extends_previous,
-                        "completion_token_ids_tail": list(
-                            ct.completion_token_ids[-16:]
-                        ),
-                        "completion_text": _decode(ct.completion_token_ids),
-                    }
-                    for i, ct in enumerate(captured)
-                ],
-            }
+            # Reconstruct the full interleaved token stream. TITO invariant: each turn's
+            # prompt extends the previous prompt+completion, so appending each
+            # completion and then the next prompt's delta recovers the whole
+            # system+task+<tool_call>+<tool_response>+... conversation. A branch
+            # (extends_previous False, e.g. compaction) resets to that turn's fresh
+            # prompt (rare for tmax vanillux; noted inline).
+            full_ids: list[int] = list(captured[0].prompt_token_ids) if captured else []
+            branch_turns: list[int] = []
+            for i, ct in enumerate(captured):
+                full_ids += list(ct.completion_token_ids)
+                if i + 1 < len(captured):
+                    nxt = list(captured[i + 1].prompt_token_ids)
+                    if nxt[: len(full_ids)] == full_ids:
+                        full_ids += nxt[len(full_ids) :]  # tool_response delta
+                    else:
+                        branch_turns.append(i + 1)
+                        full_ids = nxt  # history rewrite -> fresh render
+            full_text = _decode(full_ids)
+
+            response_len = sum(len(ct.completion_token_ids) for ct in captured)
+            num_tool_calls = full_text.count("<tool_call>")
+            last_finish = captured[-1].finish_reason if captured else None
+            any_length_finish = any(ct.finish_reason == "length" for ct in captured)
+            outcome = "SUCCESS" if reward and reward > 0 else "FAIL"
+
+            header = (
+                "=" * 90
+                + f"\nTMAX-9B rollout trace  ({outcome}, reward={reward})\n"
+                + "=" * 90
+                + f"\ninstance_id    : {sample.instance_id}"
+                + f"\nimage          : {sample.image}"
+                + f"\nrollout_id     : {rollout_id}"
+                + f"\nstatus         : {status}   submitted: {submitted}"
+                + f"\nreward         : {reward}"
+                + f"\nfinish_reason  : {last_finish}   any length-cap turn: {any_length_finish}"
+                + f"\nnum turns      : {len(captured)}   num tool calls: {num_tool_calls}"
+                + f"\nresponse length: {response_len} tokens (model-generated, all turns)"
+                + f"\nformat_errors  : {fmt_errors}"
+                + (f"\nerror          : {error_msg}" if error_msg else "")
+                + (
+                    f"\nNOTE branch/re-render at turns {branch_turns} (TITO not continued)"
+                    if branch_turns
+                    else ""
+                )
+                + "\n"
+                + "=" * 90
+                + "\nAGENT TRAJECTORY (decoded; <tool_call>=model action, "
+                + "<tool_response>=sandbox output)\n"
+                + "=" * 90
+                + "\n"
+            )
+
             os.makedirs(dump_dir, exist_ok=True)
             safe = rollout_id.replace("/", "_")
-            path = os.path.join(dump_dir, f"{safe}.json")
+            path = os.path.join(dump_dir, f"{safe}.txt")
             with open(path, "w") as f:
-                json.dump(record, f, indent=2, ensure_ascii=False)
+                f.write(header)
+                f.write(full_text)
+                f.write("\n")
             logger.info("[tmax] rollout trace dumped: %s", path)
         except Exception as e:
             logger.warning("[tmax] rollout trace dump failed: %s", e)

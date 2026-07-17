@@ -76,6 +76,13 @@ _TURN_MAX_TOKENS = 16384
 # Consecutive no-bash-call turns tolerated (with a format-error reminder) before
 # stopping, so a misformatting policy cannot spin to the turn cap.
 _MAX_FORMAT_ERRORS = int(os.environ.get("TMAX_MAX_FORMAT_ERRORS", "3"))
+# open_instruct parity: production open_instruct (scripts/tmax/RL/qwen35_9b.sh) runs
+# with tool_call_format_error_feedback=False, so a turn that parses to NO bash tool
+# call TERMINATES the rollout on the FIRST occurrence (vllm_utils.py:1253 `if not
+# tool_calls and not format_error_feedback: break`) -- no reminder, no retry. Match
+# that by default. Set TMAX_FORMAT_ERROR_FEEDBACK=1 to restore the older behavior
+# (inject the FORMAT_ERROR_TEMPLATE reminder and retry up to _MAX_FORMAT_ERRORS).
+_FORMAT_ERROR_FEEDBACK = os.environ.get("TMAX_FORMAT_ERROR_FEEDBACK", "0") == "1"
 # Per-bash-command wall-clock cap. A hung command (e.g. the model runs something
 # interactive/infinite) otherwise blocks the whole rollout until the much larger
 # whole-rollout guard. Cap each bash command at 120s to match the official TMax env
@@ -253,16 +260,26 @@ async def run_vanillux_loop(
             b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"
         ]
         if not tool_uses:
-            # No bash call: at a full context the truncated turn is empty and a
-            # reminder just yields another empty turn -> stop. Otherwise return
-            # the vanillux format-error reminder and continue (bounded).
             text = "".join(
                 b.get("text", "")
                 for b in blocks
                 if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
-            consecutive_format_errors += 1
             total_format_errors += 1
+            consecutive_format_errors += 1
+            # open_instruct parity (default): with tool_call_format_error_feedback
+            # off, a turn with no bash tool call ends the rollout on the FIRST
+            # occurrence -- no reminder, no retry (vllm_utils.py:1253). This is the
+            # production 9B behavior, so it is our default.
+            if not _FORMAT_ERROR_FEEDBACK:
+                logger.info(
+                    "[vanillux] %s: stopping (no tool call, format_error_feedback off)",
+                    session_id,
+                )
+                break
+            # Opt-in legacy behavior (TMAX_FORMAT_ERROR_FEEDBACK=1): inject the
+            # vanillux reminder and retry, bounded. At a full context the truncated
+            # turn is empty and a reminder just yields another empty turn -> stop.
             if (
                 stop_reason == "max_tokens" and not text
             ) or consecutive_format_errors > _MAX_FORMAT_ERRORS:

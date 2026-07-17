@@ -9,6 +9,7 @@
 RolloutGroup -> data-validity filters -> rollout_to_training_samples -> TrainingSampleGroup
 """
 
+import logging
 import statistics
 from dataclasses import dataclass
 
@@ -20,6 +21,8 @@ from torchtitan.experiments.rl.types import (
     TrainingSample,
     TrainingSampleGroup,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class TrainingSampleBuilder(Configurable):
@@ -277,22 +280,37 @@ class TrainingSampleBuilder(Configurable):
 
             prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 
-        # TITO / prefix-dedup invariant: every completion token is trained EXACTLY
-        # once, and no prompt/env token leaks into the trained set. So the number of
-        # loss_mask=True tokens across all packed samples must equal the sum of the
-        # per-turn completion lengths. If turn n+1's prompt (which by design contains
-        # turn n) were re-counted into the trained set, masked_total would exceed
-        # completion_total and this fires -- the exact double-training bug we guard.
-        masked_total = sum(sum(s.loss_mask) for s in training_samples)
-        completion_total = sum(
-            len(t.completion_token_ids) for t in rollout.turns if t.completion_token_ids
+        # TITO integrity. NOTE: counting loss_mask=True vs sum(completion lengths) is
+        # TAUTOLOGICAL -- the loop above sets [True]*len(completion) and
+        # [False]*len(prompt_delta) by construction, so that equality always holds and
+        # can never catch a dedup error (the old assert here was a no-op). The real,
+        # non-tautological corruption is a per-turn completion token/logprob length
+        # mismatch from capture: the loss pairs trainer-vs-generator logprobs 1:1, so a
+        # mismatch shifts the ratio. Warn (don't crash a live rollout) if it happens.
+        for turn_idx, t in enumerate(rollout.turns):
+            n_ids, n_lp = len(t.completion_token_ids), len(t.completion_logprobs)
+            if t.completion_token_ids and n_ids != n_lp:
+                logger.warning(
+                    f"[training_sample_builder] rollout {rollout.group_id}/"
+                    f"rollout={rollout.rollout_id} turn {turn_idx}: completion "
+                    f"token/logprob length mismatch ({n_ids} ids vs {n_lp} logprobs) "
+                    "-- trained logprobs would be shifted; check generator capture"
+                )
+
+        # Visibility: how a trajectory split into training samples. Expect 1 for an
+        # append-only TITO loop (tmax vanillux); >1 means a mid-trajectory branch
+        # (history rewrite or a re-render), so surface that at INFO -- it is the
+        # training-side echo of the adapter's mid-trajectory re-render warning.
+        num_samples = len(training_samples)
+        trained_tokens = sum(sum(s.loss_mask) for s in training_samples)
+        msg = (
+            f"[training_sample_builder] rollout {rollout.group_id}/"
+            f"rollout={rollout.rollout_id} -> {num_samples} sample(s), "
+            f"{trained_tokens} trained tokens, {len(rollout.turns)} turn(s)"
         )
-        assert masked_total == completion_total, (
-            f"trained-token mismatch for rollout {rollout.group_id}/"
-            f"rollout={rollout.rollout_id}: loss_mask=True count {masked_total} != "
-            f"sum(per-turn completion lengths) {completion_total}. A turn's prompt "
-            "(which contains earlier turns) leaked into the trained set, or the "
-            "prefix-dedup broke (TITO mismatch)."
-        )
+        if num_samples > 1:
+            logger.info(f"{msg} (trajectory SPLIT into {num_samples} samples)")
+        else:
+            logger.debug(msg)
 
         return training_samples
