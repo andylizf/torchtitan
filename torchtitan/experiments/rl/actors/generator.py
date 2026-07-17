@@ -813,13 +813,32 @@ class VLLMGenerator(Actor, Configurable):
                     f"tensor_parallel_degree ({full_ep}) in the generator."
                 )
 
+            # Under batch_invariant an OLD-weights prefix cache surviving a weight
+            # sync must not silently poison determinism. Two acceptable policies:
+            #   - reset: drop the whole prefix cache on sync (uniformly bitwise).
+            #   - salt: per-group cache_salt keeps only STRADDLING in-flight rollouts
+            #     on old-weight KV; new groups recompute under the new weights. Within
+            #     a policy version, recurrent-BI prefix reuse is bitwise (continuation
+            #     == fresh full prefill), so only sync-straddling samples carry the
+            #     usual off-policy drift (NOT a kernel nondeterminism). This mirrors
+            #     open-instruct's inflight cache_salt and is accepted deliberately.
+            # Neither reset nor salt = a stale cache silently persists -> forbidden.
             if (
                 self.debug.batch_invariant
                 and not self.reset_prefix_cache_on_weight_sync
+                and not self.salt_prefix_cache_on_weight_sync
             ):
                 raise ValueError(
-                    "batch_invariant requires reset_prefix_cache_on_weight_sync=True so a stale prefix "
-                    "cache from old weights can't break determinism"
+                    "batch_invariant requires reset_prefix_cache_on_weight_sync=True "
+                    "or salt_prefix_cache_on_weight_sync=True so an old-weights prefix "
+                    "cache can't silently break determinism"
+                )
+            if self.salt_prefix_cache_on_weight_sync and self.debug.batch_invariant:
+                logger.warning(
+                    "batch_invariant + salt_prefix_cache_on_weight_sync: weight-sync-"
+                    "straddling in-flight samples keep old-weight KV, so their gen-vs-"
+                    "trainer logprobs are not bitwise (off-policy drift); non-straddling "
+                    "samples stay bitwise."
                 )
             if (
                 self.reset_running_requests_on_weight_sync
@@ -828,11 +847,6 @@ class VLLMGenerator(Actor, Configurable):
                 raise ValueError(
                     "reset_running_requests_on_weight_sync requires "
                     "reset_prefix_cache_on_weight_sync=True (it only matters as part of resetting the cache)"
-                )
-            if self.salt_prefix_cache_on_weight_sync and self.debug.batch_invariant:
-                raise ValueError(
-                    "salt_prefix_cache_on_weight_sync keeps in-flight/old-weight KV, which breaks "
-                    "batch_invariant determinism; use reset_prefix_cache_on_weight_sync instead"
                 )
 
     def __init__(

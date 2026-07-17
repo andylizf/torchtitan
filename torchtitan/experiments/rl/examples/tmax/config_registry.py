@@ -34,6 +34,7 @@ from torchtitan.config import DebugConfig
 
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
+from torchtitan.experiments.rl.actors.generator import VLLMCudagraphConfig
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
@@ -336,6 +337,38 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                     config.async_loop.batcher.batch, local_batch_size=_lbsz
                 ),
             ),
+        )
+    # Batch-invariant GDN mode (SWE_GDN_BI=1): make the generator's decode == prefill
+    # == trainer logprobs BITWISE by routing BOTH the trainer and the unified vLLM
+    # wrapper GDN core through the SAME fla recurrent kernel (recurrent-everywhere).
+    # One switch flips the four coupled settings the path requires:
+    #   - trainer.debug batch_invariant  -> _RecurrentFwdChunkBwd (recurrent fwd, chunk bwd)
+    #   - generator.debug batch_invariant -> the _forward_recurrent_bi decode path
+    #   - generator.backend torchtitan_wrapper -> the unified GDN core that holds it
+    #   - generator.gdn_trainer_parity   -> _TRAINER_PARITY_FLA (selects the fla recurrence)
+    # Under BI the recurrent-everywhere decode is FULL_DECODE_ONLY cudagraph-capturable
+    # and its PAGED conv/ssm state makes prefix caching bitwise (846c51b0), so both stay
+    # ON. The weight-sync KV policy is INHERITED from the tmax base's salt-KV setting
+    # (SWE_SALT_KV, default salt-on): recurrent-BI prefix reuse is bitwise WITHIN a
+    # policy version, so salt is compatible -- only sync-straddling in-flight samples
+    # carry the usual off-policy drift (generator __post_init__ warns, no longer errors).
+    # SP must be off for BI (already is at trainer TP=1; set explicitly).
+    if os.environ.get("SWE_GDN_BI", "0") == "1":
+        _bi = DebugConfig(batch_invariant=True, deterministic=True)
+        config.trainer = dataclasses.replace(
+            config.trainer,
+            debug=_bi,
+            parallelism=dataclasses.replace(
+                config.trainer.parallelism, enable_sequence_parallel=False
+            ),
+        )
+        config.generator = dataclasses.replace(
+            config.generator,
+            backend="torchtitan_wrapper",
+            gdn_trainer_parity=True,
+            debug=_bi,
+            enable_prefix_caching=True,
+            cudagraph=VLLMCudagraphConfig(enable=True, mode="FULL_DECODE_ONLY"),
         )
     return config
 
