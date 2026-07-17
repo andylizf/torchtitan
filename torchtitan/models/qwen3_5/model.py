@@ -20,6 +20,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import local_map
 
+from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common import Conv1d, FeedForward, Linear
 from torchtitan.models.common.attention import AttentionMasksType, BaseAttention
 from torchtitan.models.common.decoder import Decoder
@@ -213,6 +214,71 @@ class RMSNormGated(Module):
         return x.to(input_dtype)
 
 
+class _RecurrentFwdChunkBwd(torch.autograd.Function):
+    """Batch-invariant GDN: fla RECURRENT kernel for the forward, fla CHUNK for backward.
+
+    The vLLM generator must use the recurrent kernel for decode (decode is inherently
+    a per-token recurrence). To be bitwise-identical, the trainer forward must use that
+    SAME recurrent kernel. But a pure-recurrent backward is O(seqlen) sequential and
+    slow, so we recompute the CHUNK kernel in the backward for efficient parallel
+    gradients (forward-swap / chunk-backward). Chunk and recurrent compute the same
+    function, so chunk grads are the accurate, fast reference training uses; only the
+    forward *value* is swapped to recurrent.
+
+    Inputs are the flattened [1, T, ...] varlen layout; cu_seqlens marks packed-sample
+    boundaries so the recurrence resets per sample (None for a single unpacked row).
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, cu_seqlens):
+        ctx.save_for_backward(q, k, v, g, beta)
+        ctx.cu_seqlens = cu_seqlens
+        with torch.no_grad():
+            # Run the recurrence in fp32 and pass a materialized ZERO initial state
+            # (not None). Two reasons this makes trainer == generator prefill ==
+            # generator decode bitwise: (1) fp32 keeps the recurrence stepped-exact
+            # (bf16 loses ~1e-5 across full-vs-stepped); (2) fla compiles
+            # USE_INITIAL_STATE from (h0 is not None), so a None here vs the tensor
+            # state the decode path passes would select two different binaries with
+            # divergent fp reductions -- a zero init forces the SAME binary. The
+            # generator uses the identical zero-init + fp32 recipe.
+            n_seq = (
+                int(cu_seqlens.numel()) - 1 if cu_seqlens is not None else q.shape[0]
+            )
+            h0 = q.new_zeros(
+                n_seq, q.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
+            )
+            out, _ = _fla_fused_recurrent_gated_delta_rule(
+                q.float(),
+                k.float(),
+                v.float(),
+                g.float(),
+                beta=beta.float(),
+                initial_state=h0,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
+        return out.to(q.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, g, beta = ctx.saved_tensors
+        # Recompute the chunk kernel with grad enabled and backprop through it.
+        with torch.enable_grad():
+            ins = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
+            out_chunk = _fla_chunk_gated_delta_rule(
+                ins[0],
+                ins[1],
+                ins[2],
+                ins[3],
+                ins[4],
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=ctx.cu_seqlens,
+            )[0]
+            grads = torch.autograd.grad(out_chunk, ins, grad_out)
+        return grads[0], grads[1], grads[2], grads[3], grads[4], None
+
+
 class GatedDeltaKernel(Module):
     """Stateless dispatch to FLA kernel or pure-torch fallback.
 
@@ -265,6 +331,16 @@ class GatedDeltaKernel(Module):
             v = v.reshape(1, bs * seqlen, *v.shape[2:])
             g = g.reshape(1, bs * seqlen, *g.shape[2:])
             beta = beta.reshape(1, bs * seqlen, *beta.shape[2:])
+
+        # Recurrent-everywhere batch-invariant path: run the fla RECURRENT kernel for
+        # the forward so the trainer matches the vLLM generator's decode kernel
+        # bitwise (decode is inherently recurrent), with chunk recomputed in backward
+        # for efficient gradients. Enabled automatically under batch-invariant mode.
+        if is_in_batch_invariant_mode():
+            out = _RecurrentFwdChunkBwd.apply(q, k, v, g, beta, cu_seqlens)
+            if cu_seqlens is not None:
+                out = out.reshape(bs, seqlen, *out.shape[2:])
+            return out
 
         if self.backend == "fla_chunked":
             result = _fla_chunk_gated_delta_rule(

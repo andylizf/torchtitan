@@ -44,10 +44,15 @@ import torch.nn.functional as F
 # is a different copy -> a parity gap). We align the GENERATOR to the TRAINER
 # because only the trainer's fla path has a backward (training needs it), so the
 # trainer's kernels are the reference.
-from fla.modules.convolution import causal_conv1d as _external_fla_causal_conv1d
+from fla.modules.convolution import (
+    causal_conv1d as _external_fla_causal_conv1d,
+    causal_conv1d_update as _external_fla_causal_conv1d_update,
+)
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule as _external_fla_chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule as _external_fla_fused_recurrent_gated_delta_rule,
 )
+from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 from vllm.config import get_current_vllm_config
@@ -162,6 +167,11 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         # vLLM populates this via the KV-cache allocator: (conv_state, ssm_state).
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
 
+        # Side conv-state buffer for the recurrent-everywhere path (fla's conv state
+        # is [num_slots, conv_dim, W] with W = kernel size, wider than vLLM's paged
+        # conv_state [.., k-1], so it cannot reuse kv_cache[0]). Lazily allocated.
+        self._fla_conv_state: torch.Tensor | None = None
+
         self.prefix = f"model.layers.{config.layer_idx}.linear_attn"
         compilation_config = vllm_config.compilation_config
         if self.prefix in compilation_config.static_forward_context:
@@ -221,6 +231,181 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         gathered = gathered * in_seg[:, :, None].to(gathered.dtype)
         # conv_state[idx] is (conv_dim, state_len) -> transpose the gathered window.
         conv_state[state_idx] = gathered.transpose(1, 2).to(conv_state.dtype)
+
+    # ---- recurrent-everywhere BI path -------------------------------------
+    def _split_qkv(
+        self, mixed_qkv_slice_TC: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = mixed_qkv_slice_TC.shape[0]
+        q = (
+            mixed_qkv_slice_TC[:, : self.key_dim]
+            .contiguous()
+            .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
+        )
+        k = (
+            mixed_qkv_slice_TC[:, self.key_dim : 2 * self.key_dim]
+            .contiguous()
+            .view(1, num_tokens, self.num_k_heads, self.head_k_dim)
+        )
+        v = (
+            mixed_qkv_slice_TC[:, 2 * self.key_dim :]
+            .contiguous()
+            .view(1, num_tokens, self.num_v_heads, self.head_v_dim)
+        )
+        return q, k, v
+
+    def _fla_conv_state_buffer(
+        self, conv_dim: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        num_slots = self.kv_cache[0].shape[0]
+        w = self.conv_kernel_size
+        buf = self._fla_conv_state
+        if (
+            buf is None
+            or buf.shape[0] != num_slots
+            or buf.shape[1] != conv_dim
+            or buf.device != device
+        ):
+            buf = torch.zeros(num_slots, conv_dim, w, dtype=dtype, device=device)
+            self._fla_conv_state = buf
+        return buf
+
+    def _forward_recurrent_bi(
+        self,
+        m: GDNAttentionMetadata,
+        n: int,
+        mixed_qkv_TC: torch.Tensor,
+        a_THv: torch.Tensor,
+        b_THv: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Recurrent-everywhere GDN: fla conv + fla RECURRENT kernel for BOTH prefill
+        and decode, so decode == prefill == trainer bitwise.
+
+        Conv uses fla's stateful pair (causal_conv1d full with output_final_state +
+        causal_conv1d_update) against a side conv-state buffer keyed by the vLLM slot
+        ids. Recurrence uses fla fused_recurrent against the paged ssm_state via
+        gather/scatter (upstream fla recurrent has no slot indexing). Fresh prefill
+        only (initial_state=None), matching the RL rollout; prefix caching is not
+        supported here.
+        """
+        conv_dim = mixed_qkv_TC.shape[1]
+        ssm_state = self.kv_cache[1]
+        nsi = m.non_spec_state_indices_tensor
+        assert nsi is not None
+        conv_state = self._fla_conv_state_buffer(
+            conv_dim, mixed_qkv_TC.dtype, mixed_qkv_TC.device
+        )
+        out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
+
+        def _recurrence(
+            conv_out_TC: torch.Tensor,
+            seg: slice,
+            slot_idx: torch.Tensor,
+            cu_seqlens: torch.Tensor,
+            has_state: bool,
+        ) -> torch.Tensor:
+            q, k, v = self._split_qkv(conv_out_TC)
+            if q.shape[2] != v.shape[2]:
+                rep = v.shape[2] // q.shape[2]
+                q = q.repeat_interleave(rep, dim=2)
+                k = k.repeat_interleave(rep, dim=2)
+            # Run the recurrence in fp32: the fla recurrent kernel is NOT bitwise
+            # stepped-consistent in bf16 (full-seq prefill vs 1-token decode differ by
+            # ~1e-5 from bf16 input rounding), but in fp32 it matches to ~1e-8, which
+            # vanishes when the output is written back to the bf16 activation buffer.
+            # This is what makes decode == prefill; the trainer upcasts identically.
+            q, k, v = q.float(), k.float(), v.float()
+            # fp32 eager gate, identical to the trainer.
+            g = (
+                -torch.exp(A_log.float())
+                * F.softplus(a_THv[seg].float() + dt_bias.float())
+            ).unsqueeze(0)
+            beta = torch.sigmoid(b_THv[seg].float()).unsqueeze(0)
+            if has_state:
+                # paged ssm_state is stored [.., V, K]; fla wants [.., K, V].
+                initial_state = ssm_state[slot_idx].transpose(-1, -2).contiguous()
+            else:
+                # Fresh prefill: pass a materialized ZERO state, NOT None. fla's
+                # recurrent kernel compiles USE_INITIAL_STATE from (h0 is not None),
+                # so a None prefill vs a tensor decode select two different binaries
+                # with divergent fp reductions (~1e-8) -> decode != prefill. A zero
+                # init makes both paths the SAME binary -> bitwise resume-exact
+                # (decode == prefill).
+                n_seq = int(cu_seqlens.numel()) - 1
+                initial_state = q.new_zeros(
+                    n_seq, q.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
+                )
+            out, final_state = _external_fla_fused_recurrent_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+            )
+            ssm_state[slot_idx] = final_state.transpose(-1, -2).to(ssm_state.dtype)
+            return out
+
+        num_decode_tokens = m.num_decode_tokens
+
+        # Decode segment: 1 token per sequence; resume conv + ssm state from cache.
+        if m.num_decodes > 0:
+            dec_slots = nsi[: m.num_decodes]
+            cache = conv_state[
+                dec_slots
+            ]  # [num_decodes, conv_dim, W] advanced-index copy
+            conv_out, cache = _external_fla_causal_conv1d_update(
+                mixed_qkv_TC[:num_decode_tokens],
+                cache,
+                weight=conv_weight,
+                bias=conv_bias,
+                activation="silu",
+            )
+            conv_state[dec_slots] = cache
+            out_1THvDv[:, :num_decode_tokens] = _recurrence(
+                conv_out,
+                slice(0, num_decode_tokens),
+                dec_slots,
+                m.non_spec_query_start_loc[: m.num_decodes + 1],
+                has_state=True,
+            )
+
+        # Prefill segment: fresh sequences; fla full conv writes conv + ssm state.
+        if m.num_prefills > 0:
+            assert m.prefill_state_indices is not None
+            pf_start = num_decode_tokens if m.num_decodes > 0 else 0
+            if m.num_decodes == 0:
+                pf_cu = m.non_spec_query_start_loc  # 0-based (verified prefill path)
+            else:
+                assert m.prefill_query_start_loc is not None
+                pf_cu = m.prefill_query_start_loc - m.prefill_query_start_loc[0]
+            conv_out, conv_final = _external_fla_causal_conv1d(
+                mixed_qkv_TC[pf_start:n].unsqueeze(0),
+                weight=conv_weight,
+                bias=conv_bias,
+                activation="silu",
+                cu_seqlens=pf_cu,
+                output_final_state=True,
+            )
+            conv_out = conv_out.squeeze(0)
+            conv_state[m.prefill_state_indices] = conv_final.to(conv_state.dtype)
+            out_1THvDv[:, pf_start:n] = _recurrence(
+                conv_out,
+                slice(pf_start, n),
+                m.prefill_state_indices,
+                pf_cu,
+                has_state=False,
+            )
+
+        return out_1THvDv
 
     # ---- forward -----------------------------------------------------------
     def forward(
@@ -299,6 +484,27 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         assert m.non_spec_query_start_loc is not None
         assert m.non_spec_query_start_loc.numel() >= num_seq + 1
         assert nsi.numel() >= num_seq
+
+        # Recurrent-everywhere: fla conv + fla RECURRENT kernel for prefill AND decode
+        # so decode == prefill == trainer bitwise (decode is inherently recurrent, so
+        # the only way prefill/trainer can match it is to use that same kernel -- not
+        # chunk). Gated on the trainer-parity path (fla kernels) + batch-invariant
+        # mode; the trainer forward is likewise swapped to fla recurrent under BI
+        # (model.py _RecurrentFwdChunkBwd). This supersedes the chunk-prefill parity
+        # branch below when both are on.
+        if _TRAINER_PARITY_FLA and is_in_batch_invariant_mode():
+            out_BTHvDv[:, :n] = self._forward_recurrent_bi(
+                m,
+                n,
+                mixed_qkv_TC,
+                a_THv,
+                b_THv,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                conv_weight=conv_weight,
+                conv_bias=conv_bias,
+            )
+            return out_BTHvDv
 
         if _TRAINER_PARITY_FLA and not VLLMGatedDeltaNetCore._logged_parity:
             VLLMGatedDeltaNetCore._logged_parity = True
