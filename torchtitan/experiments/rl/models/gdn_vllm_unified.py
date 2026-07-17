@@ -103,15 +103,16 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
     Non-speculative decoding only (asserts otherwise). Requires the generator
     cudagraph off until this custom core is captured and validated separately.
 
-    Prefix caching: validated. With ``enable_prefix_caching=True`` vLLM auto-selects
+    Prefix caching: validated for BOTH the vendored path and the recurrent-everywhere
+    trainer-parity path. With ``enable_prefix_caching=True`` vLLM auto-selects
     ``mamba_cache_mode='align'`` for this wrapper (it does not declare
     ``supports_mamba_prefix_caching``), caching the conv/ssm state at block
-    boundaries. A repro (generate a prompt twice) confirmed the second run reuses
-    the cached state (num_cached_tokens > 0) and reproduces the no-cache output
-    token-for-token, so the cached state is reconstructed correctly. NOTE: a reused
-    prefix arrives as a continuation (``has_initial_state=True``); under the
-    trainer-parity path that hits the vendored fallback (correct, not bitwise), so
-    prefix caching and bitwise parity are mutually exclusive on the reused tokens.
+    boundaries. On the trainer-parity path a reused prefix arrives as a continuation
+    (``prefill_has_initial_state``); ``_forward_recurrent_bi`` restores the cached
+    conv+ssm state and continues the fla recurrence, which is bitwise-equal to a
+    fresh full prefill (causal recurrence -> identical boundary state). A repro
+    (generate a prompt twice) confirms the second run hits the cache
+    (num_cached_tokens > 0) and reproduces the no-cache output token-for-token.
     """
 
     _logged_parity = False
@@ -166,11 +167,6 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
 
         # vLLM populates this via the KV-cache allocator: (conv_state, ssm_state).
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
-
-        # Side conv-state buffer for the recurrent-everywhere path (fla's conv state
-        # is [num_slots, conv_dim, W] with W = kernel size, wider than vLLM's paged
-        # conv_state [.., k-1], so it cannot reuse kv_cache[0]). Lazily allocated.
-        self._fla_conv_state: torch.Tensor | None = None
 
         self.prefix = f"model.layers.{config.layer_idx}.linear_attn"
         compilation_config = vllm_config.compilation_config
@@ -254,22 +250,6 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         )
         return q, k, v
 
-    def _fla_conv_state_buffer(
-        self, conv_dim: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        num_slots = self.kv_cache[0].shape[0]
-        w = self.conv_kernel_size
-        buf = self._fla_conv_state
-        if (
-            buf is None
-            or buf.shape[0] != num_slots
-            or buf.shape[1] != conv_dim
-            or buf.device != device
-        ):
-            buf = torch.zeros(num_slots, conv_dim, w, dtype=dtype, device=device)
-            self._fla_conv_state = buf
-        return buf
-
     def _forward_recurrent_bi(
         self,
         m: GDNAttentionMetadata,
@@ -286,21 +266,35 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         """Recurrent-everywhere GDN: fla conv + fla RECURRENT kernel for BOTH prefill
         and decode, so decode == prefill == trainer bitwise.
 
-        Conv uses fla's stateful pair (causal_conv1d full with output_final_state +
-        causal_conv1d_update) against a side conv-state buffer keyed by the vLLM slot
-        ids. Recurrence uses fla fused_recurrent against the paged ssm_state via
-        gather/scatter (upstream fla recurrent has no slot indexing). Fresh prefill
-        only (initial_state=None), matching the RL rollout; prefix caching is not
-        supported here.
+        Conv (fla causal_conv1d / causal_conv1d_update) and recurrence (fla
+        fused_recurrent) both run against vLLM's PAGED conv_state + ssm_state via
+        gather/scatter, so vLLM's prefix cache saves/restores them at block
+        boundaries. Fresh sequences start from a zero initial state; prefix-cache
+        continuation sequences (m.prefill_has_initial_state) restore the cached
+        conv+ssm state and continue the recurrence -- bitwise-equal to a fresh full
+        prefill because the recurrence is causal (the boundary state is identical).
         """
         conv_dim = mixed_qkv_TC.shape[1]
         ssm_state = self.kv_cache[1]
         nsi = m.non_spec_state_indices_tensor
         assert nsi is not None
-        conv_state = self._fla_conv_state_buffer(
-            conv_dim, mixed_qkv_TC.dtype, mixed_qkv_TC.device
+        # Use vLLM's paged conv_state (kv_cache[0]) directly so a prefix-cache hit
+        # restores the reused prefix's conv history. Stored [.., conv_dim, W-1] (the
+        # last W-1 pre-conv inputs); fla's causal_conv1d state is [N, conv_dim, W]
+        # whose trailing W-1 columns equal it and whose column 0 is a don't-care
+        # (verified) -- pad a zero column on read, drop it on write.
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
         )
+        conv_W = self.conv_kernel_size
         out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
+
+        def _pad_w1_to_w(state_w1: torch.Tensor) -> torch.Tensor:
+            # [n, conv_dim, W-1] -> [n, conv_dim, W]; leading column is a don't-care.
+            pad = state_w1.new_zeros(state_w1.shape[0], state_w1.shape[1], 1)
+            return torch.cat([pad, state_w1], dim=-1)
 
         # Batch-independent fp32 gate scalars: hoist out of the per-segment closure
         # (identical fp32 ops in identical order -> pure CSE, bitwise-unchanged).
@@ -312,7 +306,8 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             seg: slice,
             slot_idx: torch.Tensor,
             cu_seqlens: torch.Tensor,
-            has_state: bool,
+            ssm_init: str,
+            ssm_mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
             q, k, v = self._split_qkv(conv_out_TC)
             if q.shape[2] != v.shape[2]:
@@ -328,20 +323,27 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             # fp32 eager gate, identical to the trainer.
             g = (A_neg_exp * F.softplus(a_THv[seg].float() + dt_bias_f)).unsqueeze(0)
             beta = torch.sigmoid(b_THv[seg].float()).unsqueeze(0)
-            if has_state:
-                # paged ssm_state is stored [.., V, K]; fla wants [.., K, V].
-                initial_state = ssm_state[slot_idx].transpose(-1, -2).contiguous()
+            # Recurrent initial state (fp32). Always a materialized tensor so the
+            # USE_INITIAL_STATE constexpr picks the SAME compiled kernel across
+            # fresh/continuation/decode (-> bitwise). paged ssm_state is [.., V, K];
+            # fla wants [.., K, V]. Three modes:
+            #   "all"  (decode): every seq resumes -> a plain int-index gather, which
+            #          is cudagraph-capturable (NO boolean/data-dependent indexing).
+            #   "mask" (mixed prefill, eager -- not captured): per-seq boolean restore.
+            #   "zero" (fresh prefill): zeros.
+            if ssm_init == "all":
+                initial_state = (
+                    ssm_state[slot_idx].transpose(-1, -2).float().contiguous()
+                )
             else:
-                # Fresh prefill: pass a materialized ZERO state, NOT None. fla's
-                # recurrent kernel compiles USE_INITIAL_STATE from (h0 is not None),
-                # so a None prefill vs a tensor decode select two different binaries
-                # with divergent fp reductions (~1e-8) -> decode != prefill. A zero
-                # init makes both paths the SAME binary -> bitwise resume-exact
-                # (decode == prefill).
                 n_seq = int(cu_seqlens.numel()) - 1
                 initial_state = q.new_zeros(
                     n_seq, q.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
                 )
+                if ssm_init == "mask" and ssm_mask is not None:
+                    initial_state[ssm_mask] = (
+                        ssm_state[slot_idx[ssm_mask]].transpose(-1, -2).float()
+                    )
             out, final_state = _external_fla_fused_recurrent_gated_delta_rule(
                 q,
                 k,
@@ -358,53 +360,65 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
 
         num_decode_tokens = m.num_decode_tokens
 
-        # Decode segment: 1 token per sequence; resume conv + ssm state from cache.
+        # Decode segment: 1 token/seq; resume conv + ssm from the paged cache.
         if m.num_decodes > 0:
             dec_slots = nsi[: m.num_decodes]
-            cache = conv_state[
-                dec_slots
-            ]  # [num_decodes, conv_dim, W] advanced-index copy
-            conv_out, cache = _external_fla_causal_conv1d_update(
+            cache_w = _pad_w1_to_w(conv_state[dec_slots])  # [num_decodes, conv_dim, W]
+            conv_out, cache_w = _external_fla_causal_conv1d_update(
                 mixed_qkv_TC[:num_decode_tokens],
-                cache,
+                cache_w,
                 weight=conv_weight,
                 bias=conv_bias,
                 activation="silu",
             )
-            conv_state[dec_slots] = cache
+            conv_state[dec_slots] = cache_w[..., 1:].to(conv_state.dtype)
             out_1THvDv[:, :num_decode_tokens] = _recurrence(
                 conv_out,
                 slice(0, num_decode_tokens),
                 dec_slots,
                 m.non_spec_query_start_loc[: m.num_decodes + 1],
-                has_state=True,
+                "all",
             )
 
-        # Prefill segment: fresh sequences; fla full conv writes conv + ssm state.
+        # Prefill segment: fresh AND/OR prefix-cache continuation sequences.
         if m.num_prefills > 0:
             assert m.prefill_state_indices is not None
+            pf_state_idx = m.prefill_state_indices
+            pf_has_init = m.prefill_has_initial_state  # per-seq bool, or None (fresh)
             pf_start = num_decode_tokens if m.num_decodes > 0 else 0
             if m.num_decodes == 0:
                 pf_cu = m.non_spec_query_start_loc  # 0-based (verified prefill path)
             else:
                 assert m.prefill_query_start_loc is not None
                 pf_cu = m.prefill_query_start_loc - m.prefill_query_start_loc[0]
+            n_pf = int(pf_cu.numel()) - 1
+            # Per-sequence conv initial state [n_pf, conv_dim, W]: continuation rows
+            # restore the paged W-1 history (padded to W); fresh rows stay zero (==
+            # no-init, verified bitwise).
+            # Prefill runs eager (FULL_DECODE_ONLY graphs only pure-decode), so the
+            # host sync in .any() and the boolean-mask restore below are fine here.
+            _has_cont = pf_has_init is not None and bool(pf_has_init.any())
+            conv_init = mixed_qkv_TC.new_zeros(n_pf, conv_dim, conv_W)
+            if _has_cont:
+                conv_init[pf_has_init, :, 1:] = conv_state[pf_state_idx[pf_has_init]]
             conv_out, conv_final = _external_fla_causal_conv1d(
                 mixed_qkv_TC[pf_start:n].unsqueeze(0),
                 weight=conv_weight,
                 bias=conv_bias,
                 activation="silu",
                 cu_seqlens=pf_cu,
+                initial_state=conv_init,
                 output_final_state=True,
             )
             conv_out = conv_out.squeeze(0)
-            conv_state[m.prefill_state_indices] = conv_final.to(conv_state.dtype)
+            conv_state[pf_state_idx] = conv_final[..., 1:].to(conv_state.dtype)
             out_1THvDv[:, pf_start:n] = _recurrence(
                 conv_out,
                 slice(pf_start, n),
-                m.prefill_state_indices,
+                pf_state_idx,
                 pf_cu,
-                has_state=False,
+                "mask" if _has_cont else "zero",
+                pf_has_init,
             )
 
         return out_1THvDv

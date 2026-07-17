@@ -936,14 +936,17 @@ class VLLMGenerator(Actor, Configurable):
                         cudagraph=replace(config.cudagraph, enable=False),
                     )
                     self.config = config
-                # Prefix caching and bitwise parity are mutually exclusive: a reused
-                # prefix arrives as a continuation (has_initial_state=True) that the
-                # parity path routes to the vendored fallback (correct, NOT bitwise).
-                # Parity needs each request prefilled fresh, so disable prefix cache.
-                if config.enable_prefix_caching:
+                # Prefix caching: the recurrent-everywhere BI decode restores a reused
+                # prefix's conv+ssm state from vLLM's paged cache and CONTINUES the fla
+                # recurrence, which is bitwise-equal to a fresh full prefill (the
+                # recurrence is causal so the boundary state is identical). Keep it on
+                # under batch-invariant mode. The non-BI chunk-parity path has no
+                # bitwise continuation (a reused prefix routes to the vendored fallback),
+                # so disable prefix cache only there.
+                if config.enable_prefix_caching and not config.debug.batch_invariant:
                     logger.warning(
                         "[gdn-unified] disabling prefix caching "
-                        "(gdn_trainer_parity needs fresh full prefills for bitwise parity)"
+                        "(non-BI chunk-parity has no bitwise continuation path)"
                     )
                     config = replace(config, enable_prefix_caching=False)
                     self.config = config
