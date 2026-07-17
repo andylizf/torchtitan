@@ -136,3 +136,112 @@ def force_logprobs_fn_for_batch_invariance() -> None:
         "Patched vLLM compute_token_logprobs with trainer's implementation "
         "so generator and trainer share one logprob code path"
     )
+
+
+_small_m_matmul_patched = False
+
+
+def patch_matmul_for_small_m_batch_invariance() -> None:
+    """Shrink the batch_invariant_ops persistent-matmul M output-tile for small M.
+
+    batch_invariant_ops.matmul_persistent always launches its Triton kernel with
+    BLOCK_SIZE_M=128. On DECODE the matmul is [num_seqs, K] @ [K, N] with num_seqs
+    small (e.g. 8), so a 128-row M-tile wastes ~94% of the work -- and this kernel is
+    ~70% of the batch-invariant GDN decode CUDA time. Shrinking BLOCK_SIZE_M to fit M
+    (min(128, next_pow2(M)), floor 16) removes that waste. BLOCK_SIZE_K (which sets the
+    per-output-element K-reduction order, hence the numerics) is UNCHANGED, so the
+    result is bitwise-identical to the upstream kernel for every M -- verified with
+    torch.equal across M in {8,16,64,128,2000} -- and M>=128 (e.g. trainer/prefill)
+    keeps the original BLOCK_SIZE_M=128 unchanged. Idempotent; safe to call after
+    set_batch_invariance. No-op (logs) if the package internals are unavailable.
+    """
+    global _small_m_matmul_patched
+    if _small_m_matmul_patched:
+        return
+    try:
+        import batch_invariant_ops.batch_invariant_ops as _bi
+        import triton
+    except Exception as exc:  # package layout changed / not installed
+        logger.warning(f"small-M BI matmul patch skipped (import failed): {exc}")
+        return
+
+    # Upstream defaults (batch_invariant_ops.matmul_persistent), keyed by dtype name.
+    _cfgs = {
+        "bfloat16": dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=64,
+            GROUP_SIZE_M=8,
+            num_stages=3,
+            num_warps=8,
+        ),
+        "float16": dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_K=64,
+            GROUP_SIZE_M=8,
+            num_stages=3,
+            num_warps=8,
+        ),
+        "float32": dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=32,
+            GROUP_SIZE_M=8,
+            num_stages=3,
+            num_warps=8,
+        ),
+    }
+
+    def _small_m_matmul_persistent(a, b, bias=None):
+        assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+        num_sms = _bi.get_compute_units()
+        M, K = a.shape
+        _, N = b.shape
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        cfg = dict(_cfgs[str(a.dtype).split(".")[-1]])
+        # Only the M output-tile shrinks; BLOCK_SIZE_K stays fixed -> same reduction.
+        cfg["BLOCK_SIZE_M"] = min(
+            cfg["BLOCK_SIZE_M"], max(16, triton.next_power_of_2(M))
+        )
+
+        def grid(meta):
+            return (
+                min(
+                    num_sms,
+                    triton.cdiv(M, meta["BLOCK_SIZE_M"])
+                    * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+                ),
+            )
+
+        _bi.matmul_kernel_persistent[grid](
+            a,
+            b,
+            c,
+            bias,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            NUM_SMS=num_sms,
+            A_LARGE=a.numel() > 2**31,
+            B_LARGE=b.numel() > 2**31,
+            C_LARGE=c.numel() > 2**31,
+            HAS_BIAS=bias is not None,
+            **cfg,
+        )
+        return c
+
+    # mm_batch_invariant / addmm_batch_invariant call the module-global
+    # matmul_persistent, so replacing it here reroutes both (late binding).
+    _bi.matmul_persistent = _small_m_matmul_persistent
+    _small_m_matmul_patched = True
+    logger.info(
+        "Patched batch_invariant_ops.matmul_persistent with a small-M output-tile "
+        "(BLOCK_SIZE_K unchanged -> bitwise-identical; faster small-M decode)"
+    )

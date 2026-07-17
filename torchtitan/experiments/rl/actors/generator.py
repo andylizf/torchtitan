@@ -27,6 +27,7 @@ from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
     patch_bmm_for_batch_invariance,
+    patch_matmul_for_small_m_batch_invariance,
 )
 from torchtitan.experiments.rl.models.vllm_registry import (
     InferenceParallelismConfig,
@@ -969,6 +970,10 @@ class VLLMGenerator(Actor, Configurable):
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
             # route it through trainer's function to match the trainer exactly.
             force_logprobs_fn_for_batch_invariance()
+            # Shrink the BI persistent-matmul M-tile for small M (decode) -- the mm is
+            # ~70% of BI decode time and wastes a 128-row tile on decode's small M.
+            # Bitwise-identical (BLOCK_SIZE_K unchanged); large-M prefill unchanged.
+            patch_matmul_for_small_m_batch_invariance()
 
         self._set_determinism(config.debug)
 
