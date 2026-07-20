@@ -226,7 +226,8 @@ async def run_vanillux_loop(
     await _prepare_runtime(sb)
 
     messages: list[dict] = [{"role": "user", "content": render_instance(task)}]
-    deadline = time.time() + time_budget_sec
+    start_time = time.time()
+    deadline = start_time + time_budget_sec
     turns = 0
     submitted = False
     consecutive_format_errors = 0
@@ -347,10 +348,24 @@ async def run_vanillux_loop(
             )
         messages.append({"role": "user", "content": results})
 
+    # Classify how the loop ended so a run can measure the nonsubmit split
+    # (time-budget wall vs turn cap vs early stop). grep the log for finish= to
+    # count: submit / hit_time_budget / hit_max_turns / stopped_early.
+    elapsed = time.time() - start_time
+    if submitted:
+        finish_reason = "submit"
+    elif turns >= max_turns:
+        finish_reason = "hit_max_turns"
+    elif time.time() >= deadline:
+        finish_reason = "hit_time_budget"
+    else:
+        finish_reason = "stopped_early"
     logger.info(
-        "[vanillux] %s: finished after %d turns (submitted=%s)",
+        "[vanillux] %s: finished after %d turns (submitted=%s finish=%s elapsed=%.0fs)",
         session_id,
         turns,
         submitted,
+        finish_reason,
+        elapsed,
     )
     return turns, submitted, total_format_errors
