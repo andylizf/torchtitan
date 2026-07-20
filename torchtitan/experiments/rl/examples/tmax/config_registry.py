@@ -34,6 +34,7 @@ from torchtitan.config import DebugConfig
 
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
+from torchtitan.components.optimizer import default_adamw
 from torchtitan.experiments.rl.actors.generator import VLLMCudagraphConfig
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
@@ -48,7 +49,7 @@ from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
 )
 from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset
 from torchtitan.experiments.rl.examples.tmax.rollouter import TMaxRollouter
-from torchtitan.experiments.rl.losses import DPPOLoss
+from torchtitan.experiments.rl.losses import DPPOLoss, GRPOLoss
 
 # tmax JSONL path, supplied by the launcher (PROMPT_DATA -> SWE_PROMPT_DATA).
 # Empty by default; TMaxDataset raises a clear error if it is not set.
@@ -127,8 +128,13 @@ def _tmax_recipe_loss(loss):
     swe base's DAPO clip-higher for a clean A/B. Only loss_fn is swapped; other loss
     fields (e.g. num_chunks) are preserved.
     """
-    if os.environ.get("SWE_LOSS", "dppo").lower() == "dapo":
+    _which = os.environ.get("SWE_LOSS", "dppo").lower()
+    if _which == "dapo":
         return loss
+    if _which == "grpo":
+        # Standard GRPO clipped surrogate (swaps the DPPO trust-region for the PPO
+        # clip). Only loss_fn swapped; num_chunks etc. preserved.
+        return dataclasses.replace(loss, loss_fn=GRPOLoss.Config())
     return dataclasses.replace(
         loss,
         loss_fn=DPPOLoss.Config(
@@ -269,11 +275,20 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # inflight_updates_recompute_kv_cache=False), and drops the per-step full-batch
     # re-prefill storm. SWE_SALT_KV=0 reverts to the reset-and-re-prefill path.
     _salt_kv = os.environ.get("SWE_SALT_KV", "1") == "1"
+    # cudagraph FULL_DECODE_ONLY: ~3x GDN decode throughput (local bench 27->85 tok/s on
+    # the 4B unified), which directly cuts the 20min-wall nonsubmit rate (see the
+    # finish-reason analysis: ~30% of rollouts die on the wall). tmax DEFAULTS it ON
+    # (SWE_GEN_CUDAGRAPH default "1" here, vs "0" in the swe base). Stays
+    # FULL_DECODE_ONLY -- a mixed prefill-decode FULL graph corrupts (#3668).
+    # SWE_GEN_CUDAGRAPH=0 reverts to eager decode (smaller gen/train logprob mismatch,
+    # ~3x slower). The SWE_GDN_BI block below also forces it on (bitwise-safe there).
+    _cudagraph_on = os.environ.get("SWE_GEN_CUDAGRAPH", "1") == "1"
     config.generator = dataclasses.replace(
         config.generator,
         sampling=dataclasses.replace(
             config.generator.sampling, max_tokens=_TMAX_9B_PER_TURN_TOKENS
         ),
+        cudagraph=VLLMCudagraphConfig(enable=_cudagraph_on, mode="FULL_DECODE_ONLY"),
         salt_prefix_cache_on_weight_sync=_salt_kv,
         reset_prefix_cache_on_weight_sync=not _salt_kv,
         reset_running_requests_on_weight_sync=not _salt_kv,
@@ -337,6 +352,15 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                     config.async_loop.batcher.batch, local_batch_size=_lbsz
                 ),
             ),
+        )
+    # Optional learning-rate override (SWE_LR). Default keeps the recipe's 1e-6.
+    # Rebuilding via default_adamw preserves betas/eps/weight_decay and changes only
+    # lr. Used for the effective-step-size A/B (our token-mean grad_norm runs ~4-5x
+    # open-instruct's, so lr ~2e-7 matches OI's proven effective update lr*grad_norm).
+    _lr = float(os.environ.get("SWE_LR", "0") or "0")
+    if _lr > 0:
+        config.trainer = dataclasses.replace(
+            config.trainer, optimizer=default_adamw(lr=_lr)
         )
     # Batch-invariant GDN mode (SWE_GDN_BI=1): make the generator's decode == prefill
     # == trainer logprobs BITWISE by routing BOTH the trainer and the unified vLLM
