@@ -1045,16 +1045,31 @@ class Controller(Configurable):
             # assertion. This is open-instruct's max_result_age_steps. Strict FIFO never
             # hit this: its head-of-line stall pinned the trainer version until the
             # oldest group was consumed -- the very stall we traded away for throughput.
-            samples = training_sample_group.training_samples
-            if samples:
+            #
+            # Age is taken from the RAW rollout group's turns, NOT training_samples, so a
+            # stale ZERO-STD group is dropped too. A zero-std group has empty
+            # training_samples, so gating on those would skip the stale check and leak its
+            # metrics (e.g. rollout_reward/avg_train_reward, attached before the drop) into
+            # the step -- open-instruct drops all stale results before counting them. For a
+            # trainable group this min matches min(ts.min_policy_version): a sample's
+            # min_policy_version is its opening turn's version and per-rollout versions are
+            # non-decreasing, so the group min is turn 0's version either way.
+            group_min_policy_version = min(
+                (
+                    turn.min_policy_version
+                    for rollout in rollout_group.rollouts
+                    for turn in rollout.turns
+                    if turn.min_policy_version is not None
+                ),
+                default=None,
+            )
+            if group_min_policy_version is not None:
                 # NOTE: checked at the CURRENT trainer version, but the batch is
                 # consumed later; with the 1-deep training_batch_queue the trainer can
                 # advance one step in between, so use >= (leave a 1-step margin) to keep
                 # the consume-time age <= max_offpolicy_steps and never trip the hard
                 # freshness assertion in compute_policy_age_metrics.
-                group_age = self._trainer_policy_version - min(
-                    ts.min_policy_version for ts in samples
-                )
+                group_age = self._trainer_policy_version - group_min_policy_version
                 if group_age >= self.config.async_loop.max_offpolicy_steps:
                     logger.info(
                         "[buffer] complete group_id=%d solved=%d/%d class=%s "
