@@ -245,6 +245,43 @@ def rl_grpo_qwen3_5_4b_varlen_unified() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_5_4b_varlen_unified_cg() -> Controller.Config:
+    """Feasibility probe: unified GDN + FULL_DECODE_ONLY cudagraph (compile off)."""
+    cfg = rl_grpo_qwen3_5_4b_varlen_unified()
+    return dataclasses.replace(
+        cfg,
+        generator=dataclasses.replace(
+            cfg.generator,
+            cudagraph=VLLMCudagraphConfig(enable=True, mode="FULL_DECODE_ONLY"),
+        ),
+    )
+
+
+def rl_grpo_qwen3_5_4b_varlen_unified_compile() -> Controller.Config:
+    """Feasibility probe: unified GDN + per-layer torch.compile (aot_eager), no cudagraph."""
+    cfg = rl_grpo_qwen3_5_4b_varlen_unified()
+    return dataclasses.replace(cfg, compile=CompileConfig(enable=True, backend="aot_eager"))
+
+
+def rl_grpo_qwen3_5_4b_varlen_unified_cg_compile() -> Controller.Config:
+    """Feasibility probe: unified GDN + cudagraph FULL_DECODE_ONLY + torch.compile aot_eager."""
+    cfg = rl_grpo_qwen3_5_4b_varlen_unified()
+    return dataclasses.replace(
+        cfg,
+        compile=CompileConfig(enable=True, backend="aot_eager"),
+        generator=dataclasses.replace(
+            cfg.generator,
+            cudagraph=VLLMCudagraphConfig(enable=True, mode="FULL_DECODE_ONLY"),
+        ),
+    )
+
+
+def rl_grpo_qwen3_5_4b_varlen_unified_inductor() -> Controller.Config:
+    """Feasibility probe: unified GDN + torch.compile INDUCTOR (expected: GDN not compile-clean)."""
+    cfg = rl_grpo_qwen3_5_4b_varlen_unified()
+    return dataclasses.replace(cfg, compile=CompileConfig(enable=True, backend="inductor"))
+
+
 def rl_grpo_qwen3_5_4b_varlen_unified_prefix() -> Controller.Config:
     """Unified GDN + mamba prefix caching (align mode) for Qwen3.5-4B.
 
