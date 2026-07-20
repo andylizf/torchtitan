@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 # Must set spawn method before any CUDA operations or vLLM imports
 # CUDA cannot be re-initialized in forked subprocesses
@@ -81,7 +82,7 @@ def generate() -> None:
         raise ValueError(f"Unknown RL config {args.config!r}")
     config = config_factory()
     gen_config = config.generator
-    model_path = config.hf_assets_path
+    model_path = os.path.abspath(config.hf_assets_path)
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
 
@@ -107,7 +108,12 @@ def generate() -> None:
     )
     logger.info("Registered TorchTitan model with vLLM")
 
-    inner_attn = config.model_spec.model.layers[0].attention.inner_attention
+    # Hybrid GDN models (Qwen3.5) have GatedDeltaNet as layer 0, so use
+    # first_attention (the first full-attention layer) like the real generator.
+    attn_config = config.model_spec.model.first_attention
+    if attn_config is None:
+        raise ValueError("Model has no full-attention layer for the wrapper.")
+    inner_attn = attn_config.inner_attention
     if not isinstance(inner_attn, (VarlenAttention.Config, FlexAttention.Config)):
         raise ValueError("Only varlen and flex attention backends are supported.")
 
@@ -155,6 +161,8 @@ def generate() -> None:
             ),
         ),
         disable_log_stats=False,
+        mamba_cache_dtype=gen_config.mamba_cache_dtype,
+        mamba_ssm_cache_dtype=gen_config.mamba_ssm_cache_dtype,
     )
     engine_kwargs["max_model_len"] = config.model_spec.model.max_seq_len
     engine_kwargs["max_num_seqs"] = max_num_seqs
@@ -182,12 +190,16 @@ def generate() -> None:
     temperature = sampling.temperature if args.temperature is None else args.temperature
     top_p = sampling.top_p if args.top_p is None else args.top_p
     max_tokens = sampling.max_tokens if args.max_tokens is None else args.max_tokens
+    # --bench: ignore EOS + stop tokens so the model emits the full max_tokens
+    # (decode-loop timing needs a fixed, long token count, not the model's natural stop).
+    bench = os.environ.get("GEN_BENCH", "0") == "1"
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
         n=1,
-        stop_token_ids=stop_token_ids or None,
+        stop_token_ids=None if bench else (stop_token_ids or None),
+        ignore_eos=bench,
         seed=gen_config.debug.seed,
         output_kind=RequestOutputKind.FINAL_ONLY,
     )
@@ -221,7 +233,10 @@ def generate() -> None:
 
     # Generate text by stepping through engine
     logger.debug("Generating text...")
+    _t0 = time.perf_counter()
+    _nsteps = 0
     while engine.has_unfinished_requests():
+        _nsteps += 1
         request_outputs = engine.step()
 
         # Process finished requests
@@ -232,10 +247,17 @@ def generate() -> None:
 
                 # Print results
                 logger.debug("Generation complete")
+                _dt = time.perf_counter() - _t0
                 if is_rank0:
+                    n_out = len(output_token_ids)
                     print(f"\nConfig: {args.config}", flush=True)
                     print(f"Prompt: {prompt}", flush=True)
-                    print(f"Generated token count: {len(output_token_ids)}", flush=True)
+                    print(f"Generated token count: {n_out}", flush=True)
+                    print(
+                        f"BENCH: gen_loop_wall={_dt:.3f}s steps={_nsteps} "
+                        f"tok/s={n_out/_dt:.1f} (batch=1)",
+                        flush=True,
+                    )
                     print(f"Generated text: {generated_text!r}\n", flush=True)
 
 
