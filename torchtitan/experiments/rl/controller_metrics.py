@@ -101,10 +101,16 @@ def compute_perf_ratio_metrics(
     push_s = seconds.get("timing/step/push_model_state_dict")
     pull_s = seconds.get("timing/step/pull_model_state_dict")
 
-    if not step_s:  # no step wall-clock -> no denominator to derive ratios from
-        return []
+    # Always emit the raw global valid-token count (== the loss_denominator) as a
+    # standalone scalar, independent of whether the step timers were recorded.
+    base: list[m.Metric] = [
+        m.Metric("batch/num_global_valid_tokens", m.NoReduce(float(num_global_valid_tokens)))
+    ]
 
-    out: list[m.Metric] = []
+    if not step_s:  # no step wall-clock -> no denominator to derive ratios from
+        return base
+
+    out: list[m.Metric] = list(base)
 
     def _add_metric(key: str, value: float) -> None:
         out.append(m.Metric(key, m.NoReduce(value)))
