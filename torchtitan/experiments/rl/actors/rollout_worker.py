@@ -15,9 +15,11 @@ sandboxes or generators are available.
 This actor moves ``run_group_rollouts`` into a pool of CPU worker processes
 (co-located on the generator hosts). Each worker owns its own ``Rollouter``
 (with a local 127.0.0.1 shim on a per-worker port), ``Renderer``, and a
-generate-only generator router. The controller dispatches one group at a time to
-a worker (round-robin) and receives the finalized ``RolloutGroup`` back; the
-off-policy buffer, batcher, trainer, and weight sync all stay in the controller.
+generate-only generator router. The controller sends one RPC per group and
+round-robins those RPCs across workers. Multiple async ``run_group`` calls overlap
+inside each worker; ``train.py`` pins Monarch's concurrent endpoint dispatch for
+this behavior. The finalized groups return independently, while the off-policy
+buffer, batcher, trainer, and weight sync all stay in the controller.
 
 Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 ``RolloutGroup`` out (which has to reach the trainer anyway).

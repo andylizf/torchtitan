@@ -605,7 +605,7 @@ class Controller(Configurable):
         # worker (like the generators, so each is individually addressable for
         # round-robin dispatch). The global SWE_ROLLOUT_CONCURRENCY target is split
         # evenly across the pool; each worker sets its own share before its rollouter
-        # builds its lazy semaphore.
+        # builds its sibling-level admission gate.
         num_workers = config.num_rollout_workers
         if num_workers > 0:
             global_conc = int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "16"))

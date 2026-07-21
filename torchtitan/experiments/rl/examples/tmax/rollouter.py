@@ -110,29 +110,18 @@ class _RootSandbox:
 
 
 class _RolloutIssueGate:
-    """Async slot gate that admits work in ascending priority (lowest
-    ``(group_id, rollout_idx)`` first), NOT FIFO, with per-sibling release. It gives
-    open-instruct-style id-ordered issue (low-id groups get generator capacity first
-    and finish fresh), while a straggler holds only its OWN slot -- a later group
-    starts the moment capacity frees, with no wait for any group to fully complete.
+    """Work-conserving async gate for sibling rollouts in one worker process.
 
-    Two admission modes, chosen by the caller from whether a whole group fits:
+    Every sibling reserves one slot. Waiters are admitted by ascending
+    ``(group_id, rollout_idx)`` priority, so lower-id prompt groups get capacity first,
+    but any completed sibling immediately hands its slot to the next waiter. A slow
+    sibling therefore occupies only its own slot and cannot leave the worker's other
+    slots idle while the gate waits to reassemble a full group.
 
-      - ``acquire_group(group_id, n)`` reserves ``n`` slots ATOMICALLY, so the group's
-        n siblings dispatch together in one wave ("a group goes out in one step").
-        Used when ``capacity >= group_size``.
-      - ``acquire_sibling(priority)`` reserves 1 slot. Used only when
-        ``capacity < group_size``, where a whole group physically cannot run at once
-        (atomic issue is impossible); siblings then go strictly in id order but
-        sub-batched.
-
-    Both share one slot counter, so exactly ``capacity`` siblings run concurrently in
-    either mode; ``release()`` returns one slot per finished sibling. Admission always
-    serves the lowest-priority waiter and STOPS at the first that does not fit (never
-    skipping it), which preserves id order and lets ``acquire_group`` reserve a whole
-    wave -- at the cost of holding up to ``group_size - 1`` slots idle while a wave's
-    worth of slots accumulates (bounded, and pooled across the concurrent groups'
-    releases, so small in practice).
+    This matches open-instruct's environment pool at the relevant boundary: an
+    environment is acquired and released per rollout, while prompt-group aggregation
+    separately waits for all siblings. The gate is per worker process, not global
+    across the RolloutWorker pool.
 
     Single-event-loop only (no threads): asyncio runs coroutine steps serially, so the
     counter/heap need no lock.
@@ -143,65 +132,41 @@ class _RolloutIssueGate:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
         self._capacity = capacity
         self._available = capacity
-        # Min-heap of (priority, tiebreak, need, future). tiebreak keeps the heap
+        # Min-heap of (priority, tiebreak, future). tiebreak keeps the heap
         # totally ordered on equal priority (and never compares futures).
-        self._waiters: list[tuple[tuple[int, int], int, int, asyncio.Future]] = []
+        self._waiters: list[tuple[tuple[int, int], int, asyncio.Future]] = []
         self._tiebreak = itertools.count()
 
-    @property
-    def capacity(self) -> int:
-        return self._capacity
-
-    async def acquire_group(self, group_id: int, n: int) -> None:
-        """Reserve ``n`` slots atomically for a group (sorts before its siblings via
-        the ``-1`` sub-key), so the group's n siblings dispatch as one wave."""
-        await self._acquire((group_id, -1), n)
-
     async def acquire_sibling(self, priority: tuple[int, int]) -> None:
-        """Reserve a single slot (non-atomic fallback when a group cannot fit)."""
-        await self._acquire(priority, 1)
-
-    async def _acquire(self, priority: tuple[int, int], need: int) -> None:
-        if need > self._capacity:
-            raise ValueError(f"acquire need={need} exceeds capacity={self._capacity}")
+        """Reserve one rollout slot, waiting behind lower-priority siblings."""
         fut = asyncio.get_running_loop().create_future()
-        heapq.heappush(self._waiters, (priority, next(self._tiebreak), need, fut))
+        heapq.heappush(self._waiters, (priority, next(self._tiebreak), fut))
         self._try_admit()  # may grant synchronously if this is now the head and fits
-        if fut.done():
-            return
         try:
             await fut
         except asyncio.CancelledError:
-            # Granted-then-cancelled: return the `need` slots we were handed.
+            # Granted-then-cancelled: return the slot we were handed.
             # Pending-then-cancelled: the dead future is dropped by _try_admit's
             # done() check, so there is nothing to return.
             if fut.done() and not fut.cancelled():
-                self._release(need)
+                self.release()
+            else:
+                self._try_admit()
             raise
 
-    def release(self, count: int = 1) -> None:
-        """Return ``count`` slots (one per finished sibling) and admit any waiters
-        that now fit."""
-        self._release(count)
-
-    def _release(self, count: int) -> None:
-        self._available += count
+    def release(self) -> None:
+        """Return one sibling slot and immediately admit the next waiter."""
+        self._available += 1
+        assert self._available <= self._capacity, "rollout gate released too many slots"
         self._try_admit()
 
     def _try_admit(self) -> None:
-        # Grant from the lowest-priority waiter down while it fits; STOP at the first
-        # that does not (do not skip it -> id order + whole-wave reservation).
-        while self._waiters:
-            _, _, need, fut = self._waiters[0]
+        while self._waiters and self._available:
+            _, _, fut = heapq.heappop(self._waiters)
             if fut.done():  # cancelled/settled: drop and continue
-                heapq.heappop(self._waiters)
                 continue
-            if self._available >= need:
-                heapq.heappop(self._waiters)
-                self._available -= need
-                fut.set_result(None)
-            else:
-                break
+            self._available -= 1
+            fut.set_result(None)
 
 
 class TMaxRollouter(Rollouter):
@@ -245,8 +210,8 @@ class TMaxRollouter(Rollouter):
         # rollout_concurrency to its per-worker share.
         rollout_concurrency: int = 16
         """Max concurrently-ACTIVE rollouts (per worker process). The pool total is
-        num_rollout_workers x this. Gates per-turn fs ops so the adapter stays
-        responsive; all groups are still collected in waves."""
+        num_rollout_workers x this. Each completed sibling immediately releases its
+        slot to the next waiting rollout."""
 
         time_budget_sec: int = 1200
         """Per-rollout agent wall-clock budget (the vanillux loop stops after this)."""
@@ -264,16 +229,10 @@ class TMaxRollouter(Rollouter):
         self._max_context_tokens = config.max_context_tokens
         # Whole-rollout wall-clock guard: agent budget + eval + boot buffer.
         self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300
-        # Per-worker rollout-issue gate (one rollouter per worker proc). Admits work
-        # lowest-(group_id, rollout_idx)-first (not FIFO), so the lowest-id groups get
-        # generator capacity first and finish fresh (open-instruct's id-ordered pool
-        # admission). When a whole group fits (capacity >= group_size) it reserves the
-        # group atomically so its siblings dispatch in one wave; slots release per
-        # sibling, so a straggler never blocks a later group. NOTE: ordering is
-        # per-worker; with a RolloutWorker pool the controller stripes group_ids
-        # round-robin across workers, so each worker orders its own strided subset
-        # (open-instruct's pool is a single shared actor = globally ordered; a global
-        # gate would need cross-process coordination).
+        # Per-worker rollout-issue gate (one rollouter per worker proc). Each sibling
+        # holds one slot, matching open-instruct's per-rollout environment acquire and
+        # release. Ordering is per worker: with a RolloutWorker pool the controller
+        # stripes group ids across workers, so each gate prioritizes its own subset.
         self._rollout_gate = _RolloutIssueGate(config.rollout_concurrency)
         self._adapter: AnthropicAdapter | None = None
         self._adapter_lock = asyncio.Lock()
@@ -302,23 +261,8 @@ class TMaxRollouter(Rollouter):
         """Run + grade one prompt group of terminal-agent rollouts."""
         adapter = await self._ensure_adapter(renderer)
 
-        # Atomic group issue when a whole group fits the gate: reserve group_size slots
-        # in id order so this group's siblings dispatch as one wave, ahead of any
-        # higher-id group. If a group cannot fit (capacity < group_size), fall back to
-        # per-sibling id-ordered admission inside _run_agent_rollout (see gate docs).
-        atomic_issue = self._rollout_gate.capacity >= group_size
-        if atomic_issue:
-            await self._rollout_gate.acquire_group(group_id, group_size)
-        # TODO(async-rl): the group_size reservation is balanced by the per-sibling
-        # release() in each _run_agent_rollout finally. If this coroutine is cancelled
-        # AFTER acquire_group grants but BEFORE the siblings enter their try, the not-yet-
-        # started siblings never release, leaking their slots. Today the only cancel is
-        # full-process shutdown (controller close), where it is harmless (the process
-        # exits). If a per-group mid-flight cancel/timeout is ever added, wrap the
-        # gather in try/finally and release the count of siblings that did not run.
-
-        results = await asyncio.gather(
-            *(
+        rollout_tasks = [
+            asyncio.create_task(
                 self._run_agent_rollout(
                     adapter=adapter,
                     generate_fn=generate_fn,
@@ -327,11 +271,19 @@ class TMaxRollouter(Rollouter):
                     rollout_idx=i,
                     sampling=sampling,
                     renderer=renderer,
-                    gate_per_sibling=not atomic_issue,
-                )
-                for i in range(group_size)
+                ),
+                name=f"tmax_rollout_{group_id}_{i}",
             )
-        )
+            for i in range(group_size)
+        ]
+        try:
+            results = await asyncio.gather(*rollout_tasks)
+        except BaseException:
+            # Parent cancellation already propagates through gather. A child exception
+            # does not, so let the other rollouts finish. In both cases drain without a
+            # second cancel, which could interrupt an in-progress sandbox teardown.
+            await asyncio.gather(*rollout_tasks, return_exceptions=True)
+            raise
         rollouts = [rollout for rollout, _, _ in results]
         submitted_flags = [submitted for _, submitted, _ in results]
         fmt_errors_list = [fmt for _, _, fmt in results]
@@ -408,7 +360,6 @@ class TMaxRollouter(Rollouter):
         rollout_idx: int,
         sampling: "SamplingConfig",
         renderer: Renderer,
-        gate_per_sibling: bool,
     ) -> tuple[Rollout, bool, int]:
         """Boot a sandbox, run the agent as root, grade the task in place.
 
@@ -427,17 +378,9 @@ class TMaxRollouter(Rollouter):
         error_msg = ""
         submitted = False
         fmt_errors = 0  # total format errors this rollout (from run_vanillux_loop)
-        # Slot accounting: in atomic mode run_group_rollouts already reserved this
-        # sibling's slot as part of the group's wave, so acquire only in the per-sibling
-        # fallback (capacity < group_size). Either way we release exactly one slot in
-        # the finally, so the group's group_size reservation stays balanced.
-        if gate_per_sibling:
-            await self._rollout_gate.acquire_sibling((group_id, rollout_idx))
+        await self._rollout_gate.acquire_sibling((group_id, rollout_idx))
         try:
-            # open_session inside the try so its failure still reaches the finally
-            # (release + finish_session): the gate slot -- reserved atomically by
-            # run_group_rollouts in atomic mode, or by acquire_sibling above in the
-            # fallback -- must be released even if open_session raises.
+            # open_session is inside the try so a failure still releases the slot.
             adapter.open_session(
                 rollout_id,
                 generate_fn=generate_fn,
