@@ -142,7 +142,7 @@ _small_m_matmul_patched = False
 
 
 def patch_matmul_for_small_m_batch_invariance() -> None:
-    """Shrink the batch_invariant_ops persistent-matmul M output-tile for small M.
+    """Tune batch_invariant_ops persistent-matmul output tiles for small M.
 
     batch_invariant_ops.matmul_persistent always launches its Triton kernel with
     BLOCK_SIZE_M=128. On DECODE the matmul is [num_seqs, K] @ [K, N] with num_seqs
@@ -152,7 +152,10 @@ def patch_matmul_for_small_m_batch_invariance() -> None:
     per-output-element K-reduction order, hence the numerics) is UNCHANGED, so the
     result is bitwise-identical to the upstream kernel for every M -- verified with
     torch.equal across M in {8,16,64,128,2000} -- and M>=128 (e.g. trainer/prefill)
-    keeps the original BLOCK_SIZE_M=128 unchanged. Idempotent; safe to call after
+    keeps the original BLOCK_SIZE_M=128 unchanged. For bf16 small-M outputs no wider
+    than 4096, BLOCK_SIZE_N=32 exposes enough output tiles to occupy the H100 while
+    leaving the per-element K reduction unchanged. Wider outputs keep the upstream
+    N tile because the smaller tile is slower there. Idempotent; safe to call after
     set_batch_invariance. No-op (logs) if the package internals are unavailable.
     """
     global _small_m_matmul_patched
@@ -200,10 +203,13 @@ def patch_matmul_for_small_m_batch_invariance() -> None:
         _, N = b.shape
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
         cfg = dict(_cfgs[str(a.dtype).split(".")[-1]])
-        # Only the M output-tile shrinks; BLOCK_SIZE_K stays fixed -> same reduction.
+        # Tune only output tiles; BLOCK_SIZE_K stays fixed -> same reduction.
         cfg["BLOCK_SIZE_M"] = min(
             cfg["BLOCK_SIZE_M"], max(16, triton.next_power_of_2(M))
         )
+        if a.dtype == torch.bfloat16 and cfg["BLOCK_SIZE_M"] < 128 and N <= 4096:
+            cfg["BLOCK_SIZE_N"] = 32
+            cfg["num_warps"] = 4
         # Small-M (decode) is HBM-bound loading the weights; num_stages=4 pipelines
         # those loads ~1.3-1.5x faster than the upstream 3 (measured). num_stages is
         # scheduling only -> same K accumulation -> bitwise-identical (verified
@@ -248,6 +254,6 @@ def patch_matmul_for_small_m_batch_invariance() -> None:
     _bi.matmul_persistent = _small_m_matmul_persistent
     _small_m_matmul_patched = True
     logger.info(
-        "Patched batch_invariant_ops.matmul_persistent with a small-M output-tile "
+        "Patched batch_invariant_ops.matmul_persistent with small-M output tiles "
         "(BLOCK_SIZE_K unchanged -> bitwise-identical; faster small-M decode)"
     )

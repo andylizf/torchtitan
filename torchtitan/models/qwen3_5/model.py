@@ -230,14 +230,15 @@ class _RecurrentFwdChunkBwd(torch.autograd.Function):
     """
 
     @staticmethod
+    # pyrefly: ignore [bad-override]
     def forward(ctx, q, k, v, g, beta, cu_seqlens):
         ctx.save_for_backward(q, k, v, g, beta)
         ctx.cu_seqlens = cu_seqlens
         with torch.no_grad():
-            # Run the recurrence in fp32 and pass a materialized ZERO initial state
-            # (not None). Two reasons this makes trainer == generator prefill ==
-            # generator decode bitwise: (1) fp32 keeps the recurrence stepped-exact
-            # (bf16 loses ~1e-5 across full-vs-stepped); (2) fla compiles
+            # Pass fp32 V and a materialized ZERO initial state (not None). Two
+            # reasons this makes trainer == generator prefill == generator decode
+            # bitwise: (1) fp32 V makes FLA keep its output in fp32 while Q/K are
+            # converted to fp32 on load; (2) FLA compiles
             # USE_INITIAL_STATE from (h0 is not None), so a None here vs the tensor
             # state the decode path passes would select two different binaries with
             # divergent fp reductions -- a zero init forces the SAME binary. The
@@ -246,11 +247,11 @@ class _RecurrentFwdChunkBwd(torch.autograd.Function):
                 int(cu_seqlens.numel()) - 1 if cu_seqlens is not None else q.shape[0]
             )
             h0 = q.new_zeros(
-                n_seq, q.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
+                n_seq, v.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
             )
             out, _ = _fla_fused_recurrent_gated_delta_rule(
-                q.float(),
-                k.float(),
+                q,
+                k,
                 v.float(),
                 g.float(),
                 beta=beta.float(),
@@ -261,14 +262,23 @@ class _RecurrentFwdChunkBwd(torch.autograd.Function):
         return out.to(q.dtype)
 
     @staticmethod
+    # pyrefly: ignore [bad-override]
     def backward(ctx, grad_out):
         q, k, v, g, beta = ctx.saved_tensors
         # Recompute the chunk kernel with grad enabled and backprop through it.
         with torch.enable_grad():
             ins = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
+            q_chunk_BTHK, k_chunk_BTHK = ins[0], ins[1]
+            if q_chunk_BTHK.shape[2] != ins[2].shape[2]:
+                # FLA supports GVA in the chunk forward but its GVA backward is not
+                # usable. Preserve the established expanded-head backward;
+                # autograd sums the repeated-head gradients back into Q/K.
+                repeat = ins[2].shape[2] // q_chunk_BTHK.shape[2]
+                q_chunk_BTHK = q_chunk_BTHK.repeat_interleave(repeat, dim=2)
+                k_chunk_BTHK = k_chunk_BTHK.repeat_interleave(repeat, dim=2)
             out_chunk = _fla_chunk_gated_delta_rule(
-                ins[0],
-                ins[1],
+                q_chunk_BTHK,
+                k_chunk_BTHK,
                 ins[2],
                 ins[3],
                 ins[4],
@@ -284,8 +294,8 @@ class GatedDeltaKernel(Module):
 
     Provides a module boundary for the sharding code to wrap forward with
     DTensor→local conversion — same pattern as FlexAttention. Handles Q/K
-    head expansion for grouped linear attention internally so that
-    repeat_interleave runs on local tensors under TP.
+    grouped linear attention internally. Legacy paths expand Q/K on local tensors
+    under TP; the batch-invariant recurrent path uses FLA's native grouped heads.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -310,12 +320,15 @@ class GatedDeltaKernel(Module):
         beta: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Expand Q/K heads to match V when n_value_heads > n_key_heads
+        # FLA's chunk and recurrent kernels natively support grouped value
+        # attention. Keep the established expansion outside batch-invariant mode,
+        # but avoid materializing repeated Q/K heads on the recurrent BI path.
         if q.shape[2] != v.shape[2]:
             assert v.shape[2] % q.shape[2] == 0
-            repeat = v.shape[2] // q.shape[2]
-            q = q.repeat_interleave(repeat, dim=2)
-            k = k.repeat_interleave(repeat, dim=2)
+            if self.backend == "torch_native" or not is_in_batch_invariant_mode():
+                repeat = v.shape[2] // q.shape[2]
+                q = q.repeat_interleave(repeat, dim=2)
+                k = k.repeat_interleave(repeat, dim=2)
 
         if self.backend == "torch_native":
             return _torch_native_gated_delta(q, k, v, g, beta, cu_seqlens=cu_seqlens)

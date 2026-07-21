@@ -53,6 +53,7 @@ from fla.ops.gated_delta_rule import (
     fused_recurrent_gated_delta_rule as _external_fla_fused_recurrent_gated_delta_rule,
 )
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.experiments.rl.models.gdn_fla_paged import gather_transposed_paged_state
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 from vllm.config import get_current_vllm_config
@@ -100,8 +101,8 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
     vLLM's native GDN helper kernels against it. Decode uses the recurrent update
     path; prefill uses the varlen chunk path, matching vLLM native's split.
 
-    Non-speculative decoding only (asserts otherwise). Requires the generator
-    cudagraph off until this custom core is captured and validated separately.
+    Non-speculative decoding only (asserts otherwise). The recurrent
+    batch-invariant path also supports decode cudagraphs.
 
     Prefix caching: validated for BOTH the vendored path and the recurrent-everywhere
     trainer-parity path. With ``enable_prefix_caching=True`` vLLM auto-selects
@@ -245,7 +246,7 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         )
         v = (
             mixed_qkv_slice_TC[:, 2 * self.key_dim :]
-            .contiguous()
+            .float()
             .view(1, num_tokens, self.num_v_heads, self.head_v_dim)
         )
         return q, k, v
@@ -258,6 +259,7 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         a_THv: torch.Tensor,
         b_THv: torch.Tensor,
         *,
+        out_1THvDv: torch.Tensor,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         conv_weight: torch.Tensor,
@@ -289,7 +291,6 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             else self.kv_cache[0].transpose(-1, -2)
         )
         conv_W = self.conv_kernel_size
-        out_1THvDv = mixed_qkv_TC.new_empty(1, n, self.num_v_heads, self.head_v_dim)
 
         def _pad_w1_to_w(state_w1: torch.Tensor) -> torch.Tensor:
             # [n, conv_dim, W-1] -> [n, conv_dim, W]; leading column is a don't-care.
@@ -310,16 +311,10 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             ssm_mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
             q, k, v = self._split_qkv(conv_out_TC)
-            if q.shape[2] != v.shape[2]:
-                rep = v.shape[2] // q.shape[2]
-                q = q.repeat_interleave(rep, dim=2)
-                k = k.repeat_interleave(rep, dim=2)
-            # Run the recurrence in fp32: the fla recurrent kernel is NOT bitwise
-            # stepped-consistent in bf16 (full-seq prefill vs 1-token decode differ by
-            # ~1e-5 from bf16 input rounding), but in fp32 it matches to ~1e-8, which
-            # vanishes when the output is written back to the bf16 activation buffer.
-            # This is what makes decode == prefill; the trainer upcasts identically.
-            q, k, v = q.float(), k.float(), v.float()
+            # Keep V in fp32 so fla allocates its output in fp32. The kernel loads Q/K
+            # into fp32 registers itself, so materializing fp32 Q/K tensors is redundant.
+            # The fp32 output is what makes the recurrence stepped-consistent before it
+            # is written back to the bf16 activation buffer; the trainer does the same.
             # fp32 eager gate, identical to the trainer.
             g = (A_neg_exp * F.softplus(a_THv[seg].float() + dt_bias_f)).unsqueeze(0)
             beta = torch.sigmoid(b_THv[seg].float()).unsqueeze(0)
@@ -327,18 +322,20 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             # USE_INITIAL_STATE constexpr picks the SAME compiled kernel across
             # fresh/continuation/decode (-> bitwise). paged ssm_state is [.., V, K];
             # fla wants [.., K, V]. Three modes:
-            #   "all"  (decode): every seq resumes -> a plain int-index gather, which
-            #          is cudagraph-capturable (NO boolean/data-dependent indexing).
+            #   "all"  (decode): every seq resumes -> a fused indexed copy, which is
+            #          cudagraph-capturable (NO boolean/data-dependent indexing).
             #   "mask" (mixed prefill, eager -- not captured): per-seq boolean restore.
             #   "zero" (fresh prefill): zeros.
             if ssm_init == "all":
-                initial_state = (
-                    ssm_state[slot_idx].transpose(-1, -2).float().contiguous()
-                )
+                # Fuse the paged gather and V/K transpose into one copy kernel. The
+                # resulting contiguous tensor is byte-identical to PyTorch's
+                # advanced-index + transpose + fp32 + contiguous sequence, so FLA
+                # itself and all recurrent arithmetic remain unchanged.
+                initial_state = gather_transposed_paged_state(ssm_state, slot_idx)
             else:
                 n_seq = int(cu_seqlens.numel()) - 1
                 initial_state = q.new_zeros(
-                    n_seq, q.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
+                    n_seq, v.shape[2], q.shape[3], v.shape[3], dtype=torch.float32
                 )
                 if ssm_init == "mask" and ssm_mask is not None:
                     initial_state[ssm_mask] = (
@@ -509,12 +506,13 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
         # (model.py _RecurrentFwdChunkBwd). This supersedes the chunk-prefill parity
         # branch below when both are on.
         if _TRAINER_PARITY_FLA and is_in_batch_invariant_mode():
-            out_BTHvDv[:, :n] = self._forward_recurrent_bi(
+            self._forward_recurrent_bi(
                 m,
                 n,
                 mixed_qkv_TC,
                 a_THv,
                 b_THv,
+                out_1THvDv=out_BTHvDv[:, :n],
                 A_log=A_log,
                 dt_bias=dt_bias,
                 conv_weight=conv_weight,
