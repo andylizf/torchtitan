@@ -17,12 +17,13 @@
 ``torchtitan/experiments/__init__.py::_supported_experiments``, a core file this
 example deliberately does not modify. The MAST path uses ``--module mast_rl``.)
 
-The tmax config clones the Qwen3.6-27B SWE-R2E recipe
-(``rl_grpo_qwen3_5_27b_swe_r2e``) verbatim -- same model spec, FSDP/generator
-split, memory setup (bf16 master + bf16 Adam + FullAC + chunked DAPO loss), and
-async knobs -- but swaps the rollouter to ``TMaxRollouter`` + ``TMaxDataset``. The
-tmax JSONL path comes from ``SWE_PROMPT_DATA`` (set by the launcher's
-``PROMPT_DATA``), matching the swe_r2e convention.
+The 27B tmax config clones the Qwen3.6-27B SWE-R2E recipe
+(``rl_grpo_qwen3_5_27b_swe_r2e``) verbatim. The 9B recipe restores standard
+mixed precision (fp32 master parameters, bf16 compute, fp32 AdamW states) and
+the optimizer settings from open-instruct's TMax recipe. Both swap the rollouter
+to ``TMaxRollouter`` + ``TMaxDataset``. The tmax JSONL path comes from
+``SWE_PROMPT_DATA`` (set by the launcher's ``PROMPT_DATA``), matching the
+swe_r2e convention.
 """
 
 from __future__ import annotations
@@ -30,11 +31,11 @@ from __future__ import annotations
 import dataclasses
 import os
 
+from torchtitan.components.optimizer import default_adamw, OptimizersContainer
+
 from torchtitan.config import DebugConfig
 
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-
-from torchtitan.components.optimizer import default_adamw
 from torchtitan.experiments.rl.actors.generator import VLLMCudagraphConfig
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
@@ -150,6 +151,25 @@ def _tmax_recipe_loss(loss):
     )
 
 
+def _tmax_9b_adamw(lr: float = 1e-6) -> OptimizersContainer.Config:
+    """Build the AdamW config used by open-instruct's TMax-9B recipe.
+
+    With the 9B trainer's fp32 master parameters, ordinary fused AdamW keeps its
+    optimizer states in fp32. ``fused_opt_states_bf16`` must not be used here:
+    it would intentionally quantize the moment states and break recipe parity.
+    Full checkpoints from the former bf16-state recipe are not compatible; start
+    this recipe from a fresh dump folder or a model-only checkpoint.
+    """
+    optimizer = default_adamw(
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
+    optimizer.implementation = "fused"
+    return optimizer
+
+
 def rl_grpo_qwen3_5_27b_tmax() -> Controller.Config:
     """Qwen3.6-27B (Gated DeltaNet hybrid) tmax terminal-agent on a single 8-GPU node.
 
@@ -176,8 +196,11 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     (num_samples_per_prompt_rollout), off-policy 4 (async_steps), per-turn 16384,
     full 65536 context (response_length), and ``drop_zero_std_reward_groups=True``
     (``filter_zero_std_samples``) -- terminal tasks are sparse binary, so keeping
-    all-fail groups would zero out the gradient. temperature 1.0, lr 1e-6, constant
-    LR, GRPO/DAPO with beta 0 are inherited from the swe base and already match.
+    all-fail groups would zero out the gradient. Temperature 1.0, constant LR,
+    and beta 0 are inherited from the swe base. The trainer restores standard
+    mixed precision (fp32 master parameters, bf16 FSDP compute/reduce in fp32)
+    and open-instruct's fused AdamW settings: lr 1e-6, betas (0.9, 0.999),
+    eps 1e-8, and no weight decay.
     num_groups is kept at 8 (vs the paper's 4) since torchtitan's drop-only filter
     has no active resampling, so more groups per step raise the odds of a non-empty
     trained batch under sparse reward.
@@ -191,6 +214,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     """
     config = _swe_9b()
     config.rollouter = _tmax_rollouter()
+    assert config.model_spec is not None
     _set_max_seq_len(config.model_spec, _TMAX_9B_CONTEXT)
     # Interleaved thinking: keep each turn's <think> in later prompts (the tmax
     # recipe's preserve_thinking, shown to help agentic RL). The qwen3.5 renderer
@@ -306,6 +330,13 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     config.trainer = dataclasses.replace(
         config.trainer,
         loss=_loss,
+        optimizer=_tmax_9b_adamw(),
+        training=dataclasses.replace(
+            config.trainer.training,
+            dtype="float32",
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+        ),
         checkpoint=dataclasses.replace(config.trainer.checkpoint, interval=20),
     )
     # Optional trainer FSDP width override for a fwd/bwd speed experiment. The mast_rl
@@ -353,14 +384,13 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                 ),
             ),
         )
-    # Optional learning-rate override (SWE_LR). Default keeps the recipe's 1e-6.
-    # Rebuilding via default_adamw preserves betas/eps/weight_decay and changes only
-    # lr. Used for the effective-step-size A/B (our token-mean grad_norm runs ~4-5x
-    # open-instruct's, so lr ~2e-7 matches OI's proven effective update lr*grad_norm).
+    # Optional learning-rate override (SWE_LR). Rebuild through the TMax helper so
+    # changing lr preserves the open-instruct betas, eps, weight decay, fp32 states,
+    # and fused implementation.
     _lr = float(os.environ.get("SWE_LR", "0") or "0")
     if _lr > 0:
         config.trainer = dataclasses.replace(
-            config.trainer, optimizer=default_adamw(lr=_lr)
+            config.trainer, optimizer=_tmax_9b_adamw(lr=_lr)
         )
     # Batch-invariant GDN mode (SWE_GDN_BI=1): make the generator's decode == prefill
     # == trainer logprobs BITWISE by routing BOTH the trainer and the unified vLLM
@@ -382,6 +412,10 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         config.trainer = dataclasses.replace(
             config.trainer,
             debug=_bi,
+            # The current batch-invariant path requires full bf16 training. This
+            # diagnostic mode intentionally opts out of the fp32 master used by
+            # the normal 9B training recipe.
+            training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
             parallelism=dataclasses.replace(
                 config.trainer.parallelism, enable_sequence_parallel=False
             ),
@@ -415,10 +449,11 @@ def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
     much of the 9B GDN logprob drift is GDN-specific (chunk-parallel train vs
     recurrent decode) rather than generic batch/kernel nondeterminism.
 
-    Preconditions (all already satisfied by the tmax base): bf16 trainer+generator
-    dtype and no sequence parallel. Batch invariance also requires the reset (not
-    salt) prefix-cache policy, which the generator ``__post_init__`` enforces; the
-    9B tmax base enables salt-KV, so it is turned off here.
+    This diagnostic intentionally uses full bf16 training instead of the 9B
+    recipe's fp32 master parameters because batch invariance currently requires a
+    bf16 trainer dtype. It also requires no sequence parallel and the reset (not
+    salt) prefix-cache policy; the 9B tmax base enables salt-KV, so it is turned
+    off here.
     """
     _bi = DebugConfig(batch_invariant=True, deterministic=True)
     config = rl_grpo_qwen3_5_9b_tmax()
@@ -432,6 +467,7 @@ def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
     config.trainer = dataclasses.replace(
         config.trainer,
         debug=_bi,
+        training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
         parallelism=dataclasses.replace(
             config.trainer.parallelism, enable_sequence_parallel=False
         ),
