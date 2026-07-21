@@ -188,7 +188,7 @@ class DaytonaSandbox:
         # auto-stops after auto_stop minutes, then auto-deletes immediately
         # (auto_delete=0). A live rollout keeps the sandbox active (the host polls
         # its fs continuously via the bridge), so it is never stopped mid-run.
-        auto_stop = int(_getenv("TT_DAYTONA_AUTO_STOP_MIN", default="30"))
+        auto_stop = int(_getenv("TT_DAYTONA_AUTO_STOP_MIN", default="10"))
         auto_delete = int(_getenv("TT_DAYTONA_AUTO_DELETE_MIN", default="0"))
         params = CreateSandboxFromImageParams(
             image=self.image,

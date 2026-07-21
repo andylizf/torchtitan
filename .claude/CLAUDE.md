@@ -34,6 +34,27 @@ See tests/integration_tests/ for `OverrideDefinitions`.
 When running performance tests, use at least 10 training steps (for example,
 `--training.steps 10`) so startup and warmup effects do not dominate the results.
 
+### TMax Daytona Capacity
+
+As of 2026-07-21, the Daytona account limits are 5000 vCPU, 20000 GiB memory,
+and 25000 GiB storage. Do not use the older 1500 vCPU / 3000 GiB assumptions
+when sizing TMax runs. The observed live usage when these limits were recorded
+was 568 vCPU, 1136 GiB memory, and 1420 GiB storage; live usage is shared and
+must be checked again before increasing concurrency.
+
+The 9B TMax launcher currently allocates 2 vCPU, 4 GiB memory, and 5 GiB storage
+per Daytona sandbox. Ignoring other jobs, the account-level sandbox ceiling is
+therefore `min(5000/2, 20000/4, 25000/5) = 2500`. For reference,
+`SWE_ROLLOUT_CONCURRENCY=1024` requests 2048 vCPU, 4096 GiB memory, and 5120 GiB
+storage, so it fits the account limits. This does not guarantee a speedup: check
+Daytona failures/rate limits, generator queue and inflight metrics, rollout-worker
+CPU load, and trainer batch-wait time.
+
+The standard 9B recipe has 40 active groups of 32 siblings, or 1280 schedulable
+rollouts. Concurrency above 1280 cannot add useful rollout work without also
+increasing the active-group window. With 8 rollout workers, 1024 concurrency is
+128 sibling slots per worker.
+
 ### Validating Numerics
 Non-computation changes (e.g. activation checkpointing, refactoring) must produce
 **identical loss** before vs. after with `--debug.seed=42` and `--debug.deterministic`.
