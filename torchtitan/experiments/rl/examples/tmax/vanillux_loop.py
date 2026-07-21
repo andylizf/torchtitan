@@ -209,15 +209,15 @@ async def run_vanillux_loop(
     time_budget_sec: int,
     max_turns: int = _MAX_TURNS,
     exec_timeout: int = _EXEC_TIMEOUT,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, int, str]:
     """Drive the faithful Vanillux bash-only ReAct agent against the adapter.
 
     ``task`` is the instruction text (rendered into the vanillux instance template).
     The agent starts in /app and navigates as the instruction directs (the env uses
-    no per-task workdir). Returns ``(turns, submitted)``; the rollouter grades only
-    when ``submitted`` is True (tests run on the submit marker, matching the env).
-    Never raises for a bad turn -- format errors are surfaced to the agent as
-    observations.
+    no per-task workdir). Returns ``(turns, submitted, total_format_errors,
+    finish_reason)``; the rollouter grades only when ``submitted`` is True (tests
+    run on the submit marker, matching the env). Never raises for a bad turn --
+    format errors are surfaced to the agent as observations.
 
     Each turn calls ``adapter.complete`` directly in-process (no loopback HTTP):
     the shim does the Anthropic<->renderers translation + TITO turn capture, and
@@ -230,6 +230,7 @@ async def run_vanillux_loop(
     deadline = start_time + time_budget_sec
     turns = 0
     submitted = False
+    finish_reason: str | None = None
     consecutive_format_errors = 0
     # Total format errors across the rollout (does NOT reset on a good turn, unlike
     # consecutive_format_errors) -- surfaced as a wandb metric by the rollouter.
@@ -248,6 +249,7 @@ async def run_vanillux_loop(
         # closed or the generator yields nothing -> end the trajectory.
         data = await adapter.complete(session_id, payload)
         if data is None:
+            finish_reason = "stopped_early"
             break
 
         turns += 1
@@ -277,6 +279,7 @@ async def run_vanillux_loop(
                     "[vanillux] %s: stopping (no tool call, format_error_feedback off)",
                     session_id,
                 )
+                finish_reason = "stopped_early"
                 break
             # Opt-in legacy behavior (TMAX_FORMAT_ERROR_FEEDBACK=1): inject the
             # vanillux reminder and retry, bounded. At a full context the truncated
@@ -290,6 +293,7 @@ async def run_vanillux_loop(
                     stop_reason == "max_tokens" and not text,
                     consecutive_format_errors,
                 )
+                finish_reason = "stopped_early"
                 break
             messages.append(
                 {
@@ -327,6 +331,7 @@ async def run_vanillux_loop(
                     body = truncate_observation(raw) if raw else "(no output)"
                     obs = f"{body}\n\n(exit_code={ec})"
         if submitted:
+            finish_reason = "submit"
             break
         results.append(
             {
@@ -352,14 +357,13 @@ async def run_vanillux_loop(
     # (time-budget wall vs turn cap vs early stop). grep the log for finish= to
     # count: submit / hit_time_budget / hit_max_turns / stopped_early.
     elapsed = time.time() - start_time
-    if submitted:
-        finish_reason = "submit"
-    elif turns >= max_turns:
-        finish_reason = "hit_max_turns"
-    elif time.time() >= deadline:
-        finish_reason = "hit_time_budget"
-    else:
-        finish_reason = "stopped_early"
+    if finish_reason is None:
+        if turns >= max_turns:
+            finish_reason = "hit_max_turns"
+        elif time.time() >= deadline:
+            finish_reason = "hit_time_budget"
+        else:
+            finish_reason = "stopped_early"
     logger.info(
         "[vanillux] %s: finished after %d turns (submitted=%s finish=%s elapsed=%.0fs)",
         session_id,
@@ -368,4 +372,4 @@ async def run_vanillux_loop(
         finish_reason,
         elapsed,
     )
-    return turns, submitted, total_format_errors
+    return turns, submitted, total_format_errors, finish_reason

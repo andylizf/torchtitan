@@ -84,6 +84,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_FINISH_REASONS = (
+    "submit",
+    "hit_max_turns",
+    "hit_time_budget",
+    "stopped_early",
+    "error",
+)
+
+
+def _finish_reason_metrics(finish_reasons: list[str]) -> list[m.Metric]:
+    """Return exhaustive per-reason fractions for one completed rollout group."""
+    assert finish_reasons, "a TMax rollout group must contain at least one sibling"
+    unexpected = set(finish_reasons).difference(_FINISH_REASONS)
+    assert not unexpected, f"unexpected TMax finish reasons: {sorted(unexpected)}"
+
+    num_rollouts = len(finish_reasons)
+    return [
+        m.Metric(
+            f"rollout/finish_{reason}_frac",
+            m.Mean(
+                sum(1.0 for finish_reason in finish_reasons if finish_reason == reason)
+                / num_rollouts
+            ),
+        )
+        for reason in _FINISH_REASONS
+    ]
+
+
 class _RootSandbox:
     """Sandbox wrapper that forces every operation to run as ``root``.
 
@@ -284,9 +312,10 @@ class TMaxRollouter(Rollouter):
             # second cancel, which could interrupt an in-progress sandbox teardown.
             await asyncio.gather(*rollout_tasks, return_exceptions=True)
             raise
-        rollouts = [rollout for rollout, _, _ in results]
-        submitted_flags = [submitted for _, submitted, _ in results]
-        fmt_errors_list = [fmt for _, _, fmt in results]
+        rollouts = [rollout for rollout, _, _, _ in results]
+        submitted_flags = [submitted for _, submitted, _, _ in results]
+        fmt_errors_list = [fmt for _, _, fmt, _ in results]
+        finish_reasons = [fr for _, _, _, fr in results]
 
         # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
         outputs = await self.score_group(rollouts, sample)
@@ -305,6 +334,13 @@ class TMaxRollouter(Rollouter):
         fmt_error_frac = sum(1.0 for f in fmt_errors_list if f > 0) / len(
             fmt_errors_list
         )
+        # How each sibling's loop ended (run_vanillux_loop finish_reason), as a
+        # per-reason fraction of the group. Surfaces the stop-reason split on wandb:
+        # submit vs turn-cap vs 20min time-budget wall vs early-stop vs rollout error
+        # (the "error" bucket covers timeout/exception paths where the loop never
+        # returned). The five fracs sum to 1.0 per group; cudagraph should push
+        # time_budget down and submit up.
+        finish_metrics = _finish_reason_metrics(finish_reasons)
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
@@ -312,6 +348,7 @@ class TMaxRollouter(Rollouter):
                 m.Metric("rollout/nonsubmit_frac", m.Mean(nonsubmit_frac)),
                 m.Metric("rollout/format_errors_mean", m.Mean(fmt_errors_mean)),
                 m.Metric("rollout/format_error_frac", m.Mean(fmt_error_frac)),
+                *finish_metrics,
             ],
         )
         advantages = self.advantage_estimator(group)
@@ -360,14 +397,18 @@ class TMaxRollouter(Rollouter):
         rollout_idx: int,
         sampling: "SamplingConfig",
         renderer: Renderer,
-    ) -> tuple[Rollout, bool, int]:
+    ) -> tuple[Rollout, bool, int, str]:
         """Boot a sandbox, run the agent as root, grade the task in place.
 
-        Always returns ``(Rollout, submitted, fmt_errors)`` (errors caught + marked
-        terminal) so one bad sibling never fails the whole group. ``submitted`` is
-        whether the agent emitted the submit marker (False on any error / no-submit);
-        ``fmt_errors`` is the tool-call parse-failure count. The caller aggregates both
-        into the group's ``rollout/nonsubmit_frac`` and ``rollout/format_*`` metrics.
+        Always returns ``(Rollout, submitted, fmt_errors, finish_reason)`` (errors
+        caught + marked terminal) so one bad sibling never fails the whole group.
+        ``submitted`` is whether the agent emitted the submit marker (False on any
+        error / no-submit); ``fmt_errors`` is the tool-call parse-failure count;
+        ``finish_reason`` is how the loop ended (submit / hit_max_turns /
+        hit_time_budget / stopped_early, or "error" on the timeout/exception paths
+        where the loop never returned). The caller aggregates these into the group's
+        ``rollout/nonsubmit_frac``, ``rollout/format_*`` and ``rollout/finish_*``
+        metrics.
         """
         rollout_id = RolloutTurnID(
             group_id=group_id, rollout_id=rollout_idx, turn_id=0
@@ -378,6 +419,9 @@ class TMaxRollouter(Rollouter):
         error_msg = ""
         submitted = False
         fmt_errors = 0  # total format errors this rollout (from run_vanillux_loop)
+        # Default for the timeout/exception paths where run_vanillux_loop never
+        # returned (it sets its own reason on the normal path).
+        finish_reason = "error"
         await self._rollout_gate.acquire_sibling((group_id, rollout_idx))
         try:
             # open_session is inside the try so a failure still releases the slot.
@@ -401,7 +445,12 @@ class TMaxRollouter(Rollouter):
                     # seed-bearing tasks are unsolvable (inputs absent during rollout).
                     # Grading fixtures (tests/*) are uploaded later by grade_tmax.
                     await seed_workspace(root_sb, sample.tmax)
-                    _turns, submitted, fmt_errors = await run_vanillux_loop(
+                    (
+                        _turns,
+                        submitted,
+                        fmt_errors,
+                        finish_reason,
+                    ) = await run_vanillux_loop(
                         root_sb,
                         task=sample.problem_statement,
                         session_id=rollout_id,
@@ -502,6 +551,7 @@ class TMaxRollouter(Rollouter):
             ),
             submitted,
             fmt_errors,
+            finish_reason,
         )
 
     def _maybe_dump_trace(
