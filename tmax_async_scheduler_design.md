@@ -2,9 +2,13 @@
 
 ## Status and scope
 
-This note compares the current TorchTitan TMax scheduler with Open-Instruct and
-the local TBR `ElementBuffer`, then proposes a bounded-reordering scheduler for
-TorchTitan. It is a design note, not an implementation.
+This note compares the TorchTitan TMax scheduler with Open-Instruct and the
+local TBR `ElementBuffer`, and records the MSL-style sliding-prefix Windowed
+FIFO now implemented in TorchTitan. The feature is optional: the default
+`num_groups_in_selection_window=None` behavior remains unbounded take-any, and
+TMax enables a finite window with `SWE_SELECTION_WINDOW_GROUPS=W`. A
+configurable max-bypass stall is implemented; inflight eviction remains future
+work.
 
 The first run containing both the FP32-master AdamW configuration and the
 work-conserving sibling gate is:
@@ -176,7 +180,7 @@ the check when the trainer consumes a packed batch because the queue can age a
 previously valid batch. A queued batch that has crossed the limit is dropped and
 its group slots are released before the trainer waits for a fresh replacement.
 
-The selection path is unbounded take-any:
+The default selection path is unbounded take-any:
 
 1. `take_finalized()` scans the admission-ordered map and skips older inflight
    groups (`components/work_buffer.py:182-222`).
@@ -184,11 +188,18 @@ The selection path is unbounded take-any:
 3. The batcher emits as soon as it has the first eight partial groups
    (`components/batcher.py:103-166`).
 
-Thus selection is unbounded take-any across the current active population.
-Forty groups are visible at one instant, but selected slots are later released
-and refilled. A slow head can therefore be bypassed by more than 39 newer
-groups over time. This is not equivalent to a fixed `W=40` window.
+Thus default selection is unbounded take-any across the current active
+population. Forty groups are visible at one instant, but selected slots are
+later released and refilled. A slow head can therefore be bypassed by more than
+39 newer groups over time. This is not equivalent to a fixed `W=40` window.
 Worker-local issue priority does not fix global completion-order selection.
+
+When `RolloutGroupWorkBuffer.Config.num_groups_in_selection_window=W` is set,
+the buffer instead selects only from the first `W` entries in the current active
+admission map. Selecting any group removes it, so later entries slide into the
+prefix even if the oldest group remains inflight. This limits each selection's
+look-ahead. `max_bypass_groups` optionally stops further selection when an
+inflight group reaches its direct bypass threshold.
 
 ## Open-Instruct TMax scheduler
 
@@ -322,8 +333,10 @@ by `W-1` fixed bypass credits. This is not a universal bound on every queue
 head: `ENQUEUED` entries do not age, and retry work can take actor priority.
 
 This is a valid age-controlled scheduler, but it is not identical to the strict
-fixed-window invariant stated above. TorchTitan should choose the intended
-semantic explicitly rather than copying the TBR class name alone.
+fixed-window invariant stated above. TorchTitan deliberately adopts this
+sliding-prefix semantic to match MSL/TBR; a separate max-age rule is required
+for an eventual lifetime bound. TorchTitan implements that brake using direct
+later-group bypass count and safe stall semantics.
 
 One TBR behavior should not be copied: it releases an element-buffer slot when
 the element is handed to the downstream batcher. TorchTitan keeps an active
@@ -331,48 +344,38 @@ group charged through training and generator weight pull. That stronger
 end-to-end backpressure prevents newly admitted work from becoming stale behind
 already prepared batches and should remain intact.
 
-## Proposed TorchTitan design
+## TorchTitan design and remaining work
 
 ### 1. Separate three limits
 
 Do not overload one concurrency number:
 
-- `active_group_capacity`: admitted groups, currently 40;
+- `max_active_rollout_groups`: admitted groups, currently 40;
 - `rollout_concurrency`: active sibling slots, currently 512;
-- `selection_window_groups`: groups eligible for batch selection.
+- `num_groups_in_selection_window`: current active admission-prefix size used
+  for batch selection.
 
 Keep sibling issue work-conserving. Apply Windowed FIFO only at group selection,
 after the correct 32-sibling aggregation boundary.
 
-### 2. Add fixed-window ordering state
+### 2. Sliding active-prefix ordering
 
-Give each admitted group a monotonic `admission_seq`. Retain a small ordering
-ledger even after a group is selected:
+`take_finalized()` scans only the first `W` entries in the admission-ordered
+active map and returns the oldest finalized group in that prefix. Selecting any
+group removes its work entry. The next active admission therefore shifts into
+the prefix immediately, matching MSL's `OrderedDict` behavior; no separate
+retired-hole ledger is retained.
 
-```text
-head_seq
-window_end_seq = head_seq + W - 1
-retired_seqs
-```
-
-`take_finalized()` may return only a finalized group with
-`admission_seq <= window_end_seq`. Prefer the oldest ready group for deterministic
-behavior. Selecting a non-head group marks it retired but does not expand
-`window_end_seq`. When `head_seq` retires, advance over consecutive retired
-sequences and establish the next boundary.
-
-Every terminal disposition must retire scheduling order exactly once:
-trainable partial groups, all-solved and all-unsolved zero-variance groups,
-empty or otherwise untrainable groups, reward-partial groups, stale groups, and
-explicit evictions. Missing any path can pin `head_seq` forever. Trainable
-groups enter the batcher while dropped groups release their active slot. A
-group's capacity slot can remain charged until trainer consumption while its
-ordering entry is already retired; ordering and resource accounting are
-different concerns.
+Selection ordering and resource accounting remain separate. Every finalized
+group leaves the selection map before the batcher classifies it as trainable,
+zero-variance, stale, or otherwise untrainable. Trainable groups remain charged
+through trainer consumption and generator weight pull, while dropped groups
+release their active credit immediately. Replacements append at the active-map
+tail and gradually slide into the selection prefix.
 
 ### 3. Candidate values for TMax-9B
 
-The paper-faithful first experiment should use:
+The first experiment should use:
 
 ```text
 E = 8
@@ -381,19 +384,14 @@ N_full = 40
 W = ceil(0.3 * 40) = 12 groups
 ```
 
-TMax filtering makes `W=12` more aggressive than it would be without
-zero-variance drops. With observed partial-group retention around 0.60-0.73, a
-12-group window often contains fewer than eight partial groups. At retention
-0.65, the binomial probability of fewer than eight partials is about 42% for
-`W=12`, 7% for `W=16`, and 0.6% for `W=20`. Zero-variance retirement prevents
-permanent deadlock, but a small frozen window can produce intentional head
-stalls.
+`W=12` limits each selection to 30% of the 40 active groups. Zero-variance and
+other finalized groups are still consumed from that prefix and immediately
+shift later admissions into view, so the batcher does not need eight trainable
+groups to coexist in one frozen window. Instrument window-block time and move
+to `W=16` only if the throughput cost is excessive; it should not replace the
+`W=12` measurement.
 
-Therefore use `W=12` to test the paper policy itself, instrument window-block
-time, and move to `W=16` only if the throughput cost is excessive. `W=16` is the
-likely production compromise; it should not replace the `W=12` measurement.
-
-### 4. Add cold-start warmup without idling sibling slots
+### 4. Preserve cold-start warmup without idling sibling slots
 
 For each worker gate, enough groups must be present to expose strictly more
 siblings than that gate's capacity. With worker capacities `C_i`, the exact
@@ -418,22 +416,36 @@ would advertise a work-conserving concurrency that some worker gates cannot
 reach. The default 8-worker 512 and 1024 layouts both satisfy the invariant.
 
 At concurrency 1024, warmup cannot shrink the active population without
-sacrificing immediate refill capacity. The selection window still bounds
-shortcut bias independently. This is another reason to establish the
-512/Windowed-FIFO baseline before changing concurrency.
+sacrificing immediate refill capacity. The selection window still limits each
+selection's shortcut race independently. This is another reason to establish
+the 512/Windowed-FIFO baseline before changing concurrency.
 
-### 5. Bound pathological heads explicitly
+### 5. Max-bypass protection for pathological heads
 
-Use two controls rather than silently reverting to greedy behavior:
+The sliding window, policy-age limit, and max-bypass stall are implemented. The
+three controls remain distinct:
 
-- a policy-age limit, retaining the existing stale-data contract;
-- a head wall-clock/max-age action that is observable and configurable.
+- the window limits each selection's candidate prefix;
+- the policy-age limit retains the existing stale-data contract;
+- `max_bypass_groups` stops later selection once an inflight group reaches the
+  configured direct bypass count.
 
-For TMax, a rollout already has a finite wall budget. Initially, block at the
-window boundary and let that timeout resolve the head. If production throughput
-requires eviction, log it as a distribution-changing event and requeue the same
-dataset item under a fresh policy instead of silently replacing it with a newer
-task.
+The max-bypass stall is opt-in. `SWE_MAX_BYPASS_GROUPS=32` aligns a diagnostic
+run with the standard four-step policy cap and `E=8`; `off`, empty, or unset
+disables it. MSL requires its policy cap to be at least its max age, so copying
+MSL's `32 * E = 256` threshold while retaining TMax's four-step policy cap would
+make the delayed group stale before the brake engaged.
+
+The production launcher leaves this global stall off. The per-sibling
+`time_budget + eval_timeout + 300s` wall guard does not cover worker RPC,
+sibling-gate waiting, or every sandbox-cleanup failure. Until the controller can
+hard-timeout or reliably cancel an entire group, enabling the stall can turn one
+permanently `INFLIGHT` group into a permanently blocked trainer.
+
+Inflight eviction is intentionally deferred. The controller cannot yet cancel
+one group reliably across a `RolloutWorker` endpoint and all 32 sibling
+sandboxes. Releasing the active credit before that cancellation is confirmed
+would violate the end-to-end capacity invariant.
 
 ### 6. Align freshness at consumption, not by changing the number
 
@@ -449,56 +461,70 @@ contract without crashing the run. A future refinement can preserve group
 boundaries and refill only stale groups, or use a trainer-ready handshake so
 stale batches are never packed in the first place.
 
-## Metrics required before landing
+## Metrics for the first live trial
 
-Add per-step and cumulative metrics for:
+The work buffer exposes:
 
-- `selection/window_size_groups`;
-- `selection/head_group_id` and `selection/window_end_group_id`;
-- `selection/bypass_count` and maximum bypass per head;
-- time blocked because no finalized group is inside the window;
-- ready groups inside and outside the window;
-- head wall age and policy age;
-- warmup effective active capacity;
+- `rollout_buffer/selection_window_groups`;
+- `rollout_buffer/eligible_finalized_groups`;
+- `rollout_buffer/blocked_finalized_groups`;
+- `rollout_buffer/head_wall_age_sec`;
+- `rollout_buffer/head_bypass_count`;
+- `rollout_buffer/max_bypass_count`;
+- `rollout_buffer/max_bypass_groups`;
+- `rollout_buffer/num_inflight_at_max_bypass`;
+- `rollout_buffer/max_bypass_stall_sec`;
+- `rollout_buffer/max_bypass_stall_count`;
+- `rollout_buffer/window_stall_sec`.
+
+For the live A/B, also retain or add end-to-end measurements for:
+
 - attempted reward, kept reward, and zero-variance class counts;
 - completion rank versus solve fraction and rollout wall time;
-- stale drops and max-age evictions/requeues;
+- stale drops;
 - age at selection and age at trainer consumption, with explicit age-four
   acceptance/drop counts.
 
-The invariant `max_bypass_per_head <= W-1` must be directly asserted in tests
-and visible in logs.
+Max-age evictions or requeues should be added to metrics only if that future
+brake is implemented.
+
+The bypass tail is intentionally not bounded by `W - 1`; record it directly and
+compare it with the unbounded baseline.
 
 ## Test plan
 
 Unit tests should cover:
 
 1. `W=1` matches strict FIFO.
-2. A completed group outside the fixed window remains blocked.
-3. Consuming a non-head group does not replenish its bypass credit.
-4. Retiring the head advances across already-retired holes and opens the next
-   window.
-5. Zero-variance and stale retirement advance ordering correctly.
+2. A completed group outside the current prefix remains blocked while no group
+   in the prefix is finalized.
+3. Consuming a non-head group shifts the next active admission into the prefix.
+4. A newly replenished tail group can eventually enter the prefix while the
+   oldest group remains inflight.
+5. Multiple finalized groups in the prefix are selected in admission order.
 6. Close/cancellation wakes all window waiters.
 7. Warmup starts at `N0`, grows monotonically, and caps at `N_full`.
 8. Sibling-gate utilization and per-worker waiter depth are reported during
    warmup, including multiple simultaneous slow tails.
-9. Property tests verify the `W-1` bypass bound over random completion orders.
+9. Repeated sliding can produce more than `W - 1` lifetime bypasses and the
+   bypass metrics report it.
+10. Reaching `max_bypass_groups` stalls an otherwise eligible later group until
+    the over-age inflight group finalizes.
 
 Run at least 10 training steps for each performance comparison:
 
 - current unbounded take-any (current run as baseline);
-- fixed Windowed FIFO `W=12`, concurrency 512, all 40 groups active;
+- MSL-style sliding Windowed FIFO `W=12`, max bypass off, concurrency 512,
+  using the current 32 -> 40 cold start;
 - `W=16` only if `W=12` has excessive window-block time;
-- 24-to-40 warmup as a separate A/B after selecting `W`;
 - strict FIFO `W=1` only as a diagnostic;
 - after choosing a scheduler, compare concurrency 512 versus 1024.
 
-Before submitting a fixed-window run, replay the current run's completion trace
-through `W=12`, `W=16`, and `W=20`. A window head can otherwise hold the batcher
-until the rollout's one-hour wall budget plus its guard interval resolves. Trace
-replay cannot predict changed contention, but it catches obviously impractical
-window sizes without consuming a live run.
+Before submitting a windowed run, replay the current run's completion trace
+through `W=12`, `W=16`, and `W=20`. The batcher waits whenever all entries in
+the current prefix are unfinished, potentially until one rollout's wall budget
+plus guard interval resolves. Trace replay cannot predict changed contention,
+but it catches obviously impractical window sizes without consuming a live run.
 
 Use the same dataset order and record every attempted prompt. Compare moving
 averages rather than individual steps. The scheduler change is successful if it
@@ -510,11 +536,11 @@ increase in trainer idle time or stale drops.
 Keep the current run unchanged as the first clean FP32-master plus
 work-conserving-gate baseline. First replay its completion trace under
 `W=12/16/20`. The next live scheduler experiment should then change one
-variable: fixed Windowed FIFO with the replay-selected window, 512 sibling
-concurrency, and the existing 40 active groups. Start evaluation at `W=12`, but
-use the trace and window-block metrics to move to `W=16` or `W=20` if needed.
-Test 24-to-40 warmup and then concurrency 1024 only as later, separate
-experiments; combining them would make attribution ambiguous.
+variable: MSL-style sliding Windowed FIFO with the replay-selected window, 512
+sibling concurrency, and the current 32 -> 40 cold start. Start evaluation at
+`W=12`, but use the trace and window-block metrics to move to `W=16` or `W=20`
+if needed. Test concurrency 1024 only as a later, separate experiment;
+combining it with the scheduler change would make attribution ambiguous.
 
 Reward parity with `qcgp4uft` is a separate experiment from scheduler causal
 attribution. Keep the current run through Step 100, then evaluate checkpoints
@@ -528,7 +554,7 @@ observed execution population in one run:
 
 ```text
 rollout_concurrency = 256
-active_group_capacity = 32
+max_active_rollout_groups = 32
 max_offpolicy_steps = 4
 loss = DPPO
 optimizer state and update target = FP32
@@ -544,6 +570,6 @@ If fixed-cohort reward remains flat, stop tuning concurrency and first run a
 same-packed-batch numerical comparison: gradient norm and selected-parameter
 Adam update norm in both frameworks, followed by a generator A/B with CUDA
 graphs disabled and detailed log-probability-tail logging. Only after those
-checks should ratio caps or learning rate be changed. Raising concurrency to
-1024 before bounding selection order would widen the completion race and make
-the current fast-task shortcut and stale-partial loss worse.
+checks should ratio caps or learning rate be changed. Do not raise concurrency
+to 1024 while leaving selection unbounded; that would widen the completion race
+and make the fast-task shortcut and stale-partial loss worse.

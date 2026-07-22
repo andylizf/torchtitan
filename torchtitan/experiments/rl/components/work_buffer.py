@@ -12,6 +12,7 @@ NOTE: The buffer holds work slots, and not the finalized RolloutGroups necessari
 import asyncio
 import collections
 import enum
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -19,6 +20,9 @@ from torchtitan.config import Configurable
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout import RolloutGroup
 from torchtitan.observability import structured_logger as sl
+
+
+logger = logging.getLogger(__name__)
 
 
 class _RolloutGroupWorkState(enum.Enum):
@@ -53,6 +57,8 @@ class RolloutGroupWork:
     # without finalizing (e.g. a hung Daytona sandbox), which starve the trainer.
     admitted_ts: float | None = field(default=None, init=False)
     claimed_ts: float | None = field(default=None, init=False)
+    # Number of later-admitted groups selected while this group was INFLIGHT.
+    bypass_count: int = field(default=0, init=False)
     # TODO(async-rl): emit JSON lifecycle logging per RolloutGroupWork keyed by group_id:
     # admitted/claimed/finalized/batched/trained/dropped timestamps + policy version at admission and
     # at trainer consumption, for faithful end-to-end visibility.
@@ -62,8 +68,11 @@ class RolloutGroupWorkBuffer(Configurable):
     """Run-ahead buffer of RolloutGroupWork shared by the data-input, rollout, and batcher loops.
 
     Each entry is a RolloutGroupWork moving WAITING -> INFLIGHT -> FINALIZED. An active-slot budget caps
-    run-ahead at `max_active_rollout_groups` active slots; the batcher takes the oldest-admitted
-    FINALIZED group, skipping still-INFLIGHT stragglers, so a slow head does not stall it.
+    run-ahead at `max_active_rollout_groups` active slots. By default, the batcher
+    takes the oldest-admitted FINALIZED group while skipping INFLIGHT stragglers.
+    A configured sliding selection window limits each selection to the first
+    few active admissions while still allowing the prefix to refill after every
+    selected group.
 
     For details on the buffer's callers, check the diagram in the controller.py file.
 
@@ -91,15 +100,45 @@ class RolloutGroupWorkBuffer(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """Capacity is passed in by the controller from the run-ahead sizing."""
+        """Group-selection ordering; capacity is supplied by the controller."""
+
+        num_groups_in_selection_window: int | None = None
+        """Sliding admission-order selection window. None scans all active
+        groups, 1 is strict FIFO, and larger values scan the first W entries in
+        the current active map. Removing any selected group shifts later entries
+        into the prefix, matching MSL's FIFOElementBuffer."""
+
+        max_bypass_groups: int | None = None
+        """Stop selecting more groups while any INFLIGHT group has been bypassed
+        by this many later selections. None disables the brake. The caller must
+        guarantee that a stalled group eventually finalizes; this setting never
+        evicts or times out inflight work."""
 
         strict_fifo: bool = False
-        """take_finalized() order. False (default) = take-any: return the first
-        FINALIZED group in admission order, skipping still-INFLIGHT stragglers (no
-        head-of-line stall; the throughput default). True = strict FIFO: return the
-        OLDEST group only once IT is finalized, stalling on a slow head. FIFO removes
-        the take-any bias toward short/fast (=easy) rollouts in the trained batch, at
-        the cost of the straggler stall -- a diagnostic knob for that bias."""
+        """Compatibility alias for ``num_groups_in_selection_window=1``."""
+
+        def __post_init__(self) -> None:
+            window = self.num_groups_in_selection_window
+            if window is not None and window < 1:
+                raise ValueError(
+                    "num_groups_in_selection_window must be positive, got " f"{window}"
+                )
+            if self.strict_fifo and window not in (None, 1):
+                raise ValueError(
+                    "strict_fifo=True conflicts with "
+                    f"num_groups_in_selection_window={window}; use 1 or unset it"
+                )
+            max_bypass = self.max_bypass_groups
+            if max_bypass is not None and max_bypass < 1:
+                raise ValueError(
+                    f"max_bypass_groups must be positive, got {max_bypass}"
+                )
+
+        def resolved_num_groups_in_selection_window(self) -> int | None:
+            """Resolve the legacy strict-FIFO alias to its one-group window."""
+            if self.strict_fifo:
+                return 1
+            return self.num_groups_in_selection_window
 
     def __init__(
         self,
@@ -108,11 +147,23 @@ class RolloutGroupWorkBuffer(Configurable):
         max_active_rollout_groups: int,
         initial_active_rollout_groups: int | None = None,
     ) -> None:
-        self._strict_fifo = config.strict_fifo
+        self._num_groups_in_selection_window = (
+            config.resolved_num_groups_in_selection_window()
+        )
+        self._max_bypass_groups = config.max_bypass_groups
         if max_active_rollout_groups < 1:
             raise ValueError(
                 "max_active_rollout_groups must be positive, got "
                 f"{max_active_rollout_groups}"
+            )
+        if (
+            self._num_groups_in_selection_window is not None
+            and self._num_groups_in_selection_window > max_active_rollout_groups
+        ):
+            raise ValueError(
+                "num_groups_in_selection_window must not exceed "
+                f"max_active_rollout_groups ({max_active_rollout_groups}), got "
+                f"{self._num_groups_in_selection_window}"
             )
         if initial_active_rollout_groups is None:
             initial_active_rollout_groups = max_active_rollout_groups
@@ -130,6 +181,12 @@ class RolloutGroupWorkBuffer(Configurable):
         self._work_by_group_id: collections.OrderedDict[
             int, RolloutGroupWork
         ] = collections.OrderedDict()
+        self._max_bypass_count = 0
+        self._window_stall_started_ts: float | None = None
+        self._window_stall_sec_since_flush = 0.0
+        self._max_bypass_stall_started_ts: float | None = None
+        self._max_bypass_stall_sec_since_flush = 0.0
+        self._max_bypass_stall_count = 0
         # TODO(async-rl): Current we use a condition that alerts ALL rollout workers. There is no need to
         # alert all of them. Consider changing it to an async queue + event.
 
@@ -140,6 +197,53 @@ class RolloutGroupWorkBuffer(Configurable):
 
     def _has_active_slot_available(self) -> bool:
         return self._active_rollout_groups < self._effective_active_rollout_groups
+
+    def _group_ids_in_selection_window(self) -> list[int]:
+        window = self._num_groups_in_selection_window
+        if window is None:
+            return list(self._work_by_group_id)
+        group_ids: list[int] = []
+        for index, group_id in enumerate(self._work_by_group_id):
+            if index == window:
+                break
+            group_ids.append(group_id)
+        return group_ids
+
+    def _num_blocked_finalized_groups(self, window_group_ids: set[int]) -> int:
+        if self._num_groups_in_selection_window is None:
+            return 0
+        return sum(
+            work.state is _RolloutGroupWorkState.FINALIZED
+            and group_id not in window_group_ids
+            for group_id, work in self._work_by_group_id.items()
+        )
+
+    def _finish_window_stall(self) -> None:
+        if self._window_stall_started_ts is None:
+            return
+        self._window_stall_sec_since_flush += (
+            time.monotonic() - self._window_stall_started_ts
+        )
+        self._window_stall_started_ts = None
+
+    def _inflight_at_max_bypass(self) -> list[RolloutGroupWork]:
+        max_bypass = self._max_bypass_groups
+        if max_bypass is None:
+            return []
+        return [
+            work
+            for work in self._work_by_group_id.values()
+            if work.state is _RolloutGroupWorkState.INFLIGHT
+            and work.bypass_count >= max_bypass
+        ]
+
+    def _finish_max_bypass_stall(self) -> None:
+        if self._max_bypass_stall_started_ts is None:
+            return
+        self._max_bypass_stall_sec_since_flush += (
+            time.monotonic() - self._max_bypass_stall_started_ts
+        )
+        self._max_bypass_stall_started_ts = None
 
     async def wait_for_slot(self) -> bool:
         """Wait until one more rollout group may enter the active off-policy window.
@@ -158,8 +262,14 @@ class RolloutGroupWorkBuffer(Configurable):
             return not self._closed
 
     async def add_work(self, work: RolloutGroupWork) -> None:
-        """Admit one rollout group as WAITING and charge one active slot."""
+        """Admit one rollout group as WAITING and charge one active slot.
+
+        If close wins the race after ``wait_for_slot()`` returns, discard the
+        prepared work without charging it.
+        """
         async with self._condition:
+            if self._closed:
+                return
             if not self._has_active_slot_available():
                 raise RuntimeError(
                     "RolloutGroupWorkBuffer.add_work called without an active slot"
@@ -195,46 +305,79 @@ class RolloutGroupWorkBuffer(Configurable):
                 return
             work.rollout_group = rollout_group
             work.state = _RolloutGroupWorkState.FINALIZED
+            if not self._inflight_at_max_bypass():
+                self._finish_max_bypass_stall()
             self._condition.notify_all()
 
     @sl.log_trace_span("take_finalized")
     async def take_finalized(self) -> RolloutGroup | None:
-        """Return the oldest-admitted FINALIZED group, skipping INFLIGHT groups.
+        """Return the oldest finalized group in the sliding active prefix.
 
-        This is take-any, NOT strict FIFO: a slow straggler at the head no longer
-        blocks the batcher. If multiple groups are finalized before the scan, their
-        admission order breaks the tie; this is not a timestamped completion queue.
-        A skipped straggler keeps holding its active slot, so the pipeline never
-        exceeds max_active_rollout_groups, and the trainer still checks policy age
-        at consumption time.
+        ``num_groups_in_selection_window=None`` preserves unbounded take-any.
+        Otherwise, each selection scans the current active map's first W entries.
+        Removing any selected group shifts later entries into that prefix, so the
+        window limits instantaneous look-ahead but not lifetime bypass count.
+        If an INFLIGHT group reaches ``max_bypass_groups``, selection stalls until
+        that group finalizes.
+        Active-slot accounting is unchanged: taking a group does not release its credit.
 
         Example:
-            # head g0 still INFLIGHT, g1 FINALIZED -> returns g1 (no stall on g0)
+            # W=2, g0 INFLIGHT, g1 FINALIZED, g2 FINALIZED -> returns g1, then
+            # g2 because removing g1 shifts g2 into the current prefix.
             await buffer.take_finalized()
         """
         async with self._condition:
-            while True:
-                if self._closed:
-                    return None
-                if self._strict_fifo:
-                    # Strict FIFO: only the OLDEST group is takeable; stall if it is
-                    # still INFLIGHT (head-of-line). Removes take-any's short/fast bias
-                    # in the trained batch. Restores pre-take-any behavior.
-                    if self._work_by_group_id:
-                        oldest_group_id, oldest_work = next(
-                            iter(self._work_by_group_id.items())
-                        )
-                        if oldest_work.state is _RolloutGroupWorkState.FINALIZED:
-                            del self._work_by_group_id[oldest_group_id]
-                            self._condition.notify_all()
-                            return oldest_work.rollout_group
-                else:
-                    for group_id, work in self._work_by_group_id.items():
+            try:
+                while True:
+                    if self._closed:
+                        return None
+                    inflight_at_max_bypass = self._inflight_at_max_bypass()
+                    if inflight_at_max_bypass:
+                        self._finish_window_stall()
+                        if self._max_bypass_stall_started_ts is None:
+                            self._max_bypass_stall_started_ts = time.monotonic()
+                            self._max_bypass_stall_count += 1
+                            logger.warning(
+                                "Group selection stalled: %d INFLIGHT group(s) "
+                                "reached max_bypass_groups=%d; group_ids=%s",
+                                len(inflight_at_max_bypass),
+                                self._max_bypass_groups,
+                                [work.group_id for work in inflight_at_max_bypass],
+                            )
+                        await self._condition.wait()
+                        continue
+                    self._finish_max_bypass_stall()
+                    window_group_ids = self._group_ids_in_selection_window()
+                    bypassed_inflight_work: list[RolloutGroupWork] = []
+                    for group_id in window_group_ids:
+                        work = self._work_by_group_id.get(group_id)
+                        if work is None:
+                            continue
                         if work.state is _RolloutGroupWorkState.FINALIZED:
+                            for older_work in bypassed_inflight_work:
+                                older_work.bypass_count += 1
+                                self._max_bypass_count = max(
+                                    self._max_bypass_count, older_work.bypass_count
+                                )
+                            rollout_group = work.rollout_group
                             del self._work_by_group_id[group_id]
+                            self._finish_window_stall()
                             self._condition.notify_all()
-                            return work.rollout_group
-                await self._condition.wait()  # nothing takeable yet -> wait
+                            return rollout_group
+                        if work.state is _RolloutGroupWorkState.INFLIGHT:
+                            bypassed_inflight_work.append(work)
+
+                    blocked_finalized = self._num_blocked_finalized_groups(
+                        set(window_group_ids)
+                    )
+                    if blocked_finalized and self._window_stall_started_ts is None:
+                        self._window_stall_started_ts = time.monotonic()
+                    elif not blocked_finalized:
+                        self._finish_window_stall()
+                    await self._condition.wait()  # nothing takeable yet -> wait
+            finally:
+                self._finish_window_stall()
+                self._finish_max_bypass_stall()
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         """Free active slots: the trainer releases trained slots after its weight pull; the batcher
@@ -286,6 +429,8 @@ class RolloutGroupWorkBuffer(Configurable):
         claim_next()/take_finalized() return None.
         """
         async with self._condition:
+            self._finish_window_stall()
+            self._finish_max_bypass_stall()
             self._closed = True
             self._work_by_group_id.clear()
             self._condition.notify_all()
@@ -298,12 +443,80 @@ class RolloutGroupWorkBuffer(Configurable):
         # but not yet finalized (WAITING + INFLIGHT). max surfaces a stuck straggler occupying
         # a slot; mean is the typical in-flight wait. Both are 0 when the buffer is empty.
         now = time.monotonic()
+        window_group_ids = set(self._group_ids_in_selection_window())
+        eligible_finalized_groups = sum(
+            work.state is state_enum.FINALIZED and group_id in window_group_ids
+            for group_id, work in self._work_by_group_id.items()
+        )
+        blocked_finalized_groups = self._num_blocked_finalized_groups(window_group_ids)
+        num_inflight_at_max_bypass = len(self._inflight_at_max_bypass())
+        head_work = next(iter(self._work_by_group_id.values()), None)
+        head_wall_age_sec = (
+            now - head_work.admitted_ts
+            if head_work is not None and head_work.admitted_ts is not None
+            else 0.0
+        )
+        window_stall_sec = self._window_stall_sec_since_flush
+        if self._window_stall_started_ts is not None:
+            window_stall_sec += now - self._window_stall_started_ts
+            self._window_stall_started_ts = now
+        self._window_stall_sec_since_flush = 0.0
+        max_bypass_stall_sec = self._max_bypass_stall_sec_since_flush
+        if self._max_bypass_stall_started_ts is not None:
+            max_bypass_stall_sec += now - self._max_bypass_stall_started_ts
+            self._max_bypass_stall_started_ts = now
+        self._max_bypass_stall_sec_since_flush = 0.0
         occupancy_secs = [
             now - work.admitted_ts
             for work in self._work_by_group_id.values()
             if work.state is not state_enum.FINALIZED and work.admitted_ts is not None
         ]
         out = [
+            # A zero window gauge means the optional bound is disabled.
+            m.Metric(
+                "rollout_buffer/selection_window_groups",
+                m.NoReduce(float(self._num_groups_in_selection_window or 0)),
+            ),
+            m.Metric(
+                "rollout_buffer/eligible_finalized_groups",
+                m.NoReduce(float(eligible_finalized_groups)),
+            ),
+            m.Metric(
+                "rollout_buffer/blocked_finalized_groups",
+                m.NoReduce(float(blocked_finalized_groups)),
+            ),
+            m.Metric(
+                "rollout_buffer/head_wall_age_sec",
+                m.NoReduce(head_wall_age_sec),
+            ),
+            m.Metric(
+                "rollout_buffer/head_bypass_count",
+                m.NoReduce(float(head_work.bypass_count if head_work else 0)),
+            ),
+            m.Metric(
+                "rollout_buffer/max_bypass_count",
+                m.NoReduce(float(self._max_bypass_count)),
+            ),
+            m.Metric(
+                "rollout_buffer/max_bypass_groups",
+                m.NoReduce(float(self._max_bypass_groups or 0)),
+            ),
+            m.Metric(
+                "rollout_buffer/num_inflight_at_max_bypass",
+                m.NoReduce(float(num_inflight_at_max_bypass)),
+            ),
+            m.Metric(
+                "rollout_buffer/max_bypass_stall_sec",
+                m.NoReduce(max_bypass_stall_sec),
+            ),
+            m.Metric(
+                "rollout_buffer/max_bypass_stall_count",
+                m.NoReduce(float(self._max_bypass_stall_count)),
+            ),
+            m.Metric(
+                "rollout_buffer/window_stall_sec",
+                m.NoReduce(window_stall_sec),
+            ),
             m.Metric(
                 "rollout_buffer/slot_occupancy_max_sec",
                 m.NoReduce(max(occupancy_secs, default=0.0)),

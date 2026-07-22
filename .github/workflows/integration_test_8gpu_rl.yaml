@@ -86,7 +86,13 @@ jobs:
         # 4. Make the checkout importable for subprocesses spawned by the test.
         export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
-        # 5. Download HF model checkpoint for tests
+        # 5. Run CPU unit tests that require the RL dependency stack.
+        python -m pytest \
+          torchtitan/experiments/rl/tests/test_async_controller.py \
+          torchtitan/experiments/rl/tests/test_tmax_config.py \
+          torchtitan/experiments/rl/tests/test_tmax_rollout_gate.py -v
+
+        # 6. Download HF model checkpoint for tests
         MODEL_PATH=$(python -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"

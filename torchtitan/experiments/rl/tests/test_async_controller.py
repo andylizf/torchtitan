@@ -503,6 +503,248 @@ def test_take_finalized_uses_admission_order_when_multiple_are_ready() -> None:
     asyncio.run(run())
 
 
+def test_sliding_selection_window_refills_after_each_take() -> None:
+    async def run() -> None:
+        window = 2
+        buffer = RolloutGroupWorkBuffer.Config(
+            num_groups_in_selection_window=window
+        ).build(max_active_rollout_groups=4)
+        for group_id in range(4):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        # Group 2 is initially outside [0, 1], so it cannot be selected yet.
+        await buffer.finalize_work(RolloutGroup(group_id=2, rollouts=[]))
+        blocked_take = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0.001)
+        assert not blocked_take.done()
+
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/selection_window_groups"] == window
+        assert values["rollout_buffer/eligible_finalized_groups"] == 0
+        assert values["rollout_buffer/blocked_finalized_groups"] == 1
+        assert values["rollout_buffer/window_stall_sec"] > 0
+        assert values["rollout_buffer/available_active_slots"] == 0
+
+        # Completing group 1 makes it selectable. Removing it shifts group 2
+        # into [0, 2], without waiting for the inflight head group 0.
+        await buffer.finalize_work(RolloutGroup(group_id=1, rollouts=[]))
+        assert (await asyncio.wait_for(blocked_take, timeout=1)).group_id == 1
+        assert (await buffer.take_finalized()).group_id == 2
+
+        # Repeating the slide lets the same head be bypassed more than W - 1 times.
+        await buffer.finalize_work(RolloutGroup(group_id=3, rollouts=[]))
+        assert (await buffer.take_finalized()).group_id == 3
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/head_bypass_count"] == 3
+        assert values["rollout_buffer/max_bypass_count"] == 3
+        assert values["rollout_buffer/head_bypass_count"] > window - 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("num_groups_in_selection_window", "strict_fifo"),
+    [(1, False), (None, True)],
+)
+def test_one_group_selection_window_matches_strict_fifo(
+    num_groups_in_selection_window: int | None, strict_fifo: bool
+) -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(
+            num_groups_in_selection_window=num_groups_in_selection_window,
+            strict_fifo=strict_fifo,
+        ).build(max_active_rollout_groups=2)
+        for group_id in (0, 1):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        await buffer.finalize_work(RolloutGroup(group_id=1, rollouts=[]))
+        blocked_take = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0)
+        assert not blocked_take.done()
+
+        await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
+        assert (await asyncio.wait_for(blocked_take, timeout=1)).group_id == 0
+        assert (await buffer.take_finalized()).group_id == 1
+
+    asyncio.run(run())
+
+
+def test_close_wakes_take_blocked_by_selection_window() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(num_groups_in_selection_window=2).build(
+            max_active_rollout_groups=3
+        )
+        for group_id in range(3):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        await buffer.finalize_work(RolloutGroup(group_id=2, rollouts=[]))
+        blocked_take = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0)
+        assert not blocked_take.done()
+        await buffer.close()
+        assert await asyncio.wait_for(blocked_take, timeout=1) is None
+
+    asyncio.run(run())
+
+
+def test_add_work_does_not_charge_after_close() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(num_groups_in_selection_window=1).build(
+            max_active_rollout_groups=1
+        )
+        assert await buffer.wait_for_slot()
+        await buffer.close()
+
+        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/num_groups_waiting"] == 0
+        assert values["rollout_buffer/active_slots_in_use_peak"] == 0
+        assert await buffer.claim_next() is None
+        assert await buffer.take_finalized() is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("window", [0, -1])
+def test_selection_window_must_be_positive(window: int) -> None:
+    with pytest.raises(ValueError, match="num_groups_in_selection_window"):
+        RolloutGroupWorkBuffer.Config(num_groups_in_selection_window=window)
+
+
+def test_selection_window_rejects_conflicting_strict_fifo() -> None:
+    with pytest.raises(ValueError, match="strict_fifo=True conflicts"):
+        RolloutGroupWorkBuffer.Config(
+            num_groups_in_selection_window=2,
+            strict_fifo=True,
+        )
+
+
+@pytest.mark.parametrize("max_bypass", [0, -1])
+def test_max_bypass_must_be_positive(max_bypass: int) -> None:
+    with pytest.raises(ValueError, match="max_bypass_groups"):
+        RolloutGroupWorkBuffer.Config(max_bypass_groups=max_bypass)
+
+
+def test_selection_window_must_fit_active_capacity() -> None:
+    with pytest.raises(ValueError, match="must not exceed max_active_rollout_groups"):
+        RolloutGroupWorkBuffer.Config(num_groups_in_selection_window=3).build(
+            max_active_rollout_groups=2
+        )
+
+
+def test_async_loop_rejects_selection_window_larger_than_capacity() -> None:
+    with pytest.raises(ValueError, match="must not exceed max_active_rollout_groups"):
+        AsyncLoopConfig(
+            num_groups_per_train_step=1,
+            max_active_rollout_groups=2,
+            group_buffer=RolloutGroupWorkBuffer.Config(
+                num_groups_in_selection_window=3
+            ),
+        )
+
+
+def test_cancelled_window_take_stops_stall_timer() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(num_groups_in_selection_window=2).build(
+            max_active_rollout_groups=3
+        )
+        for group_id in range(3):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        await buffer.finalize_work(RolloutGroup(group_id=2, rollouts=[]))
+        blocked_take = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0.001)
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/window_stall_sec"] > 0
+
+        blocked_take.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocked_take
+        buffer.metrics()  # Drain the final partial interval recorded on cancellation.
+        await asyncio.sleep(0.001)
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/window_stall_sec"] == 0
+
+    asyncio.run(run())
+
+
+def test_max_bypass_stalls_until_inflight_group_finishes() -> None:
+    async def run() -> None:
+        max_bypass = 2
+        buffer = RolloutGroupWorkBuffer.Config(
+            num_groups_in_selection_window=2,
+            max_bypass_groups=max_bypass,
+        ).build(max_active_rollout_groups=4)
+        for group_id in range(4):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        for group_id in (1, 2):
+            await buffer.finalize_work(RolloutGroup(group_id=group_id, rollouts=[]))
+            assert (await buffer.take_finalized()).group_id == group_id
+
+        # Group 3 is now inside the sliding prefix, but group 0 has reached the
+        # bypass limit. MSL-style max-age protection stalls further selection.
+        await buffer.finalize_work(RolloutGroup(group_id=3, rollouts=[]))
+        blocked_take = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0.001)
+        assert not blocked_take.done()
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/max_bypass_groups"] == max_bypass
+        assert values["rollout_buffer/num_inflight_at_max_bypass"] == 1
+        assert values["rollout_buffer/max_bypass_stall_sec"] > 0
+        assert values["rollout_buffer/max_bypass_stall_count"] == 1
+        assert values["rollout_buffer/eligible_finalized_groups"] == 1
+        assert values["rollout_buffer/available_active_slots"] == 0
+
+        await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
+        assert (await asyncio.wait_for(blocked_take, timeout=1)).group_id == 0
+        assert (await buffer.take_finalized()).group_id == 3
+
+    asyncio.run(run())
+
+
+def test_replenishment_enters_sliding_selection_window() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(num_groups_in_selection_window=2).build(
+            max_active_rollout_groups=3
+        )
+        for group_id in (0, 1, 2):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        await buffer.finalize_work(RolloutGroup(group_id=1, rollouts=[]))
+        assert (await buffer.take_finalized()).group_id == 1
+        await buffer.release_active_groups(1, reason="untrainable_group")
+
+        assert await buffer.wait_for_slot()
+        await buffer.add_work(RolloutGroupWork(group_id=3, sample=object()))
+        assert (await buffer.claim_next()).group_id == 3
+        await buffer.finalize_work(RolloutGroup(group_id=3, rollouts=[]))
+
+        # Group 3 was appended outside [0, 2], so it remains blocked until 2 is
+        # selected and shifts the current prefix to [0, 3].
+        blocked_take = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0)
+        assert not blocked_take.done()
+        await buffer.finalize_work(RolloutGroup(group_id=2, rollouts=[]))
+        assert (await asyncio.wait_for(blocked_take, timeout=1)).group_id == 2
+        assert (await buffer.take_finalized()).group_id == 3
+
+    asyncio.run(run())
+
+
 def test_untrainable_group_releases_before_training() -> None:
     async def run() -> None:
         buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=1)

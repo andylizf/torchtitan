@@ -271,6 +271,18 @@ class AsyncLoopConfig(Configurable.Config):
                 f"num_groups_per_train_step ({self.num_groups_per_train_step}), "
                 f"got {max_active_rollout_groups}"
             )
+        num_groups_in_selection_window = (
+            self.group_buffer.resolved_num_groups_in_selection_window()
+        )
+        if (
+            num_groups_in_selection_window is not None
+            and num_groups_in_selection_window > max_active_rollout_groups
+        ):
+            raise ValueError(
+                "num_groups_in_selection_window must not exceed "
+                f"max_active_rollout_groups ({max_active_rollout_groups}), got "
+                f"{num_groups_in_selection_window}"
+            )
         if self.initial_active_rollout_groups is None:
             return max_active_rollout_groups
         if not 1 <= self.initial_active_rollout_groups <= max_active_rollout_groups:

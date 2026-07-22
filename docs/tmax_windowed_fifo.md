@@ -8,9 +8,10 @@ This document records the scheduling analysis as of 2026-07-22 and compares:
 - MSL/TBR's `SimpleBufferAsyncController + FIFOElementBuffer`;
 - the fixed, anchored Windowed FIFO shown in the paper.
 
-This is a design document. It does not imply that TorchTitan has implemented
-Windowed FIFO. By default, TorchTitan still uses take-any over the entire active
-window.
+TorchTitan now has an optional MSL-style sliding selection window over the
+current active admission queue. It is disabled by default, so existing recipes
+still use take-any over the entire active window. TMax enables it with
+`SWE_SELECTION_WINDOW_GROUPS=W`.
 
 ## 2. Problem Statement
 
@@ -76,9 +77,12 @@ If group 0 is slow while groups 1, 2, 7, and 19 have finished, the batcher can
 continue consuming the later groups. As consumption and replenishment continue,
 an arbitrary number of new groups can bypass group 0.
 
-The current implementation is therefore unbounded take-any, not Windowed FIFO.
-Setting `SWE_STRICT_FIFO=1` changes it to strict FIFO, but reintroduces
-head-of-line blocking.
+The default implementation is therefore unbounded take-any. With a configured
+window, the batcher scans only the first `W` entries in the current active map.
+Selecting any group removes it immediately, so later entries slide into the
+prefix even while the oldest group remains unfinished. This matches MSL's
+current-prefix semantics. `SWE_STRICT_FIFO=1` remains a compatibility alias for
+`W=1`.
 
 Relevant code:
 
@@ -253,8 +257,8 @@ MSL's Windowed FIFO therefore:
 
 | Dimension | TorchTitan TMax | MSL/TBR |
 |---|---|---|
-| selection | take-any over the entire active map | Windowed FIFO over a queue prefix |
-| slow tasks | may be bypassed continuously and stale-dropped after completion | stall or eviction after reaching max age |
+| selection | full-map take-any by default; optional sliding queue prefix | sliding queue-prefix Windowed FIFO |
+| slow tasks | optional max-bypass stall, then stale-drop if completed too old | stall or eviction after reaching max age |
 | execution unit | 32-sibling prompt group | actor element |
 | concurrency | worker-local sibling gate | `num_actors` element lanes |
 | slot release | after generator weight pull | when fed to `DynamicBatcher` |
@@ -265,7 +269,7 @@ MSL's Windowed FIFO therefore:
 The bounded selection window is the most useful MSL mechanism to adopt. Its
 slot lifetime and warmup formula should not be transplanted.
 
-## 6. Proposed TorchTitan Design
+## 6. TorchTitan Design
 
 ### 6.1 Preserve Existing Mechanisms
 
@@ -278,12 +282,12 @@ Windowed FIFO should not change the following behavior:
 4. Hold each trainable group's credit until the generator weight pull.
 5. Check policy age both in the batcher and at trainer consumption.
 
-### 6.2 Add a Group Selection Window
+### 6.2 Group Selection Window
 
-Add an independent parameter to `RolloutGroupWorkBuffer.Config`, for example:
+`RolloutGroupWorkBuffer.Config` provides an independent parameter:
 
 ```text
-selection_window_groups: int | None
+num_groups_in_selection_window: int | None
 ```
 
 Selection rules:
@@ -291,17 +295,20 @@ Selection rules:
 ```text
 None  -> current take-any over the full window
 1     -> strict FIFO
-W > 1 -> scan only the first W entries in the admission queue and return the
-         earliest FINALIZED group
+W > 1 -> scan the first W entries in the current active admission map and
+         return the earliest FINALIZED group
 ```
 
-The window must be based on the admission queue, not the current finalized
-list. Otherwise, the behavior still degenerates into completion-order sampling.
+The window is based on the current admission-ordered active map, not the current
+finalized list. Removing a non-head entry slides the next active admission into
+view. New groups are appended at the tail as active credits become available.
+The TMax environment variable is `SWE_SELECTION_WINDOW_GROUPS`.
 
 ### 6.3 Initial TMax Experiment Values
 
-The current configuration is `N=40, E=8`. The paper's empirical value of
-`W ~= 0.3N` corresponds to approximately 12 groups:
+The current configuration is `N=40, E=8`. Using the paper's empirical
+`W ~= 0.3N` ratio as an initial value, despite the different sliding semantics,
+corresponds to approximately 12 groups:
 
 ```text
 baseline: W=None  # current unbounded take-any
@@ -314,29 +321,53 @@ control:  W=1     # strict FIFO, only to diagnose the throughput cost
 trainer wait when many groups have zero standard deviation. The first A/B test
 should keep rollout concurrency, shuffle, seed, optimizer, and loss unchanged.
 
-### 6.4 Whether to Add a Max-Age Brake
+### 6.4 Max-Bypass Brake
 
 The selection window and policy stale-drop address different problems:
 
 - the selection window controls the training distribution;
 - the policy cap prevents the use of excessively old data;
-- a max-age brake handles permanently stuck or extremely slow `INFLIGHT` groups.
+- the max-bypass brake stops further selection after an `INFLIGHT` group has
+  been bypassed by too many later groups.
 
-First implement the selection window and record the bypass count for each group.
-After observing the actual tail, decide whether to add:
+`RolloutGroupWorkBuffer.Config` provides:
 
 ```text
-max_bypass_groups
-max_bypass_action = stall | drop
+max_bypass_groups: int | None
 ```
 
-For Daytona agent workloads, `drop` is generally more robust than a global
-`stall`. However, infrastructure failures, idle TTL, and genuinely long tasks
-must be reported separately to avoid silently removing difficult samples.
+At `bypass_count >= max_bypass_groups`, the batcher stops selecting every later
+group until the over-age group leaves `INFLIGHT`. Normal agent execution is
+bounded by a per-sibling wall guard, but this is not a complete group-level hard
+timeout.
+
+The max-bypass brake is opt-in. `SWE_MAX_BYPASS_GROUPS=32` aligns a diagnostic
+run with the standard four-step policy cap and `E=8`; `off`, an empty value, or
+an unset variable disables it. MSL validates that its policy cap is at least its
+32-step max age, so copying MSL's `32 * E = 256` default into TMax while keeping
+a four-step policy cap would make the delayed group stale before the brake
+engages.
+
+TMax counts direct later-group selections while an older group is `INFLIGHT`,
+rather than every MSL feed event. The two are equivalent for a stuck queue head,
+which is the condition this brake handles, but this is not an exact replacement
+for every element's MSL age.
+
+The production launcher leaves the brake off. The per-sibling wall guard does
+not cover every group-level failure mode: worker RPC, sibling-gate waiting, or
+sandbox cleanup can still hang outside it. A global stall is not safe by default
+until TMax can hard-timeout or reliably cancel the complete group across its
+worker and sibling sandboxes.
+
+Inflight eviction is intentionally not implemented. The controller does not yet
+own a reliable cross-`RolloutWorker` single-group cancellation handshake;
+releasing its active credit while its sibling sandboxes still run would break
+end-to-end capacity accounting.
 
 ## 7. Required Metrics
 
-At minimum, record the following metrics after implementing Windowed FIFO:
+The implementation exposes the following scheduler metrics. Monitor them
+alongside the existing stale-drop and policy-age metrics:
 
 ```text
 rollout_buffer/selection_window_groups
@@ -345,6 +376,10 @@ rollout_buffer/blocked_finalized_groups
 rollout_buffer/head_wall_age_sec
 rollout_buffer/head_bypass_count
 rollout_buffer/max_bypass_count
+rollout_buffer/max_bypass_groups
+rollout_buffer/num_inflight_at_max_bypass
+rollout_buffer/max_bypass_stall_sec
+rollout_buffer/max_bypass_stall_count
 rollout_buffer/window_stall_sec
 rollout_buffer/dropped/stale
 train_batch/policy_age
@@ -360,31 +395,42 @@ differences and scheduler selection bias.
 
 Validation must cover more than throughput. The implementation must satisfy:
 
-1. A finalized group outside the window cannot be selected before the boundary
-   advances.
+1. A finalized group outside the window cannot be selected until earlier
+   removals shift it into the current prefix.
 2. An inflight head can be bypassed within the window.
-3. When multiple groups within the window are finalized, select them in
+3. Selecting a non-head group immediately shifts the next active admission into
+   the window, matching MSL.
+4. A replenished tail group can enter the window while the oldest group remains
+   inflight.
+5. When multiple groups within the window are finalized, select them in
    admission order.
-4. Sibling slots are still released individually; the implementation must not
+6. Sibling slots are still released individually; the implementation must not
    regress to waiting for a complete group's worth of slots.
-5. Active credits remain conserved across zero-std, stale, and trained groups.
-6. Trainer consumption never accepts a batch beyond the policy cap.
-7. `W=None` matches the current take-any behavior.
-8. `W=1` matches strict FIFO behavior.
-9. Compare task index, wall time, solve distribution, and attempted reward over
+7. Active credits remain conserved across zero-std, stale, and trained groups.
+8. Trainer consumption never accepts a batch beyond the policy cap.
+9. `W=None` matches the current take-any behavior.
+10. `W=1` matches strict FIFO behavior.
+11. Repeated sliding may produce more than `W - 1` lifetime bypasses, and the
+    bypass metrics record that tail.
+12. Reaching `max_bypass_groups` stalls later selection until the over-age
+    `INFLIGHT` group becomes terminal.
+13. Compare task index, wall time, solve distribution, and attempted reward over
    the first 10 steps.
-10. Report throughput, trainer wait time, and stale-partial rate alongside the
+14. Report throughput, trainer wait time, and stale-partial rate alongside the
     reward curve.
 
 ## 9. Conclusion
 
-TorchTitan has addressed trajectory-level slot waste, but not group-level
-completion-selection bias. MSL's key idea is to separate total run-ahead,
-normal selection range, and extreme-tail protection into three independent
-parameters: `mean_age`, `windowed_fifo`, and `max_age`.
+TorchTitan now addresses trajectory-level slot waste and, when the optional
+selection window is enabled, limits each group selection to an older active
+prefix. The default `W=None` behavior remains unbounded take-any for
+compatibility. MSL's key idea is preserved: total run-ahead, normal selection
+range, and extreme-tail protection are separate concerns.
 
-The safest migration path for TMax is to preserve the existing sibling gate,
-cold start, end-to-end credits, and policy freshness checks while adding an
-admission-ordered selection window to the group buffer. This directly limits
-the fast-task shortcut without reintroducing the full throughput cost of strict
-FIFO.
+The implemented sliding admission-ordered window preserves the sibling gate,
+32 -> 40 cold start, end-to-end credits, and policy freshness checks. It reduces
+the instantaneous fast-task race but does not impose a lifetime bypass bound by
+itself. The max-bypass stall supplies the eventual scheduler brake while the
+group remains healthy, but it is disabled in the production launcher because
+some group-level failure paths are still unbounded. A production lifetime bound
+requires a hard group timeout or explicit cancellation handshake.

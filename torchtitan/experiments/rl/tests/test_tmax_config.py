@@ -97,6 +97,9 @@ def test_tmax_9b_cold_start_capacity(
 ) -> None:
     monkeypatch.delenv("SWE_GDN_BI", raising=False)
     monkeypatch.delenv("SWE_OFFPOLICY_STEPS", raising=False)
+    monkeypatch.delenv("SWE_SELECTION_WINDOW_GROUPS", raising=False)
+    monkeypatch.delenv("SWE_MAX_BYPASS_GROUPS", raising=False)
+    monkeypatch.delenv("SWE_STRICT_FIFO", raising=False)
     monkeypatch.setenv("SWE_NUM_ROLLOUT_WORKERS", "8")
     monkeypatch.setenv("SWE_ROLLOUT_CONCURRENCY", str(rollout_concurrency))
     for name, value in (
@@ -119,6 +122,20 @@ def test_tmax_9b_cold_start_capacity(
     )
 
 
+def test_tmax_9b_defaults_to_unbounded_take_any(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SWE_SELECTION_WINDOW_GROUPS", raising=False)
+    monkeypatch.delenv("SWE_MAX_BYPASS_GROUPS", raising=False)
+    monkeypatch.delenv("SWE_STRICT_FIFO", raising=False)
+
+    group_buffer = rl_grpo_qwen3_5_9b_tmax().async_loop.group_buffer
+
+    assert group_buffer.num_groups_in_selection_window is None
+    assert group_buffer.max_bypass_groups is None
+    assert not group_buffer.strict_fifo
+
+
 def test_tmax_9b_rejects_worker_split_without_group_headroom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -129,3 +146,34 @@ def test_tmax_9b_rejects_worker_split_without_group_headroom(
 
     with pytest.raises(ValueError, match="cannot keep every trajectory gate supplied"):
         rl_grpo_qwen3_5_9b_tmax()
+
+
+def test_tmax_9b_configures_sliding_selection_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SWE_SELECTION_WINDOW_GROUPS", "12")
+    monkeypatch.delenv("SWE_MAX_BYPASS_GROUPS", raising=False)
+    monkeypatch.setenv("SWE_STRICT_FIFO", "0")
+
+    group_buffer = rl_grpo_qwen3_5_9b_tmax().async_loop.group_buffer
+
+    assert group_buffer.num_groups_in_selection_window == 12
+    assert group_buffer.max_bypass_groups is None
+    assert not group_buffer.strict_fifo
+
+
+@pytest.mark.parametrize(
+    ("max_bypass_override", "expected"),
+    [("32", 32), ("off", None), ("", None)],
+)
+def test_tmax_9b_configures_max_bypass_override(
+    monkeypatch: pytest.MonkeyPatch,
+    max_bypass_override: str,
+    expected: int | None,
+) -> None:
+    monkeypatch.setenv("SWE_SELECTION_WINDOW_GROUPS", "12")
+    monkeypatch.setenv("SWE_MAX_BYPASS_GROUPS", max_bypass_override)
+
+    group_buffer = rl_grpo_qwen3_5_9b_tmax().async_loop.group_buffer
+
+    assert group_buffer.max_bypass_groups == expected

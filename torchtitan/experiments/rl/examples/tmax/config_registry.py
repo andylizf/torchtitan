@@ -237,6 +237,17 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     group_size = 32
     max_offpolicy_steps = int(os.environ.get("SWE_OFFPOLICY_STEPS", "4"))
     max_active_rollout_groups = int(os.environ.get("SWE_MAX_ACTIVE_GROUPS", "40"))
+    num_groups_in_selection_window_env = os.environ.get("SWE_SELECTION_WINDOW_GROUPS")
+    num_groups_in_selection_window = (
+        int(num_groups_in_selection_window_env)
+        if num_groups_in_selection_window_env
+        else None
+    )
+    max_bypass_groups_env = os.environ.get("SWE_MAX_BYPASS_GROUPS")
+    if not max_bypass_groups_env or max_bypass_groups_env.lower() == "off":
+        max_bypass_groups = None
+    else:
+        max_bypass_groups = int(max_bypass_groups_env)
     num_rollout_workers = int(os.environ.get("SWE_NUM_ROLLOUT_WORKERS", "8"))
     rollout_concurrency = config.rollouter.rollout_concurrency
     # Open-Instruct cold-starts with async_steps * global_batch_size prompt
@@ -304,12 +315,14 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             if os.environ.get("SWE_MAX_NUM_SEQS")
             else None
         ),
-        # Batcher take order. Default take-any (throughput); SWE_STRICT_FIFO=1 uses
-        # strict FIFO to remove take-any's bias toward short/fast (=easy) rollouts in
-        # the trained batch (diagnostic for the flat-reward hypothesis; costs the
-        # straggler stall).
+        # Batcher take order. Default take-any preserves historical throughput.
+        # SWE_SELECTION_WINDOW_GROUPS=W enables MSL-style sliding-prefix selection;
+        # SWE_MAX_BYPASS_GROUPS optionally applies direct-bypass stall protection;
+        # SWE_STRICT_FIFO=1 remains a compatibility alias for W=1.
         group_buffer=dataclasses.replace(
             config.async_loop.group_buffer,
+            num_groups_in_selection_window=num_groups_in_selection_window,
+            max_bypass_groups=max_bypass_groups,
             strict_fifo=os.environ.get("SWE_STRICT_FIFO", "0") == "1",
         ),
         training_sample_builder=TrainingSampleBuilder.Config(

@@ -68,6 +68,8 @@ SWE_LOSS=dppo \
 SWE_TIME_BUDGET_SEC=3600 \
 SWE_VAL_SAMPLES=0 \
 SWE_DISABLE_SHUFFLE=0 \
+SWE_SELECTION_WINDOW_GROUPS=12 \
+SWE_MAX_BYPASS_GROUPS=off \
 SWE_STRICT_FIFO=0 \
 SWE_ROLLOUT_CONCURRENCY=512 \
 SWE_NUM_ROLLOUT_WORKERS=8 \
@@ -124,18 +126,46 @@ naming. It does not mean the selected loss is GRPO. Confirm the W&B config under
 
 ## 4. Shuffle, FIFO, and validation variants
 
-The recommended training run uses shuffled prompts and the work-conserving
+The baseline training run uses shuffled prompts and the work-conserving
 take-any buffer:
 
 ```text
 SWE_DISABLE_SHUFFLE=0
+SWE_SELECTION_WINDOW_GROUPS=<unset>
+SWE_MAX_BYPASS_GROUPS=off
 SWE_STRICT_FIFO=0
 ```
 
+For the first MSL-style Windowed FIFO trial, keep every other setting unchanged and
+set:
+
+```text
+SWE_SELECTION_WINDOW_GROUPS=12
+SWE_MAX_BYPASS_GROUPS=off
+SWE_STRICT_FIFO=0
+```
+
+Each selection scans the first 12 entries in the current active admission map.
+Removing any selected group shifts the next entry into that prefix, so `W=12`
+limits instantaneous look-ahead but not lifetime bypass count. Use `W=16` only
+as a follow-up if window-block time is excessive, and monitor head bypass. The
+local `mast_rl/submit_swe_tmax_9b.sh` entry point defaults to `W=12` and
+`max_bypass_groups=off`.
+
+`SWE_MAX_BYPASS_GROUPS=32` enables an experimental MSL-inspired global stall at
+four step-equivalents of direct bypass. Do not enable it for an unattended run
+until the controller has a hard group-RPC timeout or reliable cancellation
+handshake: a crashed worker or hung RPC can otherwise leave a group `INFLIGHT`
+and freeze selection permanently. MSL's `32 * E = 256` default is also not
+appropriate with TMax's four-step policy cap. Use the nonempty `off` sentinel so
+the setting is visible after MAST environment forwarding.
+
 For an index-by-index Open-Instruct comparison, set
 `SWE_DISABLE_SHUFFLE=1`. This is a diagnostic run and changes the sampled task
-distribution. `SWE_STRICT_FIFO=1` is also diagnostic: it removes completion-order
-selection but reintroduces head-of-line straggler stalls.
+distribution. Strict FIFO is also diagnostic: set
+`SWE_SELECTION_WINDOW_GROUPS=`, `SWE_MAX_BYPASS_GROUPS=off`, and
+`SWE_STRICT_FIFO=1`; this removes completion-order selection but reintroduces
+head-of-line straggler stalls.
 
 `SWE_VAL_SAMPLES=0` disables fixed held-out validation. To enable the recipe's
 held-out pass, set it to `32`; validation then runs at the start, end, and every
