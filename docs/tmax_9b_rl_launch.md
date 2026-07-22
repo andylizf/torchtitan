@@ -139,7 +139,9 @@ selection but reintroduces head-of-line straggler stalls.
 
 `SWE_VAL_SAMPLES=0` disables fixed held-out validation. To enable the recipe's
 held-out pass, set it to `32`; validation then runs at the start, end, and every
-20 steps and adds substantial Daytona wall time.
+20 steps and adds substantial Daytona wall time. Validation currently uses the
+controller-local rollouter rather than the worker gates, so a periodic pass may
+temporarily create up to 32 sandboxes in addition to the training concurrency.
 
 ## 5. Trying concurrency 1024
 
@@ -160,8 +162,14 @@ SWE_ROLLOUT_CONCURRENCY=1024
 ```
 
 Keep `TT_DAYTONA_CREATE_CONCURRENCY=16` for the first comparison. With eight
-workers, 1024 means 128 sibling slots per worker. Concurrency above 1280 cannot
-do useful work with the default 40-group active window.
+workers, 1024 means 128 sibling slots per worker. The recipe automatically starts
+all 40 active groups at this concurrency, leaving one queued 32-sibling group per
+worker to refill completed slots; do not force `SWE_INITIAL_ACTIVE_GROUPS=32`.
+Concurrency above 1280 cannot do useful work with the default 40-group active
+window. With eight workers, the largest concurrency that also leaves at least
+one queued sibling behind every gate is 1272. The launcher rejects worker and
+concurrency combinations whose even gate split would need more than the active
+group window; reduce either setting or increase `SWE_MAX_ACTIVE_GROUPS`.
 
 Do not assume 1024 is faster. Compare Daytona create failures/rate limits,
 generator inflight and queue-time metrics, rollout-worker CPU load, and

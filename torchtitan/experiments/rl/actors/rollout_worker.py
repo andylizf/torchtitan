@@ -15,11 +15,12 @@ sandboxes or generators are available.
 This actor moves ``run_group_rollouts`` into a pool of CPU worker processes
 (co-located on the generator hosts). Each worker owns its own ``Rollouter``
 (with a local 127.0.0.1 shim on a per-worker port), ``Renderer``, and a
-generate-only generator router. The controller sends one RPC per group and
-round-robins those RPCs across workers. Multiple async ``run_group`` calls overlap
-inside each worker; ``train.py`` pins Monarch's concurrent endpoint dispatch for
-this behavior. The finalized groups return independently, while the off-policy
-buffer, batcher, trainer, and weight sync all stay in the controller.
+generate-only generator router. The controller pins rollout-loop lanes to
+workers round-robin, and each lane sends one RPC for whichever group it claims.
+Multiple async ``run_group`` calls overlap inside each worker; ``train.py`` pins
+Monarch's concurrent endpoint dispatch for this behavior. The finalized groups
+return independently, while the off-policy buffer, batcher, trainer, and weight
+sync all stay in the controller.
 
 Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 ``RolloutGroup`` out (which has to reach the trainer anyway).
@@ -79,9 +80,9 @@ class RolloutWorker(Actor):
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
         )
         # Per-worker concurrency: override the rollouter's rollout_concurrency with
-        # this worker's share (pool total = num_workers x this) via config, so the
-        # rollouter builds its semaphore from config -- no process-wide env. The
-        # hasattr guard keeps the pool usable with any Rollouter.Config.
+        # this worker's exact share of the global limit, so the rollouter builds its
+        # semaphore from config -- no process-wide env. The hasattr guard keeps the
+        # pool usable with any Rollouter.Config.
         rollouter_config = config.rollouter
         if hasattr(rollouter_config, "rollout_concurrency"):
             rollouter_config = replace(

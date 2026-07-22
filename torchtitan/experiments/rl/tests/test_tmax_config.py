@@ -75,24 +75,30 @@ def test_tmax_4b_diagnostic_keeps_required_bf16(
     (
         "max_active_override",
         "initial_active_override",
+        "rollout_concurrency",
         "expected_max_active",
         "expected_initial_active",
     ),
     [
-        (None, None, 40, 32),
-        ("32", None, 32, 32),
-        ("40", "24", 40, 24),
+        (None, None, 512, 40, 32),
+        (None, None, 1000, 40, 32),
+        (None, None, 1024, 40, 40),
+        ("32", None, 512, 32, 32),
+        ("40", "24", 1024, 40, 24),
     ],
 )
-def test_tmax_9b_open_instruct_cold_start_capacity(
+def test_tmax_9b_cold_start_capacity(
     monkeypatch: pytest.MonkeyPatch,
     max_active_override: str | None,
     initial_active_override: str | None,
+    rollout_concurrency: int,
     expected_max_active: int,
     expected_initial_active: int,
 ) -> None:
     monkeypatch.delenv("SWE_GDN_BI", raising=False)
     monkeypatch.delenv("SWE_OFFPOLICY_STEPS", raising=False)
+    monkeypatch.setenv("SWE_NUM_ROLLOUT_WORKERS", "8")
+    monkeypatch.setenv("SWE_ROLLOUT_CONCURRENCY", str(rollout_concurrency))
     for name, value in (
         ("SWE_MAX_ACTIVE_GROUPS", max_active_override),
         ("SWE_INITIAL_ACTIVE_GROUPS", initial_active_override),
@@ -111,3 +117,15 @@ def test_tmax_9b_open_instruct_cold_start_capacity(
     assert (
         async_loop.resolved_initial_active_rollout_groups() == expected_initial_active
     )
+
+
+def test_tmax_9b_rejects_worker_split_without_group_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SWE_INITIAL_ACTIVE_GROUPS", raising=False)
+    monkeypatch.setenv("SWE_MAX_ACTIVE_GROUPS", "40")
+    monkeypatch.setenv("SWE_NUM_ROLLOUT_WORKERS", "15")
+    monkeypatch.setenv("SWE_ROLLOUT_CONCURRENCY", "1024")
+
+    with pytest.raises(ValueError, match="cannot keep every trajectory gate supplied"):
+        rl_grpo_qwen3_5_9b_tmax()

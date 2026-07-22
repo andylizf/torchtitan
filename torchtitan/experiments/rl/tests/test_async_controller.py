@@ -17,7 +17,12 @@ from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
-from torchtitan.experiments.rl.controller import AsyncLoopConfig, Controller
+from torchtitan.experiments.rl.controller import (
+    _should_drop_group_at_batcher,
+    _split_rollout_concurrency,
+    AsyncLoopConfig,
+    Controller,
+)
 from torchtitan.experiments.rl.controller_metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
@@ -93,6 +98,103 @@ def _rollout_group(
     return RolloutGroup(group_id=group_id, rollouts=[rollout])
 
 
+@pytest.mark.parametrize(
+    ("global_concurrency", "num_workers", "max_num_workers", "expected"),
+    [
+        (512, 8, None, [64] * 8),
+        (10, 3, None, [4, 3, 3]),
+        (3, 8, None, [1, 1, 1]),
+        (512, 64, 40, [13] * 32 + [12] * 8),
+    ],
+)
+def test_split_rollout_concurrency_preserves_global_limit(
+    global_concurrency: int,
+    num_workers: int,
+    max_num_workers: int | None,
+    expected: list[int],
+) -> None:
+    capacities = _split_rollout_concurrency(
+        global_concurrency, num_workers, max_num_workers=max_num_workers
+    )
+
+    assert capacities == expected
+    assert sum(capacities) == global_concurrency
+    assert min(capacities) >= 1
+    assert max(capacities) - min(capacities) <= 1
+
+
+@pytest.mark.parametrize(
+    ("global_concurrency", "num_workers", "max_num_workers"),
+    [(0, 1, None), (1, 0, None), (-1, 1, None), (1, -1, None), (1, 1, 0)],
+)
+def test_split_rollout_concurrency_rejects_nonpositive_values(
+    global_concurrency: int, num_workers: int, max_num_workers: int | None
+) -> None:
+    with pytest.raises(ValueError):
+        _split_rollout_concurrency(
+            global_concurrency, num_workers, max_num_workers=max_num_workers
+        )
+
+
+@pytest.mark.parametrize(
+    ("group_age", "max_offpolicy_steps", "expected"),
+    [
+        (0, 0, False),
+        (1, 0, True),
+        (3, 4, False),
+        (4, 4, False),
+        (5, 4, True),
+    ],
+)
+def test_batcher_staleness_keeps_fully_on_policy_groups(
+    group_age: int, max_offpolicy_steps: int, expected: bool
+) -> None:
+    assert (
+        _should_drop_group_at_batcher(
+            group_age=group_age, max_offpolicy_steps=max_offpolicy_steps
+        )
+        is expected
+    )
+
+
+def test_validation_group_ids_are_unique_across_passes() -> None:
+    controller = object.__new__(Controller)
+    controller._next_validation_group_id = -1
+
+    assert controller._allocate_validation_group_ids(3) == [-1, -2, -3]
+    assert controller._allocate_validation_group_ids(2) == [-4, -5]
+
+
+def test_trainer_discards_stale_queued_batch_before_training() -> None:
+    class FakeGroupBuffer:
+        def __init__(self) -> None:
+            self.releases: list[tuple[int, str]] = []
+
+        async def release_active_groups(self, count: int, *, reason: str) -> None:
+            self.releases.append((count, reason))
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller._trainer_policy_version = 5
+        controller.config = SimpleNamespace(
+            async_loop=AsyncLoopConfig(
+                num_groups_per_train_step=2,
+                max_offpolicy_steps=3,
+            )
+        )
+        controller._group_buffer = FakeGroupBuffer()
+        stale = SimpleNamespace(min_policy_versions=[1])
+        fresh = SimpleNamespace(min_policy_versions=[2])
+        queue = asyncio.Queue()
+        await queue.put(stale)
+        await queue.put(fresh)
+
+        assert await controller._take_fresh_training_batch(queue) is fresh
+        assert controller._group_buffer.releases == [(2, "stale_queued_batch")]
+
+    asyncio.run(run())
+
+
 def test_batcher_counts_trainable_groups_not_rollouts() -> None:
     # Target is 2 GROUPS. A single group with many rollouts is not a full batch; two groups are,
     # regardless of how many rollouts each contributes.
@@ -166,13 +268,16 @@ def test_compute_perf_ratio_metrics_skips_missing_spans() -> None:
             num_global_valid_tokens=100, time_metrics=time_metrics
         )
     }
-    assert keys == {"perf/trainer/tokens_per_second_full_step"}
+    assert keys == {
+        "batch/num_global_valid_tokens",
+        "perf/trainer/tokens_per_second_full_step",
+    }
 
 
-def test_compute_perf_ratio_metrics_returns_empty_without_total() -> None:
-    assert (
-        compute_perf_ratio_metrics(num_global_valid_tokens=100, time_metrics=[]) == []
-    )
+def test_compute_perf_ratio_metrics_emits_token_count_without_total() -> None:
+    metrics = compute_perf_ratio_metrics(num_global_valid_tokens=100, time_metrics=[])
+    assert len(metrics) == 1
+    assert metrics[0].key == "batch/num_global_valid_tokens"
 
 
 def test_metrics_timer_flush_drains() -> None:
@@ -376,6 +481,24 @@ def test_take_finalized_skips_inflight_straggler() -> None:
         await buffer.finalize_work(RolloutGroup(group_id=1, rollouts=[]))
         taken = await buffer.take_finalized()
         assert taken is not None and taken.group_id == 1
+
+    asyncio.run(run())
+
+
+def test_take_finalized_uses_admission_order_when_multiple_are_ready() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=2)
+        for group_id in (0, 1):
+            assert await buffer.wait_for_slot()
+            await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+            assert (await buffer.claim_next()).group_id == group_id
+
+        # Finalize in reverse order before the batcher scans. The buffer chooses
+        # the older admission, not the earlier completion timestamp.
+        await buffer.finalize_work(RolloutGroup(group_id=1, rollouts=[]))
+        await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
+        taken = await buffer.take_finalized()
+        assert taken is not None and taken.group_id == 0
 
     asyncio.run(run())
 

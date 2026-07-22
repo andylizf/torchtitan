@@ -40,7 +40,11 @@ from torchtitan.experiments.rl.actors.generator import VLLMCudagraphConfig
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
-from torchtitan.experiments.rl.controller import Controller, ValidationConfig
+from torchtitan.experiments.rl.controller import (
+    _split_rollout_concurrency,
+    Controller,
+    ValidationConfig,
+)
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
     _CKPT_DIR,
     _qwen3_rl_model_registry,
@@ -197,9 +201,11 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     full 65536 context (response_length), and ``drop_zero_std_reward_groups=True``
     (``filter_zero_std_samples``) -- terminal tasks are sparse binary, so keeping
     all-fail groups would zero out the gradient. Temperature 1.0, constant LR,
-    and beta 0 are inherited from the swe base. It cold-starts with the paper
-    implementation's ``async_steps * num_groups = 32`` prompt groups, then opens
-    the eight downstream slots one-for-one as trainable groups are retained.
+    and beta 0 are inherited from the swe base. When 32 groups leave queued
+    siblings behind every worker gate (including concurrency 512 and 1000), it
+    uses the paper implementation's ``async_steps * num_groups = 32`` prompt-group
+    start. At concurrency 1024 it starts all 40 groups so every worker has queued
+    siblings behind its 128 active slots instead of draining on slow tails.
     The trainer restores standard
     mixed precision (fp32 master parameters, bf16 FSDP compute/reduce in fp32)
     and open-instruct's fused AdamW settings: lr 1e-6, betas (0.9, 0.999),
@@ -212,8 +218,9 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     is re-chunked to 32 chunks (from 16) so the per-chunk fp32 logits stay in the
     validated ~1 GiB envelope at the 4x longer sequence. The full end-to-end active
     ceiling is (off+1) x num_groups x group_size = 5 x 8 x 32 = 1280 sibling slots,
-    while cold-start admission is 4 x 8 x 32 = 1024;
-    ``SWE_ROLLOUT_CONCURRENCY`` throttles the sandbox count below both limits.
+    while the OI-aligned cold-start admission is 4 x 8 x 32 = 1024 logical
+    siblings. ``SWE_ROLLOUT_CONCURRENCY`` throttles the sandbox count and may raise
+    startup admission to preserve queued work at higher concurrency.
     """
     config = _swe_9b()
     config.rollouter = _tmax_rollouter()
@@ -227,14 +234,45 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # grow with retained thinking, so the 65536 context fills sooner.
     config.renderer = dataclasses.replace(config.renderer, preserve_all_thinking=True)
     num_groups_per_train_step = 8
+    group_size = 32
     max_offpolicy_steps = int(os.environ.get("SWE_OFFPOLICY_STEPS", "4"))
     max_active_rollout_groups = int(os.environ.get("SWE_MAX_ACTIVE_GROUPS", "40"))
+    num_rollout_workers = int(os.environ.get("SWE_NUM_ROLLOUT_WORKERS", "8"))
+    rollout_concurrency = config.rollouter.rollout_concurrency
     # Open-Instruct cold-starts with async_steps * global_batch_size prompt
-    # groups. Its extra +1 batch is Ray queue headroom, not initial generation
-    # inventory. Keep the concrete 32-group recipe default in the serialized
-    # config; experiments that shrink the full capacity must override both values.
+    # groups. Also keep at least one queued group per sibling-gate shard: without
+    # that headroom, a concurrency=1024 launch would admit exactly 1024 siblings
+    # and every early completion would leave its slot idle until a full group tail
+    # finished. Keep the OI-aligned 32-group start whenever it supplies that
+    # per-worker headroom, and use all 40 groups at concurrency=1024.
+    oi_initial_active_groups = max_offpolicy_steps * num_groups_per_train_step
+    worker_concurrencies = (
+        _split_rollout_concurrency(
+            rollout_concurrency,
+            num_rollout_workers,
+            max_num_workers=max_active_rollout_groups,
+        )
+        if num_rollout_workers > 0
+        else [rollout_concurrency]
+    )
+    min_work_conserving_groups = sum(
+        worker_concurrency // group_size + 1
+        for worker_concurrency in worker_concurrencies
+    )
+    if min_work_conserving_groups > max_active_rollout_groups:
+        raise ValueError(
+            "The rollout-worker split cannot keep every trajectory gate supplied: "
+            f"it needs at least {min_work_conserving_groups} active groups, but "
+            f"SWE_MAX_ACTIVE_GROUPS={max_active_rollout_groups}. Reduce "
+            "SWE_ROLLOUT_CONCURRENCY or SWE_NUM_ROLLOUT_WORKERS, or increase "
+            "SWE_MAX_ACTIVE_GROUPS."
+        )
+    default_initial_active_groups = min(
+        max_active_rollout_groups,
+        max(oi_initial_active_groups, min_work_conserving_groups),
+    )
     initial_active_rollout_groups = int(
-        os.environ.get("SWE_INITIAL_ACTIVE_GROUPS", "32")
+        os.environ.get("SWE_INITIAL_ACTIVE_GROUPS", str(default_initial_active_groups))
     )
     config.async_loop = dataclasses.replace(
         config.async_loop,
@@ -243,7 +281,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # SWE_ZERO_STD_LOG for a later SWE_SKIP_PROMPTS pass).
         num_training_steps=int(os.environ.get("SWE_TRAIN_STEPS", "100")),
         num_groups_per_train_step=num_groups_per_train_step,
-        group_size=32,
+        group_size=group_size,
         # Policy-age cap. Open-Instruct uses async_steps=4 and initially admits
         # async_steps * num_groups = 32 prompt groups.
         max_offpolicy_steps=max_offpolicy_steps,
@@ -253,9 +291,10 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # separate initial limit below prevents that downstream headroom from being
         # filled with policy-version-0 generation groups.
         max_active_rollout_groups=max_active_rollout_groups,
-        # Start with 32 generation groups, then admit one replacement whenever a
-        # trainable group moves downstream until the full 40-slot end-to-end cap is
-        # reached. Zero-std and stale groups release their existing slot instead.
+        # Start with the OI 32-group population when it leaves gate headroom; raise
+        # it as needed at high rollout concurrency. Then admit one replacement
+        # whenever a trainable group moves downstream until the full end-to-end cap
+        # is reached. Zero-std and stale groups release their existing slot instead.
         initial_active_rollout_groups=initial_active_rollout_groups,
         # Override the generator's vLLM max_num_seqs (decode batch cap per engine).
         # Unset = derived from the rollout pool (capped 512). SWE_MAX_NUM_SEQS=512
@@ -301,7 +340,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # adapter, Daytona HTTP, grading -- otherwise serializes on one GIL and caps
     # throughput). SWE_NUM_ROLLOUT_WORKERS=0 keeps the in-process path; default 8.
     # The global SWE_ROLLOUT_CONCURRENCY is split across the pool.
-    config.num_rollout_workers = int(os.environ.get("SWE_NUM_ROLLOUT_WORKERS", "8"))
+    config.num_rollout_workers = num_rollout_workers
     # Weight-sync KV policy. Default (SWE_SALT_KV=1): keep in-flight KV AND the prefix
     # cache (no preempt, no full re-prefill) and salt the prefix cache per GROUP (its n
     # samples share one namespace), so a NEW group recomputes its prefix under the new

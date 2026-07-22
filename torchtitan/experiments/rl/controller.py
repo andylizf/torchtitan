@@ -75,8 +75,8 @@ _rollout_loop[N]
     unblocked by: n/a
 
 _batcher_loop
-  consumes: the oldest FINALIZED group (group_buffer.take_finalized)
-    waits for:    the oldest group becoming FINALIZED
+  consumes: the oldest-admitted group that is FINALIZED (group_buffer.take_finalized)
+    waits for:    any active group becoming FINALIZED
     unblocked by: _rollout_loop[N] group_buffer.finalize_work()
   produces: TrainingBatch (training_batch_queue.put)
     waits for:    a free training_batch_queue slot (maxsize=1)
@@ -137,6 +137,36 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+
+def _split_rollout_concurrency(
+    global_concurrency: int,
+    num_workers: int,
+    *,
+    max_num_workers: int | None = None,
+) -> list[int]:
+    """Split a global rollout limit across worker shards that can receive work."""
+    if global_concurrency < 1:
+        raise ValueError(
+            f"rollout_concurrency must be positive, got {global_concurrency}"
+        )
+    if num_workers < 1:
+        raise ValueError(f"num_rollout_workers must be positive, got {num_workers}")
+    if max_num_workers is not None and max_num_workers < 1:
+        raise ValueError(f"max_num_workers must be positive, got {max_num_workers}")
+
+    num_active_workers = min(
+        global_concurrency,
+        num_workers,
+        max_num_workers if max_num_workers is not None else num_workers,
+    )
+    base, remainder = divmod(global_concurrency, num_active_workers)
+    return [base + (worker_id < remainder) for worker_id in range(num_active_workers)]
+
+
+def _should_drop_group_at_batcher(*, group_age: int, max_offpolicy_steps: int) -> bool:
+    """Drop groups that are already past the configured policy-age limit."""
+    return group_age > max_offpolicy_steps
 
 
 @dataclass(kw_only=True, slots=True)
@@ -329,9 +359,10 @@ class Controller(Configurable):
 
         0 (default) runs rollouts in-process on the controller (the original
         path). N > 0 spawns N single-proc CPU actors on the controller host; the
-        controller dispatches each group to a worker round-robin, so the agent
-        orchestration (adapter, Daytona HTTP, grading) runs across N GILs. The
-        global ``SWE_ROLLOUT_CONCURRENCY`` target is split evenly across workers.
+        controller pins rollout-loop lanes to workers round-robin, so the agent
+        orchestration (adapter, Daytona HTTP, grading) runs across N GILs. A lane
+        claims the next group from the shared buffer; group id is not a permanent
+        worker assignment. The global rollout concurrency is split across workers.
         """
 
         generator_router: InterGeneratorRouter.Config = field(
@@ -434,6 +465,10 @@ class Controller(Configurable):
         self.generator_router: InterGeneratorRouter | None = None
         # CPU RolloutWorker actors (num_rollout_workers > 0); empty = in-process.
         self._rollout_workers: list = []
+        # Validation shares the generator prefix cache with training. Never reuse a
+        # group id within one process, so salt-prefix mode cannot hit blocks created
+        # by an earlier validation pass under older weights.
+        self._next_validation_group_id = -1
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self._proc_meshes = []
@@ -505,6 +540,20 @@ class Controller(Configurable):
         where all ranks return the same result.
         """
         return result.get(0)
+
+    def _allocate_validation_group_ids(self, num_groups: int) -> list[int]:
+        """Return negative group ids that are unique for this controller process."""
+        if num_groups < 0:
+            raise ValueError(f"num_groups must be non-negative, got {num_groups}")
+        group_ids = list(
+            range(
+                self._next_validation_group_id,
+                self._next_validation_group_id - num_groups,
+                -1,
+            )
+        )
+        self._next_validation_group_id -= num_groups
+        return group_ids
 
     def _make_generate_fn(self, metrics_prefix: str) -> GenerateFn:
         """Build the rollouter's `GenerateFn`: route a completion via the generator router, namespacing
@@ -650,17 +699,37 @@ class Controller(Configurable):
         # Spawn the CPU RolloutWorker pool on the controller host: each worker runs
         # group rollouts (agent orchestration + adapter + Daytona HTTP + grading) in
         # its own process, off the controller GIL. One single-proc CPU mesh per
-        # worker (like the generators, so each is individually addressable for
-        # round-robin dispatch). The global SWE_ROLLOUT_CONCURRENCY target is split
-        # evenly across the pool; each worker sets its own share before its rollouter
-        # builds its sibling-level admission gate.
-        num_workers = config.num_rollout_workers
-        if num_workers > 0:
-            global_conc = int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "16"))
-            per_worker_conc = max(1, math.ceil(global_conc / num_workers))
+        # worker (like the generators, so each is individually addressable). The
+        # global rollout concurrency is split exactly across reachable worker lanes;
+        # each worker sets its own share before its rollouter builds the sibling gate.
+        requested_num_workers = config.num_rollout_workers
+        if requested_num_workers < 0:
+            raise ValueError(
+                "num_rollout_workers must be non-negative, got "
+                f"{requested_num_workers}"
+            )
+        if requested_num_workers > 0:
+            global_conc = getattr(config.rollouter, "rollout_concurrency", None)
+            if global_conc is None:
+                global_conc = int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "16"))
+            worker_concurrencies = _split_rollout_concurrency(
+                global_conc,
+                requested_num_workers,
+                max_num_workers=config.async_loop.resolved_max_active_rollout_groups(),
+            )
+            if len(worker_concurrencies) < requested_num_workers:
+                logger.warning(
+                    "Capping rollout workers from %d to %d: each worker needs a "
+                    "trajectory slot and a rollout-group lane (global concurrency=%d, "
+                    "max active groups=%d)",
+                    requested_num_workers,
+                    len(worker_concurrencies),
+                    global_conc,
+                    config.async_loop.resolved_max_active_rollout_groups(),
+                )
             with sl.log_trace_span("rollout_worker_spawn"):
                 host = this_host()
-                for worker_id in range(num_workers):
+                for worker_id, worker_conc in enumerate(worker_concurrencies):
                     worker_mesh = host.spawn_procs(per_host={"rollout_workers": 1})
                     self._proc_meshes.append(worker_mesh)
                     self._rollout_workers.append(
@@ -668,7 +737,7 @@ class Controller(Configurable):
                             f"rollout_worker_{worker_id}",
                             RolloutWorker,
                             config,
-                            rollout_concurrency=per_worker_conc,
+                            rollout_concurrency=worker_conc,
                         )
                     )
                 # Each worker builds its own generate-only router over the shared generators.
@@ -676,8 +745,12 @@ class Controller(Configurable):
                     *(w.setup.call(generators) for w in self._rollout_workers)
                 )
             logger.info(
-                f"Spawned {num_workers} RolloutWorker(s), {per_worker_conc} "
-                f"concurrency each (global target {global_conc})"
+                "Spawned %d RolloutWorker(s) (requested %d), concurrency by "
+                "worker=%s (global target %d)",
+                len(worker_concurrencies),
+                requested_num_workers,
+                worker_concurrencies,
+                global_conc,
             )
 
         # Initialize TorchStore for weight sync between trainer and generator.
@@ -718,19 +791,20 @@ class Controller(Configurable):
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         samples = [self._rollouter.get_validation_sample() for _ in range(num_groups)]
+        group_ids = self._allocate_validation_group_ids(num_groups)
         group_results = await asyncio.gather(
             *(
                 self._rollouter.run_group_rollouts(
                     generate_fn=generate,
                     sample=sample,
-                    # Negative ids keep validation disjoint from training group ids, so their
-                    # request_ids can't collide in the shared engine (e.g. post-validation).
-                    group_id=-(i + 1),
+                    # Negative, process-unique ids keep validation disjoint from
+                    # training and from prior validation prefix-cache salts.
+                    group_id=group_id,
                     group_size=1,
                     sampling=sampling,
                     renderer=self.renderer,
                 )
-                for i, sample in enumerate(samples)
+                for sample, group_id in zip(samples, group_ids, strict=True)
             ),
             return_exceptions=True,
         )
@@ -738,10 +812,10 @@ class Controller(Configurable):
         # Keep the groups that succeeded; log + count the ones that raised.
         rollout_groups: list[RolloutGroup] = []
         num_failed_groups = 0
-        for i, result in enumerate(group_results):
+        for group_id, result in zip(group_ids, group_results, strict=True):
             if isinstance(result, BaseException):
                 logger.error(
-                    f"validation group {-(i + 1)} (step={step}) failed; dropping",
+                    f"validation group {group_id} (step={step}) failed; dropping",
                     exc_info=(type(result), result, result.__traceback__),
                 )
                 num_failed_groups += 1
@@ -857,9 +931,10 @@ class Controller(Configurable):
         # initially fills only initial_active_rollout_groups when cold-start
         # admission is configured, then uses the remaining tasks as retained
         # trainable groups open the downstream headroom.
-        # With a RolloutWorker pool, each loop task is pinned to a worker round-robin so groups spread
-        # across the worker processes (dispatch is non-blocking on the controller; the CPU work runs in the
-        # worker). Without a pool (num_rollout_workers=0), worker=None keeps the in-process path.
+        # With a RolloutWorker pool, each loop task is pinned to a worker round-robin.
+        # The tasks all claim from one shared buffer, so a group is owned by whichever
+        # lane claims it, not by group_id modulo num_workers. Without a pool
+        # (num_rollout_workers=0), worker=None keeps the in-process path.
         num_workers = len(self._rollout_workers)
         rollout_tasks = [
             asyncio.create_task(
@@ -1065,8 +1140,8 @@ class Controller(Configurable):
         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel
         so the trainer stops.
 
-        consumes: the oldest FINALIZED group (group_buffer.take_finalized)
-            waits for:    the oldest group becoming FINALIZED
+        consumes: the oldest-admitted group that is FINALIZED (group_buffer.take_finalized)
+            waits for:    any active group becoming FINALIZED
             unblocked by: _rollout_loop[N] group_buffer.finalize_work()
         produces: TrainingBatch (training_batch_queue.put)
             waits for:    a free training_batch_queue slot (maxsize=1)
@@ -1096,13 +1171,10 @@ class Controller(Configurable):
                 else "partial_solve"
             )
 
-            # Stale-drop (take-any safety). take_finalized returns groups in completion
-            # order, so a slow straggler generated many steps ago can surface later than
-            # the off-policy window allows. Drop it here (release its slot, do not train)
-            # instead of letting compute_policy_age_metrics trip its hard freshness
-            # assertion. This is open-instruct's max_result_age_steps. Strict FIFO never
-            # hit this: its head-of-line stall pinned the trainer version until the
-            # oldest group was consumed -- the very stall we traded away for throughput.
+            # Stale-drop (take-any safety). take_finalized skips inflight groups, so a
+            # slow straggler generated many steps ago can surface after the off-policy
+            # window. Drop it here instead of admitting stale data to a training batch.
+            # This is the analogue of open-instruct's max_result_age_steps.
             #
             # Age is taken from the RAW rollout group's turns, NOT training_samples, so a
             # stale ZERO-STD group is dropped too. A zero-std group has empty
@@ -1122,13 +1194,14 @@ class Controller(Configurable):
                 default=None,
             )
             if group_min_policy_version is not None:
-                # NOTE: checked at the CURRENT trainer version, but the batch is
-                # consumed later; with the 1-deep training_batch_queue the trainer can
-                # advance one step in between, so use >= (leave a 1-step margin) to keep
-                # the consume-time age <= max_offpolicy_steps and never trip the hard
-                # freshness assertion in compute_policy_age_metrics.
+                # Reject groups already past the policy-age limit. A packed batch can
+                # still age while queued, so _take_fresh_training_batch repeats this
+                # check at consumption and releases a batch that has crossed the cap.
                 group_age = self._trainer_policy_version - group_min_policy_version
-                if group_age >= self.config.async_loop.max_offpolicy_steps:
+                if _should_drop_group_at_batcher(
+                    group_age=group_age,
+                    max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
+                ):
                     logger.info(
                         "[buffer] complete group_id=%d solved=%d/%d class=%s "
                         "-> RELEASE(stale_dropped) cur_ver=%d",
@@ -1219,7 +1292,7 @@ class Controller(Configurable):
                 with sl.log_trace_span("wait_for_training_batch"), step_timer.record(
                     "timing/step/wait_for_training_batch"
                 ):
-                    packed = await training_batch_queue.get()
+                    packed = await self._take_fresh_training_batch(training_batch_queue)
 
                 if packed is None:
                     logger.info("Batcher closed and drained; stopping training")
@@ -1354,3 +1427,37 @@ class Controller(Configurable):
                 and step != num_training_steps
             ):
                 await self._validate_and_log(step=step)
+
+    async def _take_fresh_training_batch(
+        self, training_batch_queue: "asyncio.Queue[TrainingBatch | None]"
+    ) -> TrainingBatch | None:
+        """Discard queued batches that aged past the consume-time policy limit."""
+        max_offpolicy_steps = self.config.async_loop.max_offpolicy_steps
+        num_groups = self.config.async_loop.num_groups_per_train_step
+        while True:
+            packed = await training_batch_queue.get()
+            if packed is None:
+                return None
+
+            max_policy_age = max(
+                (
+                    self._trainer_policy_version - min_policy_version
+                    for min_policy_version in packed.min_policy_versions
+                ),
+                default=0,
+            )
+            if max_policy_age <= max_offpolicy_steps:
+                return packed
+
+            logger.warning(
+                "dropping queued training batch beyond off-policy window: "
+                "max_policy_age=%d max_offpolicy_steps=%d trainer_policy_version=%d",
+                max_policy_age,
+                max_offpolicy_steps,
+                self._trainer_policy_version,
+            )
+            # The batcher emits exactly num_groups_per_train_step trainable groups.
+            # Metric-only zero-variance groups were already released at selection.
+            await self._group_buffer.release_active_groups(
+                num_groups, reason="stale_queued_batch"
+            )

@@ -62,8 +62,8 @@ class RolloutGroupWorkBuffer(Configurable):
     """Run-ahead buffer of RolloutGroupWork shared by the data-input, rollout, and batcher loops.
 
     Each entry is a RolloutGroupWork moving WAITING -> INFLIGHT -> FINALIZED. An active-slot budget caps
-    run-ahead at `max_active_rollout_groups` active slots; the batcher takes ANY finalized group in
-    completion order (take-any), skipping still-INFLIGHT stragglers, so a slow head does not stall it.
+    run-ahead at `max_active_rollout_groups` active slots; the batcher takes the oldest-admitted
+    FINALIZED group, skipping still-INFLIGHT stragglers, so a slow head does not stall it.
 
     For details on the buffer's callers, check the diagram in the controller.py file.
 
@@ -95,7 +95,7 @@ class RolloutGroupWorkBuffer(Configurable):
 
         strict_fifo: bool = False
         """take_finalized() order. False (default) = take-any: return the first
-        FINALIZED group in completion order, skipping still-INFLIGHT stragglers (no
+        FINALIZED group in admission order, skipping still-INFLIGHT stragglers (no
         head-of-line stall; the throughput default). True = strict FIFO: return the
         OLDEST group only once IT is finalized, stalling on a slow head. FIFO removes
         the take-any bias toward short/fast (=easy) rollouts in the trained batch, at
@@ -199,17 +199,14 @@ class RolloutGroupWorkBuffer(Configurable):
 
     @sl.log_trace_span("take_finalized")
     async def take_finalized(self) -> RolloutGroup | None:
-        """Batcher loop: take-any -- return the first FINALIZED group (completion
-        order), skipping any still-INFLIGHT groups; wait only if NONE is finalized.
+        """Return the oldest-admitted FINALIZED group, skipping INFLIGHT groups.
 
         This is take-any, NOT strict FIFO: a slow straggler at the head no longer
-        head-of-line-blocks the batcher. It consumes whichever groups finished
-        first, exactly like open-instruct's accumulate_inference_batches pulling
-        from the completion queue -- which is what removes the ~tens-of-min stall
-        (and the KV drain) where each step waited on the single slowest rollout.
-        Staleness stays bounded: a skipped straggler keeps holding its active slot,
-        so the pipeline never exceeds max_active_rollout_groups (off-policy window),
-        and the trainer still computes policy_age at consumption time.
+        blocks the batcher. If multiple groups are finalized before the scan, their
+        admission order breaks the tie; this is not a timestamped completion queue.
+        A skipped straggler keeps holding its active slot, so the pipeline never
+        exceeds max_active_rollout_groups, and the trainer still checks policy age
+        at consumption time.
 
         Example:
             # head g0 still INFLIGHT, g1 FINALIZED -> returns g1 (no stall on g0)

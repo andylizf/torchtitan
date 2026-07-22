@@ -259,8 +259,8 @@ class TMaxRollouter(Rollouter):
         self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300
         # Per-worker rollout-issue gate (one rollouter per worker proc). Each sibling
         # holds one slot, matching open-instruct's per-rollout environment acquire and
-        # release. Ordering is per worker: with a RolloutWorker pool the controller
-        # stripes group ids across workers, so each gate prioritizes its own subset.
+        # release. Ordering is per worker. The controller pins group-loop lanes to
+        # workers, and each gate prioritizes the groups claimed by its lanes.
         self._rollout_gate = _RolloutIssueGate(config.rollout_concurrency)
         self._adapter: AnthropicAdapter | None = None
         self._adapter_lock = asyncio.Lock()

@@ -158,23 +158,23 @@ The 9B recipe has:
 - `C = 512` active sibling rollouts, split as 64 across each of 8 rollout
   worker processes.
 
-The controller creates 40 group-loop tasks immediately
-(`controller.py:799-820`). Each group creates all 32 sibling tasks and waits for
-all of them (`examples/tmax/rollouter.py:279-315`). The per-worker issue gate is
-work-conserving: every completed sibling releases one slot to the next pending
-sibling, ordered by `(group_id, rollout_idx)` within that worker
-(`examples/tmax/rollouter.py:140-198`).
+The controller creates 40 group-loop tasks, but the current 512-concurrency
+recipe initially admits 32 groups and grows to 40 as trainable groups move
+downstream. The `89db01` baseline predates that startup change and admitted all
+40 immediately. Each admitted group creates all 32 sibling tasks and waits for
+all of them. The per-worker issue gate is work-conserving: every completed
+sibling releases one slot to the next pending sibling, ordered by
+`(group_id, rollout_idx)` within that worker.
 
 Group aggregation still has the correct all-sibling barrier. A group is
 finalized only after all 32 siblings complete. The new gate removed idle rollout
 slots behind a slow sibling; it did not change training-batch selection.
 
-There is also a freshness-boundary difference from Open-Instruct. Although the
-configured Titan cap is four steps, the batcher drops when current age is
-`>= 4` (`controller.py:1067-1085`). It reserves one step because the one-deep
-training-batch queue can hold a packed batch while the trainer advances. Thus a
-group is normally selectable only at age 0-3, even though a group packed at age
-3 can be consumed at age 4.
+The batcher and Open-Instruct use the same inclusive freshness boundary: a
+group at age 4 remains eligible and a group at age 5 is dropped. Titan repeats
+the check when the trainer consumes a packed batch because the queue can age a
+previously valid batch. A queued batch that has crossed the limit is dropped and
+its group slots are released before the trainer waits for a fresh replacement.
 
 The selection path is unbounded take-any:
 
@@ -395,35 +395,32 @@ likely production compromise; it should not replace the `W=12` measurement.
 
 ### 4. Add cold-start warmup without idling sibling slots
 
-For 512 sibling slots, `ceil(512 / 32) = 16` group equivalents exactly fill the
-gate, but leave no pending sibling to refill a slot when an early sibling
-finishes while its group tail remains. Keep one queued group per rollout worker:
+For each worker gate, enough groups must be present to expose strictly more
+siblings than that gate's capacity. With worker capacities `C_i`, the exact
+headroom lower bound is:
 
 ```text
-N_issue = ceil(rollout_concurrency / group_size)
-N0 = min(N_full, N_issue + num_rollout_workers)
+N_headroom = sum(floor(C_i / group_size) + 1)
+N0 = min(N_full, max(N_oi, N_headroom))
+N_oi = async_steps * groups_per_train_step
 ```
 
-For the current topology, `N0 = 16 + 8 = 24`. A candidate warmup starts with 24
-admitted groups and grows effective capacity by one after every retired group
-until 40. This reaches full capacity after 16 retirements, roughly two training
-steps.
+For 512 split across eight workers, `N_headroom=24`, while the Open-Instruct
+startup population is `N_oi=32`, so the current recipe starts at 32 and grows to
+40 as trainable groups move downstream. For 1024, `N_headroom=40`, so it starts
+at the full 40-group capacity. This is implemented in the TMax config registry;
+an explicit `SWE_INITIAL_ACTIVE_GROUPS` remains an experimental override.
 
-Twenty-four groups do not guarantee full sibling-slot utilization. Worker
-ownership is assigned dynamically, not as an invariant three-group partition,
-and multiple groups can each retain a slow tail after the queued siblings have
-drained. Treat 24 as an empirical starting point and measure per-worker active
-and waiter counts; raise it if utilization falls.
+The worker pool is capped at the number of available group-loop lanes, and the
+global trajectory limit is split exactly across the resulting workers. The
+recipe rejects an even worker split when `N_headroom > N_full`; otherwise it
+would advertise a work-conserving concurrency that some worker gates cannot
+reach. The default 8-worker 512 and 1024 layouts both satisfy the invariant.
 
-Do not enable this in the first Windowed-FIFO experiment. Windowing changes
-selection fairness, while warmup changes the policy-version mix and generation
-population. Measure `W=12` with all 40 active groups first, then A/B the 24-to-40
-warmup with the selected window size.
-
-At concurrency 1024, `N_issue + workers = 40`, so warmup cannot shrink the
-active population without sacrificing some immediate refill capacity. The
-selection window still bounds shortcut bias independently. This is another
-reason to establish the 512/Windowed-FIFO baseline before changing concurrency.
+At concurrency 1024, warmup cannot shrink the active population without
+sacrificing immediate refill capacity. The selection window still bounds
+shortcut bias independently. This is another reason to establish the
+512/Windowed-FIFO baseline before changing concurrency.
 
 ### 5. Bound pathological heads explicitly
 
@@ -444,14 +441,13 @@ Do not set Titan's cap to five merely to imitate Open-Instruct's observed
 acceptance of age four. That would also permit age-five data at trainer
 consumption and would change the learning contract.
 
-Instead, make the final four-step decision at the boundary where a batch is
-actually consumed. One implementation is a trainer-ready handshake: completed
-groups may accumulate while training runs, but the next batch is selected and
-freshness-checked only after the trainer has advanced its policy version and is
-ready for another batch. A more general implementation can preserve group
-boundaries in a prepared batch and reject/refill stale groups at trainer
-consumption. Either approach needs a test showing that age four trains and age
-five does not, without allowing a queued batch to age past the cap.
+The current implementation makes the final four-step decision at the boundary
+where a batch is consumed. It rejects a whole queued batch if any sample is age
+five or older, releases the eight charged trainable-group slots, and waits for a
+fresh batch for the same optimizer step. This preserves the hard freshness
+contract without crashing the run. A future refinement can preserve group
+boundaries and refill only stale groups, or use a trainer-ready handshake so
+stale batches are never packed in the first place.
 
 ## Metrics required before landing
 
