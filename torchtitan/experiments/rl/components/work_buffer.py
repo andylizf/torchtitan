@@ -101,9 +101,29 @@ class RolloutGroupWorkBuffer(Configurable):
         the take-any bias toward short/fast (=easy) rollouts in the trained batch, at
         the cost of the straggler stall -- a diagnostic knob for that bias."""
 
-    def __init__(self, config: Config, *, max_active_rollout_groups: int) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        max_active_rollout_groups: int,
+        initial_active_rollout_groups: int | None = None,
+    ) -> None:
         self._strict_fifo = config.strict_fifo
+        if max_active_rollout_groups < 1:
+            raise ValueError(
+                "max_active_rollout_groups must be positive, got "
+                f"{max_active_rollout_groups}"
+            )
+        if initial_active_rollout_groups is None:
+            initial_active_rollout_groups = max_active_rollout_groups
+        if not 1 <= initial_active_rollout_groups <= max_active_rollout_groups:
+            raise ValueError(
+                "initial_active_rollout_groups must be between 1 and "
+                f"max_active_rollout_groups ({max_active_rollout_groups}), got "
+                f"{initial_active_rollout_groups}"
+            )
         self._max_active_rollout_groups = max_active_rollout_groups
+        self._effective_active_rollout_groups = initial_active_rollout_groups
         self._active_rollout_groups = 0
         # metric: Per-flush peak active slots; reset on `.metrics()` call.
         self._active_rollout_groups_peak_since_flush = 0
@@ -117,11 +137,9 @@ class RolloutGroupWorkBuffer(Configurable):
         # every mutation notify_all()s and waiters re-check their predicate.
         self._condition = asyncio.Condition()
         self._closed = False
-        # TODO(async-rl): warm start — admit a small number of groups at first and grow the effective cap as the
-        # batcher consumes, so a cold start doesn't fill the whole off-policy window at policy version 0.
 
     def _has_active_slot_available(self) -> bool:
-        return self._active_rollout_groups < self._max_active_rollout_groups
+        return self._active_rollout_groups < self._effective_active_rollout_groups
 
     async def wait_for_slot(self) -> bool:
         """Wait until one more rollout group may enter the active off-policy window.
@@ -248,6 +266,22 @@ class RolloutGroupWorkBuffer(Configurable):
             sl.log_trace_scalar({f"rollout_buffer/released/{reason}": float(count)})
             self._condition.notify_all()
 
+    async def grow_effective_capacity(self) -> bool:
+        """Grow cold-start admission headroom for retained downstream groups.
+
+        A trainable group remains charged after the batcher takes it, so growing
+        the effective capacity by one admits exactly one replacement generation
+        group. Filtered and stale groups instead call ``release_active_groups`` and
+        must not grow the capacity. Returns whether the capacity grew.
+        """
+        async with self._condition:
+            if self._effective_active_rollout_groups == self._max_active_rollout_groups:
+                return False
+            self._effective_active_rollout_groups += 1
+            sl.log_trace_scalar({"rollout_buffer/effective_capacity_growth": 1.0})
+            self._condition.notify_all()
+            return True
+
     async def close(self) -> None:
         """run() shutdown calls this once. Sets `_closed`, drops buffered work, and wakes every waiter.
 
@@ -302,8 +336,19 @@ class RolloutGroupWorkBuffer(Configurable):
             m.Metric(
                 "rollout_buffer/available_active_slots",
                 m.NoReduce(
-                    float(self._max_active_rollout_groups - self._active_rollout_groups)
+                    float(
+                        self._effective_active_rollout_groups
+                        - self._active_rollout_groups
+                    )
                 ),
+            ),
+            m.Metric(
+                "rollout_buffer/effective_active_group_capacity",
+                m.NoReduce(float(self._effective_active_rollout_groups)),
+            ),
+            m.Metric(
+                "rollout_buffer/max_active_group_capacity",
+                m.NoReduce(float(self._max_active_rollout_groups)),
             ),
         ]
         # Next interval starts from the current gauge, not 0: slots stay occupied across a flush.

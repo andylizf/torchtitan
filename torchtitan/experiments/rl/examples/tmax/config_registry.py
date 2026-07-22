@@ -190,27 +190,30 @@ def rl_grpo_qwen3_5_27b_tmax() -> Controller.Config:
 def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     """Qwen3.5-9B (Gated DeltaNet hybrid, text-only) AI2 tmax terminal-agent recipe.
 
-    Base = ``rl_grpo_qwen3_5_9b_swe_r2e`` (9B GDN, gen TP-4), rollouter swapped to
-    ``TMaxRollouter``. Matches the paper's open-instruct run
+    Base = ``rl_grpo_qwen3_5_9b_swe_r2e`` (9B GDN, generator DP-8 x TP-1),
+    rollouter swapped to ``TMaxRollouter``. Matches the paper's open-instruct run
     (``scripts/tmax/RL/qwen35_9b.sh``): ``group_size=32``
     (num_samples_per_prompt_rollout), off-policy 4 (async_steps), per-turn 16384,
     full 65536 context (response_length), and ``drop_zero_std_reward_groups=True``
     (``filter_zero_std_samples``) -- terminal tasks are sparse binary, so keeping
     all-fail groups would zero out the gradient. Temperature 1.0, constant LR,
-    and beta 0 are inherited from the swe base. The trainer restores standard
+    and beta 0 are inherited from the swe base. It cold-starts with the paper
+    implementation's ``async_steps * num_groups = 32`` prompt groups, then opens
+    the eight downstream slots one-for-one as trainable groups are retained.
+    The trainer restores standard
     mixed precision (fp32 master parameters, bf16 FSDP compute/reduce in fp32)
     and open-instruct's fused AdamW settings: lr 1e-6, betas (0.9, 0.999),
     eps 1e-8, and no weight decay.
-    num_groups is kept at 8 (vs the paper's 4) since torchtitan's drop-only filter
-    has no active resampling, so more groups per step raise the odds of a non-empty
-    trained batch under sparse reward.
+    ``num_groups_per_train_step=8`` matches the target run's
+    ``num_unique_prompts_rollout``.
 
     Two knobs must move together with the context: the batcher packing width
     (``seq_len``) and the model RoPE / vLLM max_model_len, both to 65536. The loss
     is re-chunked to 32 chunks (from 16) so the per-chunk fp32 logits stay in the
-    validated ~1 GiB envelope at the 4x longer sequence. The active-rollout ceiling
-    grows to (off+1) x num_groups x group_size = 5 x 8 x 32 = 1280 concurrent
-    rollout slots; ``SWE_ROLLOUT_CONCURRENCY`` throttles the sandbox count below it.
+    validated ~1 GiB envelope at the 4x longer sequence. The full end-to-end active
+    ceiling is (off+1) x num_groups x group_size = 5 x 8 x 32 = 1280 sibling slots,
+    while cold-start admission is 4 x 8 x 32 = 1024;
+    ``SWE_ROLLOUT_CONCURRENCY`` throttles the sandbox count below both limits.
     """
     config = _swe_9b()
     config.rollouter = _tmax_rollouter()
@@ -223,29 +226,37 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # clean match (every past turn stays in the current cycle). Trade-off: prompts
     # grow with retained thinking, so the 65536 context fills sooner.
     config.renderer = dataclasses.replace(config.renderer, preserve_all_thinking=True)
+    num_groups_per_train_step = 8
+    max_offpolicy_steps = int(os.environ.get("SWE_OFFPOLICY_STEPS", "4"))
+    max_active_rollout_groups = int(os.environ.get("SWE_MAX_ACTIVE_GROUPS", "40"))
+    # Open-Instruct cold-starts with async_steps * global_batch_size prompt
+    # groups. Its extra +1 batch is Ray queue headroom, not initial generation
+    # inventory. Keep the concrete 32-group recipe default in the serialized
+    # config; experiments that shrink the full capacity must override both values.
+    initial_active_rollout_groups = int(
+        os.environ.get("SWE_INITIAL_ACTIVE_GROUPS", "32")
+    )
     config.async_loop = dataclasses.replace(
         config.async_loop,
         # Total optimizer steps. Swe base = 100; SWE_TRAIN_STEPS raises it (e.g. 500
         # for a long "wash" run that streams zero-std prompt annotations to
         # SWE_ZERO_STD_LOG for a later SWE_SKIP_PROMPTS pass).
         num_training_steps=int(os.environ.get("SWE_TRAIN_STEPS", "100")),
-        num_groups_per_train_step=8,
+        num_groups_per_train_step=num_groups_per_train_step,
         group_size=32,
-        # off-policy window = run-ahead buffer depth. Recipe (qwen35_9b.sh) uses
-        # async_steps=4 -> (4+1)*8=40 active groups. SWE_OFFPOLICY_STEPS raises it
-        # (e.g. 8 -> 72 groups) to feed a higher SWE_ROLLOUT_CONCURRENCY when the
-        # straggler tail under-fills the pool; DEVIATES from the recipe + raises
-        # off-policy staleness, so use only for speed experiments.
-        max_offpolicy_steps=int(os.environ.get("SWE_OFFPOLICY_STEPS", "4")),
+        # Policy-age cap. Open-Instruct uses async_steps=4 and initially admits
+        # async_steps * num_groups = 32 prompt groups.
+        max_offpolicy_steps=max_offpolicy_steps,
         # Buffer size (run-ahead groups), DECOUPLED from the staleness cap above.
-        # Unset = coupled ((off+1)*num_groups). SWE_MAX_ACTIVE_GROUPS enlarges the
-        # buffer (more concurrent rollouts -> less trainer starvation) while keeping
-        # SWE_OFFPOLICY_STEPS as the stale-drop cap (max-age vs mean-age staleness).
-        max_active_rollout_groups=(
-            int(os.environ["SWE_MAX_ACTIVE_GROUPS"])
-            if os.environ.get("SWE_MAX_ACTIVE_GROUPS")
-            else None
-        ),
+        # The explicit full capacity is (off+1)*num_groups = 40 because Titan
+        # charges the eight trainable groups through trainer weight pull. The
+        # separate initial limit below prevents that downstream headroom from being
+        # filled with policy-version-0 generation groups.
+        max_active_rollout_groups=max_active_rollout_groups,
+        # Start with 32 generation groups, then admit one replacement whenever a
+        # trainable group moves downstream until the full 40-slot end-to-end cap is
+        # reached. Zero-std and stale groups release their existing slot instead.
+        initial_active_rollout_groups=initial_active_rollout_groups,
         # Override the generator's vLLM max_num_seqs (decode batch cap per engine).
         # Unset = derived from the rollout pool (capped 512). SWE_MAX_NUM_SEQS=512
         # removes the cap so vLLM batches as many concurrent rollouts as KV allows.

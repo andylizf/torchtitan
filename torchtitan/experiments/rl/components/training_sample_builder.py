@@ -108,15 +108,13 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std and group_mean_reward == 0.0 else 0.0),
             )
         )
-        # Avg train reward = the paper's Figure-7 curve (open-instruct's
-        # val/avg_group_performance_post_filter, computed on the TRAINING batch --
-        # NOT held-out). It is the mean reward over ALL sampled groups INCLUDING the
-        # zero-std ones dropped below: this group contributes its mean (all-solved ->
-        # 1, all-failed -> 0, mixed -> its fraction). Emitted before the drop so the
-        # per-step Mean over groups equals open-instruct's _compute_avg_group_
-        # performance for equal group sizes. Unlike the trained-batch reward (which
-        # drop_zero_std pins near the mixed-band mean), this rises as the policy
-        # solves more prompts (more all-solved groups).
+        # Avg train reward = open-instruct's val/avg_group_performance_pre_filter,
+        # computed on the attempted TRAINING batch, not held-out validation. It is
+        # the mean reward over all consumed groups, including the zero-std groups
+        # dropped below: all-solved contributes 1, all-failed contributes 0, and a
+        # mixed group contributes its solve fraction. Emitting before the drop makes
+        # the per-step group mean equal to open-instruct's helper for equal group
+        # sizes. Unlike kept-only reward, this can rise as more prompts become solved.
         if rewards:
             metrics.append(
                 m.Metric(

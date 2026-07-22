@@ -8,6 +8,7 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,13 +17,19 @@ from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.experiments.rl.controller import AsyncLoopConfig, Controller
 from torchtitan.experiments.rl.controller_metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     MetricsTimer,
 )
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.rollout import RolloutGroup
+from torchtitan.experiments.rl.rollout import (
+    Rollout,
+    RolloutGroup,
+    RolloutStatus,
+    RolloutTurn,
+)
 from torchtitan.experiments.rl.types import (
     RolloutTurnID,
     TrainingSample,
@@ -59,6 +66,31 @@ def _build_batcher(*, num_groups_per_train_step: int) -> Batcher:
         dp_degree=1,
         pad_id=0,
     )
+
+
+def _rollout_group(
+    group_id: int,
+    *,
+    reward: float,
+    min_policy_version: int,
+) -> RolloutGroup:
+    rollout_id = RolloutTurnID(group_id=group_id, rollout_id=0, turn_id=0)
+    turn = RolloutTurn(
+        rollout_id=rollout_id,
+        prompt_token_ids=[1],
+        completion_token_ids=[2],
+        completion_logprobs=[0.0],
+        min_policy_version=min_policy_version,
+        max_policy_version=min_policy_version,
+    )
+    rollout = Rollout(
+        group_id=group_id,
+        rollout_id=0,
+        turns=[turn],
+        status=RolloutStatus.COMPLETED,
+        reward=reward,
+    )
+    return RolloutGroup(group_id=group_id, rollouts=[rollout])
 
 
 def test_batcher_counts_trainable_groups_not_rollouts() -> None:
@@ -174,6 +206,158 @@ def test_take_finalized_does_not_release_active_slot() -> None:
         assert await waiter
 
     asyncio.run(run())
+
+
+def test_cold_start_capacity_grows_to_full_limit() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config().build(
+            max_active_rollout_groups=3,
+            initial_active_rollout_groups=1,
+        )
+
+        assert await buffer.wait_for_slot()
+        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+
+        second_slot = asyncio.create_task(buffer.wait_for_slot())
+        await asyncio.sleep(0)
+        assert not second_slot.done()
+        assert await buffer.grow_effective_capacity()
+        assert await second_slot
+        await buffer.add_work(RolloutGroupWork(group_id=1, sample=object()))
+
+        third_slot = asyncio.create_task(buffer.wait_for_slot())
+        await asyncio.sleep(0)
+        assert not third_slot.done()
+        assert await buffer.grow_effective_capacity()
+        assert await third_slot
+        await buffer.add_work(RolloutGroupWork(group_id=2, sample=object()))
+        assert not await buffer.grow_effective_capacity()
+
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/effective_active_group_capacity"] == 3
+        assert values["rollout_buffer/max_active_group_capacity"] == 3
+        assert values["rollout_buffer/available_active_slots"] == 0
+
+        blocked = asyncio.create_task(buffer.wait_for_slot())
+        await asyncio.sleep(0)
+        assert not blocked.done()
+        await buffer.close()
+        assert not await blocked
+
+    asyncio.run(run())
+
+
+def test_dropped_group_releases_without_growing_cold_start_capacity() -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config().build(
+            max_active_rollout_groups=2,
+            initial_active_rollout_groups=1,
+        )
+        assert await buffer.wait_for_slot()
+        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+        await buffer.release_active_groups(1, reason="untrainable_group")
+
+        assert await buffer.wait_for_slot()
+        await buffer.add_work(RolloutGroupWork(group_id=1, sample=object()))
+        values = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert values["rollout_buffer/effective_active_group_capacity"] == 1
+        assert values["rollout_buffer/available_active_slots"] == 0
+
+    asyncio.run(run())
+
+
+def test_batcher_loop_replenishes_each_group_exactly_once() -> None:
+    class FakeGroupBuffer:
+        def __init__(self) -> None:
+            self.groups = iter(
+                [
+                    _rollout_group(0, reward=0.0, min_policy_version=5),
+                    _rollout_group(1, reward=1.0, min_policy_version=0),
+                    _rollout_group(2, reward=0.5, min_policy_version=5),
+                ]
+            )
+            self.releases: list[tuple[int, str]] = []
+            self.num_capacity_growths = 0
+
+        async def take_finalized(self) -> RolloutGroup | None:
+            return next(self.groups, None)
+
+        async def release_active_groups(self, count: int, *, reason: str) -> None:
+            self.releases.append((count, reason))
+
+        async def grow_effective_capacity(self) -> bool:
+            self.num_capacity_growths += 1
+            return True
+
+    class FakeTrainingSampleBuilder:
+        def build_from_group(
+            self, *, rollout_group: RolloutGroup
+        ) -> TrainingSampleGroup:
+            if rollout_group.group_id == 0:
+                return TrainingSampleGroup(
+                    group_id=rollout_group.group_id,
+                    training_samples=[],
+                    metrics=[],
+                )
+            return _trainable_group(rollout_group.group_id, num_samples=1)
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller._trainer_policy_version = 5
+        controller.config = SimpleNamespace(
+            async_loop=AsyncLoopConfig(max_offpolicy_steps=4)
+        )
+        group_buffer = FakeGroupBuffer()
+        training_batch_queue = asyncio.Queue()
+
+        await controller._batcher_loop(
+            group_buffer=group_buffer,
+            training_sample_builder=FakeTrainingSampleBuilder(),
+            batcher=_build_batcher(num_groups_per_train_step=1),
+            training_batch_queue=training_batch_queue,
+        )
+
+        assert group_buffer.releases == [
+            (1, "untrainable_group"),
+            (1, "stale_dropped"),
+        ]
+        assert group_buffer.num_capacity_growths == 1
+        assert await training_batch_queue.get() is not None
+        assert await training_batch_queue.get() is None
+
+    asyncio.run(run())
+
+
+def test_initial_active_groups_must_not_exceed_full_capacity() -> None:
+    with pytest.raises(ValueError, match="initial_active_rollout_groups"):
+        AsyncLoopConfig(
+            max_active_rollout_groups=8,
+            initial_active_rollout_groups=9,
+        )
+
+
+def test_full_active_capacity_must_fit_one_train_batch() -> None:
+    with pytest.raises(ValueError, match="num_groups_per_train_step"):
+        AsyncLoopConfig(
+            num_groups_per_train_step=8,
+            max_active_rollout_groups=7,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"num_groups_per_train_step": 0}, "num_groups_per_train_step"),
+        ({"group_size": 0}, "group_size"),
+        (
+            {"max_offpolicy_steps": -1, "max_active_rollout_groups": 8},
+            "max_offpolicy_steps",
+        ),
+    ],
+)
+def test_async_loop_counts_must_be_valid(overrides: dict[str, int], error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        AsyncLoopConfig(**overrides)
 
 
 def test_take_finalized_skips_inflight_straggler() -> None:

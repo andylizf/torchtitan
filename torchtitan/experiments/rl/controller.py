@@ -182,6 +182,15 @@ class AsyncLoopConfig(Configurable.Config):
     fly); it is a ceiling, not a KV reservation, so vLLM pages KV on demand and admits
     fewer / preempts when tight rather than OOM-ing."""
 
+    initial_active_rollout_groups: int | None = None
+    """Cold-start admission limit in prompt groups. None starts at the full
+    ``max_active_rollout_groups`` capacity (the historical behavior). When smaller
+    than the full capacity, each trainable group retained downstream grows the
+    admission limit by one until the full capacity is reached. Dropped groups free
+    their existing slot instead. This preserves one-result-in/one-prompt-out
+    generation inventory without filling the downstream headroom at policy version
+    zero."""
+
     generator_max_num_seqs: int | None = None
     """Explicit override for the generator's vLLM max_num_seqs (the scheduler's max
     concurrent decode batch per engine). None derives it from the rollout pool:
@@ -205,6 +214,45 @@ class AsyncLoopConfig(Configurable.Config):
         if self.max_active_rollout_groups is not None:
             return self.max_active_rollout_groups
         return (self.max_offpolicy_steps + 1) * self.num_groups_per_train_step
+
+    def resolved_initial_active_rollout_groups(self) -> int:
+        """Resolve and validate the cold-start active-group admission limit."""
+        if self.num_groups_per_train_step < 1:
+            raise ValueError(
+                "num_groups_per_train_step must be positive, got "
+                f"{self.num_groups_per_train_step}"
+            )
+        if self.group_size < 1:
+            raise ValueError(f"group_size must be positive, got {self.group_size}")
+        if self.max_offpolicy_steps < 0:
+            raise ValueError(
+                "max_offpolicy_steps must be non-negative, got "
+                f"{self.max_offpolicy_steps}"
+            )
+        max_active_rollout_groups = self.resolved_max_active_rollout_groups()
+        if max_active_rollout_groups < 1:
+            raise ValueError(
+                "max_active_rollout_groups must be positive, got "
+                f"{max_active_rollout_groups}"
+            )
+        if max_active_rollout_groups < self.num_groups_per_train_step:
+            raise ValueError(
+                "max_active_rollout_groups must be at least "
+                f"num_groups_per_train_step ({self.num_groups_per_train_step}), "
+                f"got {max_active_rollout_groups}"
+            )
+        if self.initial_active_rollout_groups is None:
+            return max_active_rollout_groups
+        if not 1 <= self.initial_active_rollout_groups <= max_active_rollout_groups:
+            raise ValueError(
+                "initial_active_rollout_groups must be between 1 and "
+                f"max_active_rollout_groups ({max_active_rollout_groups}), got "
+                f"{self.initial_active_rollout_groups}"
+            )
+        return self.initial_active_rollout_groups
+
+    def __post_init__(self) -> None:
+        self.resolved_initial_active_rollout_groups()
 
 
 class Controller(Configurable):
@@ -773,9 +821,18 @@ class Controller(Configurable):
         # max_active_rollout_groups is set; staleness is still bounded by the batcher's
         # stale-drop at max_offpolicy_steps).
         max_active_rollout_groups = async_loop.resolved_max_active_rollout_groups()
+        initial_active_rollout_groups = (
+            async_loop.resolved_initial_active_rollout_groups()
+        )
+        logger.info(
+            "Active rollout-group capacity: initial=%d, max=%d",
+            initial_active_rollout_groups,
+            max_active_rollout_groups,
+        )
 
         self._group_buffer = async_loop.group_buffer.build(
             max_active_rollout_groups=max_active_rollout_groups,
+            initial_active_rollout_groups=initial_active_rollout_groups,
         )
 
         # training_sample_builder
@@ -796,12 +853,13 @@ class Controller(Configurable):
         # rollout_loop
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
 
-        # One rollout loop task per active buffer slot: lets generation fill the whole off-policy window,
-        # including the cold start (step 0 fills every active slot, not just num_groups_per_train_step per wave).
+        # One rollout loop task per full-capacity buffer slot. The data-input loop
+        # initially fills only initial_active_rollout_groups when cold-start
+        # admission is configured, then uses the remaining tasks as retained
+        # trainable groups open the downstream headroom.
         # With a RolloutWorker pool, each loop task is pinned to a worker round-robin so groups spread
         # across the worker processes (dispatch is non-blocking on the controller; the CPU work runs in the
         # worker). Without a pool (num_rollout_workers=0), worker=None keeps the in-process path.
-        # TODO: support warm start
         num_workers = len(self._rollout_workers)
         rollout_tasks = [
             asyncio.create_task(
@@ -1096,6 +1154,11 @@ class Controller(Configurable):
                 )
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
             else:
+                # Open one cold-start headroom slot for the retained group. The
+                # group remains charged through trainer consumption and weight
+                # pull, while its replacement can enter generation immediately.
+                # Once the configured full capacity is reached this is a no-op.
+                await group_buffer.grow_effective_capacity()
                 logger.info(
                     "[buffer] complete group_id=%d solved=%d/%d class=%s "
                     "-> TRAINABLE cur_ver=%d",
