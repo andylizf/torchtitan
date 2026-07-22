@@ -48,10 +48,21 @@ def convert_to_hf(
     # convert state dict tt->hf
     hf_state_dict = sd_adapter.to_hf(state_dict)
 
+    # The source HF index can contain optional weights that the adapter does not
+    # export (for example Qwen3.5 MTP weights). Do not create empty safetensors
+    # header entries for those keys during consolidation.
+    fqn_to_index_mapping = sd_adapter.fqn_to_index_mapping
+    if fqn_to_index_mapping is not None:
+        fqn_to_index_mapping = {
+            fqn: index
+            for fqn, index in fqn_to_index_mapping.items()
+            if fqn in hf_state_dict
+        }
+
     storage_writer = HuggingFaceStorageWriter(
         path=output_dir,
         save_distributed=True,
-        fqn_to_index_mapping=sd_adapter.fqn_to_index_mapping,
+        fqn_to_index_mapping=fqn_to_index_mapping,
         enable_consolidation=True,
         thread_count_consolidation=5,
     )
