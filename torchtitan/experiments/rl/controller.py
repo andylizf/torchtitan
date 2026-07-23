@@ -197,9 +197,10 @@ class AsyncLoopConfig(Configurable.Config):
     """Sibling rollouts sampled per prompt (the GRPO group)."""
 
     max_offpolicy_steps: int = 3
-    """Max train-steps a rollout may lag the trainer (the STALENESS cap). A group that
-    ages past this at the batcher is stale-dropped, and the trainer never trains on
-    older data. 0 = fully on-policy (sync): generator and trainer alternate in lockstep."""
+    """Max train-steps a rollout may lag its reserved consuming policy version. A
+    group that exceeds this cap is stale-dropped before entering the batch cohort,
+    and the trainer never trains on older data. 0 = fully on-policy (sync): generator
+    and trainer alternate in lockstep."""
 
     max_active_rollout_groups: int | None = None
     """Rollout buffer size: peak concurrent active rollout groups (the run-ahead
@@ -931,6 +932,7 @@ class Controller(Configurable):
             num_groups_per_train_step=async_loop.num_groups_per_train_step,
             dp_degree=self.trainer_dp_degree,
             pad_id=self.renderer._tokenizer.eos_token_id,
+            initial_policy_version=self.start_step,
         )
 
         # training_batch_queue
@@ -1166,10 +1168,6 @@ class Controller(Configurable):
             if rollout_group is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
-            with sl.log_trace_span("training_sample_builder"):
-                training_sample_group = training_sample_builder.build_from_group(
-                    rollout_group=rollout_group
-                )
 
             # [buffer trace] classify this completed group's solve status for per-step
             # visibility. full-solve (all rollouts pass) and not-solve (all fail) groups
@@ -1185,19 +1183,13 @@ class Controller(Configurable):
                 else "partial_solve"
             )
 
-            # Stale-drop (take-any safety). take_finalized skips inflight groups, so a
-            # slow straggler generated many steps ago can surface after the off-policy
-            # window. Drop it here instead of admitting stale data to a training batch.
-            # This is the analogue of open-instruct's max_result_age_steps.
+            # Bind freshness to the policy version that will consume the batch, not
+            # the trainer's version at arrival. This is the analogue of Open-Instruct's
+            # max_result_age_steps check against the batch's reserved training step.
             #
-            # Age is taken from the RAW rollout group's turns, NOT training_samples, so a
-            # stale ZERO-STD group is dropped too. A zero-std group has empty
-            # training_samples, so gating on those would skip the stale check and leak its
-            # metrics (e.g. rollout_reward/avg_train_reward, attached before the drop) into
-            # the step -- open-instruct drops all stale results before counting them. For a
-            # trainable group this min matches min(ts.min_policy_version): a sample's
-            # min_policy_version is its opening turn's version and per-rollout versions are
-            # non-decreasing, so the group min is turn 0's version either way.
+            # Check the raw group before TrainingSampleBuilder computes zero-std and
+            # reward metrics. Otherwise a metric-only group can be fresh on arrival,
+            # age while waiting for siblings, and leak stale reward into a later step.
             group_min_policy_version = min(
                 (
                     turn.min_policy_version
@@ -1207,36 +1199,41 @@ class Controller(Configurable):
                 ),
                 default=None,
             )
+            target_policy_version = batcher.next_batch_policy_version
             if group_min_policy_version is not None:
-                # Reject groups already past the policy-age limit. A packed batch can
-                # still age while queued, so _take_fresh_training_batch repeats this
-                # check at consumption and releases a batch that has crossed the cap.
-                group_age = self._trainer_policy_version - group_min_policy_version
+                group_age = target_policy_version - group_min_policy_version
                 if _should_drop_group_at_batcher(
                     group_age=group_age,
                     max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
                 ):
                     logger.info(
                         "[buffer] complete group_id=%d solved=%d/%d class=%s "
-                        "-> RELEASE(stale_dropped) cur_ver=%d",
+                        "-> RELEASE(stale_dropped) target_ver=%d cur_ver=%d",
                         rollout_group.group_id,
                         _ns,
                         _n,
                         _cls,
+                        target_policy_version,
                         self._trainer_policy_version,
                     )
                     await group_buffer.release_active_groups(1, reason="stale_dropped")
                     sl.log_trace_scalar({"rollout_buffer/dropped/stale": 1.0})
                     continue
 
+            with sl.log_trace_span("training_sample_builder"):
+                training_sample_group = training_sample_builder.build_from_group(
+                    rollout_group=rollout_group
+                )
+
             if not training_sample_group.training_samples:
                 logger.info(
                     "[buffer] complete group_id=%d solved=%d/%d class=%s "
-                    "-> RELEASE(zero_std, dropped) cur_ver=%d",
+                    "-> RELEASE(zero_std, dropped) target_ver=%d cur_ver=%d",
                     rollout_group.group_id,
                     _ns,
                     _n,
                     _cls,
+                    target_policy_version,
                     self._trainer_policy_version,
                 )
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
@@ -1248,11 +1245,12 @@ class Controller(Configurable):
                 await group_buffer.grow_effective_capacity()
                 logger.info(
                     "[buffer] complete group_id=%d solved=%d/%d class=%s "
-                    "-> TRAINABLE cur_ver=%d",
+                    "-> TRAINABLE target_ver=%d cur_ver=%d",
                     rollout_group.group_id,
                     _ns,
                     _n,
                     _cls,
+                    target_policy_version,
                     self._trainer_policy_version,
                 )
 
@@ -1266,6 +1264,7 @@ class Controller(Configurable):
             if maybe_training_batch is not None:
                 logger.info(
                     "[batcher_loop] packed a training batch "
+                    f"for policy version {maybe_training_batch.target_policy_version} "
                     f"({len(maybe_training_batch.microbatches)} microbatch(es)); "
                     "putting on queue"
                 )
@@ -1306,7 +1305,9 @@ class Controller(Configurable):
                 with sl.log_trace_span("wait_for_training_batch"), step_timer.record(
                     "timing/step/wait_for_training_batch"
                 ):
-                    packed = await self._take_fresh_training_batch(training_batch_queue)
+                    packed = await self._take_reserved_training_batch(
+                        training_batch_queue
+                    )
 
                 if packed is None:
                     logger.info("Batcher closed and drained; stopping training")
@@ -1442,36 +1443,34 @@ class Controller(Configurable):
             ):
                 await self._validate_and_log(step=step)
 
-    async def _take_fresh_training_batch(
+    async def _take_reserved_training_batch(
         self, training_batch_queue: "asyncio.Queue[TrainingBatch | None]"
     ) -> TrainingBatch | None:
-        """Discard queued batches that aged past the consume-time policy limit."""
+        """Take the batch reserved for the live trainer policy and verify invariants."""
         max_offpolicy_steps = self.config.async_loop.max_offpolicy_steps
-        num_groups = self.config.async_loop.num_groups_per_train_step
-        while True:
-            packed = await training_batch_queue.get()
-            if packed is None:
-                return None
+        packed = await training_batch_queue.get()
+        if packed is None:
+            return None
 
-            max_policy_age = max(
-                (
-                    self._trainer_policy_version - min_policy_version
-                    for min_policy_version in packed.min_policy_versions
-                ),
-                default=0,
+        if packed.target_policy_version != self._trainer_policy_version:
+            raise RuntimeError(
+                "training batch consumed by the wrong policy version: "
+                f"target_policy_version={packed.target_policy_version}, "
+                f"trainer_policy_version={self._trainer_policy_version}"
             )
-            if max_policy_age <= max_offpolicy_steps:
-                return packed
 
-            logger.warning(
-                "dropping queued training batch beyond off-policy window: "
-                "max_policy_age=%d max_offpolicy_steps=%d trainer_policy_version=%d",
-                max_policy_age,
-                max_offpolicy_steps,
-                self._trainer_policy_version,
+        max_policy_age = max(
+            (
+                packed.target_policy_version - min_policy_version
+                for min_policy_version in packed.min_policy_versions
+            ),
+            default=0,
+        )
+        if max_policy_age > max_offpolicy_steps:
+            raise RuntimeError(
+                "batcher admitted stale training data for its reserved policy version: "
+                f"max_policy_age={max_policy_age}, "
+                f"max_offpolicy_steps={max_offpolicy_steps}, "
+                f"target_policy_version={packed.target_policy_version}"
             )
-            # The batcher emits exactly num_groups_per_train_step trainable groups.
-            # Metric-only zero-variance groups were already released at selection.
-            await self._group_buffer.release_active_groups(
-                num_groups, reason="stale_queued_batch"
-            )
+        return packed

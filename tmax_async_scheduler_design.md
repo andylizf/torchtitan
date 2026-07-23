@@ -175,10 +175,12 @@ finalized only after all 32 siblings complete. The new gate removed idle rollout
 slots behind a slow sibling; it did not change training-batch selection.
 
 The batcher and Open-Instruct use the same inclusive freshness boundary: a
-group at age 4 remains eligible and a group at age 5 is dropped. Titan repeats
-the check when the trainer consumes a packed batch because the queue can age a
-previously valid batch. A queued batch that has crossed the limit is dropped and
-its group slots are released before the trainer waits for a fresh replacement.
+group at age 4 remains eligible and a group at age 5 is dropped. Each Titan
+batch is reserved for a specific future trainer policy version. A raw rollout
+group is checked against that target before zero-variance filtering or reward
+metric construction. A stale group releases its slot, and the batcher keeps
+collecting for the same target version. The trainer verifies the reservation
+and freshness invariants when it consumes the packed batch.
 
 The default selection path is unbounded take-any:
 
@@ -447,19 +449,20 @@ one group reliably across a `RolloutWorker` endpoint and all 32 sibling
 sandboxes. Releasing the active credit before that cancellation is confirmed
 would violate the end-to-end capacity invariant.
 
-### 6. Align freshness at consumption, not by changing the number
+### 6. Align freshness to the reserved consumption version
 
 Do not set Titan's cap to five merely to imitate Open-Instruct's observed
 acceptance of age four. That would also permit age-five data at trainer
 consumption and would change the learning contract.
 
-The current implementation makes the final four-step decision at the boundary
-where a batch is consumed. It rejects a whole queued batch if any sample is age
-five or older, releases the eight charged trainable-group slots, and waits for a
-fresh batch for the same optimizer step. This preserves the hard freshness
-contract without crashing the run. A future refinement can preserve group
-boundaries and refill only stale groups, or use a trainer-ready handshake so
-stale batches are never packed in the first place.
+The current implementation assigns each batch the trainer policy version that
+will consume it. Both trainable and zero-variance groups are checked against
+that version before entering the batch cohort. An age-five group is released
+immediately and collection continues until eight fresh trainable groups are
+available. The FIFO trainer path then verifies that the reserved version equals
+the live trainer version and that no trainable sample exceeds the cap. This
+preserves the hard freshness contract without post-hoc metric filtering or
+whole-batch replacement.
 
 ## Metrics for the first live trial
 

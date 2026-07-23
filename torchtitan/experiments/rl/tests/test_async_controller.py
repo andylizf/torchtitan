@@ -66,11 +66,14 @@ def _trainable_group(group_id: int, *, num_samples: int) -> TrainingSampleGroup:
     )
 
 
-def _build_batcher(*, num_groups_per_train_step: int) -> Batcher:
+def _build_batcher(
+    *, num_groups_per_train_step: int, initial_policy_version: int = 0
+) -> Batcher:
     return Batcher.Config().build(
         num_groups_per_train_step=num_groups_per_train_step,
         dp_degree=1,
         pad_id=0,
+        initial_policy_version=initial_policy_version,
     )
 
 
@@ -183,32 +186,49 @@ def test_zero_step_run_only_validates_once() -> None:
     asyncio.run(run())
 
 
-def test_trainer_discards_stale_queued_batch_before_training() -> None:
-    class FakeGroupBuffer:
-        def __init__(self) -> None:
-            self.releases: list[tuple[int, str]] = []
-
-        async def release_active_groups(self, count: int, *, reason: str) -> None:
-            self.releases.append((count, reason))
-
+def test_trainer_requires_batch_reserved_for_live_policy() -> None:
     async def run() -> None:
         controller = object.__new__(Controller)
         controller._trainer_policy_version = 5
         controller.config = SimpleNamespace(
-            async_loop=AsyncLoopConfig(
-                num_groups_per_train_step=2,
-                max_offpolicy_steps=3,
-            )
+            async_loop=AsyncLoopConfig(max_offpolicy_steps=3)
         )
-        controller._group_buffer = FakeGroupBuffer()
-        stale = SimpleNamespace(min_policy_versions=[1])
-        fresh = SimpleNamespace(min_policy_versions=[2])
         queue = asyncio.Queue()
-        await queue.put(stale)
-        await queue.put(fresh)
+        await queue.put(
+            SimpleNamespace(target_policy_version=4, min_policy_versions=[4])
+        )
 
-        assert await controller._take_fresh_training_batch(queue) is fresh
-        assert controller._group_buffer.releases == [(2, "stale_queued_batch")]
+        with pytest.raises(RuntimeError, match="wrong policy version"):
+            await controller._take_reserved_training_batch(queue)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("min_policy_version", "raises"),
+    [(1, False), (0, True)],
+)
+def test_trainer_verifies_reserved_batch_freshness(
+    min_policy_version: int, raises: bool
+) -> None:
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller._trainer_policy_version = 5
+        controller.config = SimpleNamespace(
+            async_loop=AsyncLoopConfig(max_offpolicy_steps=4)
+        )
+        packed = SimpleNamespace(
+            target_policy_version=5,
+            min_policy_versions=[min_policy_version],
+        )
+        queue = asyncio.Queue()
+        await queue.put(packed)
+
+        if raises:
+            with pytest.raises(RuntimeError, match="admitted stale training data"):
+                await controller._take_reserved_training_batch(queue)
+        else:
+            assert await controller._take_reserved_training_batch(queue) is packed
 
     asyncio.run(run())
 
@@ -227,6 +247,23 @@ def test_batcher_counts_trainable_groups_not_rollouts() -> None:
         training_sample_group=_trainable_group(1, num_samples=1)
     )
     assert batch is not None
+    assert batch.target_policy_version == 0
+    assert batcher.next_batch_policy_version == 1
+
+
+def test_batcher_reserves_policy_versions_in_order() -> None:
+    batcher = _build_batcher(num_groups_per_train_step=1, initial_policy_version=7)
+
+    first = batcher.add_training_samples(
+        training_sample_group=_trainable_group(0, num_samples=1)
+    )
+    second = batcher.add_training_samples(
+        training_sample_group=_trainable_group(1, num_samples=1)
+    )
+
+    assert first is not None and first.target_policy_version == 7
+    assert second is not None and second.target_policy_version == 8
+    assert batcher.next_batch_policy_version == 9
 
 
 def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
@@ -249,6 +286,7 @@ def test_microbatch_grid_spreads_pad_rows_across_cells() -> None:
         num_groups_per_train_step=1,
         dp_degree=2,
         pad_id=0,
+        initial_policy_version=0,
     )
     batch = batcher.add_training_samples(
         training_sample_group=_trainable_group(0, num_samples=5)
@@ -395,7 +433,9 @@ def test_batcher_loop_replenishes_each_group_exactly_once() -> None:
             self.groups = iter(
                 [
                     _rollout_group(0, reward=0.0, min_policy_version=5),
-                    _rollout_group(1, reward=1.0, min_policy_version=0),
+                    # Fresh against the live trainer (5 - 1 == 4), but stale for
+                    # the batch reserved for policy version 6 (6 - 1 == 5).
+                    _rollout_group(1, reward=1.0, min_policy_version=1),
                     _rollout_group(2, reward=0.5, min_policy_version=5),
                 ]
             )
@@ -413,9 +453,13 @@ def test_batcher_loop_replenishes_each_group_exactly_once() -> None:
             return True
 
     class FakeTrainingSampleBuilder:
+        def __init__(self) -> None:
+            self.group_ids: list[int] = []
+
         def build_from_group(
             self, *, rollout_group: RolloutGroup
         ) -> TrainingSampleGroup:
+            self.group_ids.append(rollout_group.group_id)
             if rollout_group.group_id == 0:
                 return TrainingSampleGroup(
                     group_id=rollout_group.group_id,
@@ -432,11 +476,14 @@ def test_batcher_loop_replenishes_each_group_exactly_once() -> None:
         )
         group_buffer = FakeGroupBuffer()
         training_batch_queue = asyncio.Queue()
+        training_sample_builder = FakeTrainingSampleBuilder()
 
         await controller._batcher_loop(
             group_buffer=group_buffer,
-            training_sample_builder=FakeTrainingSampleBuilder(),
-            batcher=_build_batcher(num_groups_per_train_step=1),
+            training_sample_builder=training_sample_builder,
+            batcher=_build_batcher(
+                num_groups_per_train_step=1, initial_policy_version=6
+            ),
             training_batch_queue=training_batch_queue,
         )
 
@@ -444,8 +491,11 @@ def test_batcher_loop_replenishes_each_group_exactly_once() -> None:
             (1, "untrainable_group"),
             (1, "stale_dropped"),
         ]
+        assert training_sample_builder.group_ids == [0, 2]
         assert group_buffer.num_capacity_growths == 1
-        assert await training_batch_queue.get() is not None
+        packed = await training_batch_queue.get()
+        assert packed is not None
+        assert packed.target_policy_version == 6
         assert await training_batch_queue.get() is None
 
     asyncio.run(run())
@@ -770,6 +820,7 @@ def test_untrainable_group_releases_before_training() -> None:
             num_groups_per_train_step=1,
             dp_degree=1,
             pad_id=0,
+            initial_policy_version=0,
         )
 
         if not await buffer.wait_for_slot():

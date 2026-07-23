@@ -69,7 +69,7 @@ class Batcher(Configurable):
         # num_groups_per_train_step=2, dp_degree=2, local_batch_size=2
         # The trigger is 2 trainable GROUPS, regardless of how many samples/tokens each contains.
         batcher = Batcher.Config(batch=BatchConfig(local_batch_size=2, seq_len=128)).build(
-            num_groups_per_train_step=2, dp_degree=2, pad_id=0,
+            num_groups_per_train_step=2, dp_degree=2, pad_id=0, initial_policy_version=0,
         )
         _ = batcher.add_training_samples(training_sample_group=group0)  # -> None (only 1 trainable group)
         batch = batcher.add_training_samples(training_sample_group=group1)  # -> TrainingBatch
@@ -91,6 +91,7 @@ class Batcher(Configurable):
         num_groups_per_train_step: int,
         dp_degree: int,
         pad_id: int,
+        initial_policy_version: int,
     ) -> None:
         self.local_batch_size = config.batch.local_batch_size
         self.seq_len = config.batch.seq_len
@@ -98,7 +99,13 @@ class Batcher(Configurable):
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
         self._num_groups_per_train_step = num_groups_per_train_step
         self._dp_degree = dp_degree
+        self._next_batch_policy_version = initial_policy_version
         self._groups_for_next_batch: list[TrainingSampleGroup] = []
+
+    @property
+    def next_batch_policy_version(self) -> int:
+        """Policy version that will consume the group currently being accumulated."""
+        return self._next_batch_policy_version
 
     def add_training_samples(
         self, *, training_sample_group: TrainingSampleGroup
@@ -109,7 +116,12 @@ class Batcher(Configurable):
             training_sample_group: One rollout group's trainable samples plus rollout metrics.
 
         Example:
-            batcher = Batcher.Config().build(num_groups_per_train_step=2, dp_degree=1, pad_id=0)
+            batcher = Batcher.Config().build(
+                num_groups_per_train_step=2,
+                dp_degree=1,
+                pad_id=0,
+                initial_policy_version=0,
+            )
             batcher.add_training_samples(training_sample_group=group0)  # -> None
             batcher.add_training_samples(training_sample_group=group1)  # -> TrainingBatch
         """
@@ -119,9 +131,13 @@ class Batcher(Configurable):
         )
         if num_trainable_groups < self._num_groups_per_train_step:
             return None  # accumulate until one full batch is ready
-        return self._pack_one_training_batch()
+        batch = self._pack_one_training_batch(
+            target_policy_version=self._next_batch_policy_version
+        )
+        self._next_batch_policy_version += 1
+        return batch
 
-    def _pack_one_training_batch(self) -> TrainingBatch:
+    def _pack_one_training_batch(self, *, target_policy_version: int) -> TrainingBatch:
         """Pack the oldest accumulated groups (up to `num_groups_per_train_step` trainable groups) into one batch."""
         (
             training_samples,
@@ -146,6 +162,7 @@ class Batcher(Configurable):
                     num_metric_only_groups,
                 ),
             ],
+            target_policy_version=target_policy_version,
             # Trainer computes policy_age from these at consume time (faithful to what it trains on).
             # min_policy_version is the oldest version this training_sample was sampled under.
             min_policy_versions=[
@@ -172,8 +189,12 @@ class Batcher(Configurable):
                 num_trainable_groups += 1
                 taken_training_samples.extend(group.training_samples)
 
-        # surplus carried over
-        self._groups_for_next_batch = self._groups_for_next_batch[cut:]
+        remaining_groups = self._groups_for_next_batch[cut:]
+        assert not remaining_groups, (
+            "Batcher packed more than one target policy version at once; "
+            "group freshness must be checked again for the next target"
+        )
+        self._groups_for_next_batch = []
         num_metric_only_groups: int = cut - num_trainable_groups
 
         return (
