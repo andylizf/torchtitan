@@ -139,7 +139,7 @@ def test_sandbox_issue_metrics_count_events_and_affected_rollouts() -> None:
             {"command_disk_exhausted": 1},
             {
                 "execute_response_recovered": 1,
-                "poll_transient": 1,
+                "command_output_retry": 1,
             },
             {},
         ]

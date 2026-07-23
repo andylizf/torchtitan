@@ -32,6 +32,7 @@ from torchtitan.experiments.rl.harness.sandbox import (
 )
 from torchtitan.experiments.rl.harness.sandbox.daytona import (
     _build_exec_command,
+    _build_observable_exec_command,
     DaytonaSandbox,
 )
 
@@ -39,6 +40,12 @@ from torchtitan.experiments.rl.harness.sandbox.daytona import (
 class _SessionExecuteRequest:
     def __init__(self, **kwargs) -> None:
         self.__dict__.update(kwargs)
+
+
+class _StatusError(RuntimeError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @pytest.fixture
@@ -63,9 +70,20 @@ def _process() -> SimpleNamespace:
     )
 
 
+def _filesystem() -> SimpleNamespace:
+    async def download_file(path: str, _timeout: int) -> bytes:
+        if path.endswith(".status"):
+            return b"0\n"
+        if path.endswith(".output"):
+            return b"ok"
+        raise FileNotFoundError(path)
+
+    return SimpleNamespace(download_file=AsyncMock(side_effect=download_file))
+
+
 def _sandbox_with_process(process: SimpleNamespace) -> DaytonaSandbox:
     sandbox = DaytonaSandbox("example/image")
-    sandbox._sb = SimpleNamespace(process=process)
+    sandbox._sb = SimpleNamespace(process=process, fs=_filesystem())
     return sandbox
 
 
@@ -198,15 +216,50 @@ def test_wrapped_command_preserves_successful_detached_child() -> None:
         os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.skipif(shutil.which("timeout") is None, reason="GNU timeout is required")
+def test_observable_command_finishes_while_background_child_survives() -> None:
+    command_key = f"pytest_{os.getpid()}_{time.time_ns()}"
+    full = _build_exec_command(
+        "sleep 30 & echo $!",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, command_key
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 0
+    with open(status_path) as status_file:
+        assert status_file.read().strip() == "0"
+    with open(output_path) as output_file:
+        pid = int(output_file.read().strip())
+    try:
+        os.kill(pid, 0)
+    finally:
+        os.kill(pid, signal.SIGKILL)
+        os.unlink(status_path)
+        os.unlink(output_path)
+
+
 def test_lost_execute_response_recovers_without_replay(
     fake_daytona: None,
 ) -> None:
     full = "echo once"
     process = _process()
     process.execute_session_command.side_effect = ConnectionError("response lost")
-    process.get_session.return_value = SimpleNamespace(
-        commands=[SimpleNamespace(id="recovered-id", command=full)]
-    )
+
+    async def get_session(_session_id: str) -> SimpleNamespace:
+        request = process.execute_session_command.await_args.args[1]
+        return SimpleNamespace(
+            commands=[SimpleNamespace(id="recovered-id", command=request.command)]
+        )
+
+    process.get_session.side_effect = get_session
     sandbox = _sandbox_with_process(process)
 
     result = asyncio.run(
@@ -219,13 +272,45 @@ def test_lost_execute_response_recovers_without_replay(
 
     assert result == (0, "ok")
     process.execute_session_command.assert_awaited_once()
-    assert process.execute_session_command.await_args.kwargs["timeout"] == 30
+    execute_call = process.execute_session_command.await_args
+    assert execute_call.kwargs["timeout"] == 30
+    request = execute_call.args[1]
+    assert request.run_async is True
+    assert request.var_async is None
+    assert request.additional_properties == {"async": True}
+    process.get_session_command.assert_not_awaited()
+    process.get_session_command_logs.assert_not_awaited()
     process.delete_session.assert_not_awaited()
     assert sandbox.issue_tracker.counts == {"execute_response_recovered": 1}
     issue = sandbox.issue_tracker.issues[0]
     assert issue.recovered
     assert issue.session_id
     assert issue.command_id == "recovered-id"
+
+
+def test_result_sentinel_preserves_nonzero_exit_and_output(
+    fake_daytona: None,
+) -> None:
+    process = _process()
+    sandbox = _sandbox_with_process(process)
+
+    async def download_file(path: str, _timeout: int) -> bytes:
+        return b"7\n" if path.endswith(".status") else b"command failed\n"
+
+    sandbox._sb.fs.download_file.side_effect = download_file
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "exit 7",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (7, "command failed\n")
+    process.execute_session_command.assert_awaited_once()
+    process.get_session_command.assert_not_awaited()
+    process.get_session_command_logs.assert_not_awaited()
 
 
 def test_session_create_enospc_is_not_retried(
@@ -365,18 +450,26 @@ def test_agent_loop_keeps_nonzero_command_as_observation() -> None:
     assert sandbox.issue_tracker.counts == {}
 
 
-def test_command_logs_retry_does_not_replay_command(
+def test_command_output_retry_does_not_replay_command(
     fake_daytona: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TT_DAYTONA_RPC_RETRIES", "2")
     monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     process = _process()
-    process.get_session_command_logs.side_effect = [
-        ConnectionError("server disconnected"),
-        SimpleNamespace(stdout="ok", stderr=""),
-    ]
     sandbox = _sandbox_with_process(process)
+    output_calls = 0
+
+    async def download_file(path: str, _timeout: int) -> bytes:
+        nonlocal output_calls
+        if path.endswith(".status"):
+            return b"0\n"
+        output_calls += 1
+        if output_calls == 1:
+            raise ConnectionError("server disconnected")
+        return b"ok"
+
+    sandbox._sb.fs.download_file.side_effect = download_file
 
     result = asyncio.run(
         sandbox._session_exec(
@@ -388,8 +481,8 @@ def test_command_logs_retry_does_not_replay_command(
 
     assert result == (0, "ok")
     process.execute_session_command.assert_awaited_once()
-    assert process.get_session_command_logs.await_count == 2
-    assert sandbox.issue_tracker.counts == {"command_logs_retry": 1}
+    assert output_calls == 2
+    assert sandbox.issue_tracker.counts == {"command_output_retry": 1}
 
 
 def test_file_upload_retry_reuses_identical_payload(
@@ -550,13 +643,21 @@ def test_boot_retries_share_rollout_issue_tracker(
     assert tracker.counts == {"create_retry": 1}
 
 
-def test_poll_disconnect_does_not_replay_command(fake_daytona: None) -> None:
+def test_result_poll_disconnect_does_not_replay_command(fake_daytona: None) -> None:
     process = _process()
-    process.get_session_command.side_effect = [
-        ConnectionError("server disconnected"),
-        SimpleNamespace(exit_code=0),
-    ]
     sandbox = _sandbox_with_process(process)
+    status_calls = 0
+
+    async def download_file(path: str, _timeout: int) -> bytes:
+        nonlocal status_calls
+        if path.endswith(".output"):
+            return b"ok"
+        status_calls += 1
+        if status_calls == 1:
+            raise ConnectionError("server disconnected")
+        return b"0\n"
+
+    sandbox._sb.fs.download_file.side_effect = download_file
 
     result = asyncio.run(
         sandbox._session_exec(
@@ -568,10 +669,59 @@ def test_poll_disconnect_does_not_replay_command(fake_daytona: None) -> None:
 
     assert result == (0, "ok")
     process.execute_session_command.assert_awaited_once()
-    assert process.get_session_command.await_count == 2
+    assert status_calls == 2
+    process.get_session_command.assert_not_awaited()
     process.delete_session.assert_not_awaited()
     assert sandbox.issue_tracker.counts == {"poll_transient": 1}
     assert sandbox.issue_tracker.issues[0].recovered
+
+
+def test_result_poll_treats_file_404_as_pending(fake_daytona: None) -> None:
+    process = _process()
+    sandbox = _sandbox_with_process(process)
+    status_calls = 0
+
+    async def download_file(path: str, _timeout: int) -> bytes:
+        nonlocal status_calls
+        if path.endswith(".output"):
+            return b"ok"
+        status_calls += 1
+        if status_calls == 1:
+            raise _StatusError("file not found", 404)
+        return b"0\n"
+
+    sandbox._sb.fs.download_file.side_effect = download_file
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "echo ok",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (0, "ok")
+    assert status_calls == 2
+    assert sandbox.issue_tracker.counts == {}
+
+
+def test_result_poll_preserves_explicit_sandbox_404(fake_daytona: None) -> None:
+    process = _process()
+    sandbox = _sandbox_with_process(process)
+    sandbox._sb.fs.download_file.side_effect = _StatusError(
+        "sandbox not found", 404
+    )
+
+    with pytest.raises(_StatusError, match="sandbox not found"):
+        asyncio.run(
+            sandbox._session_exec(
+                "echo ok",
+                command_timeout=5,
+                request_timeout=30,
+            )
+        )
+
+    assert sandbox.issue_tracker.counts == {"sandbox_lost": 1}
 
 
 def test_poll_deadline_does_not_delete_a_possibly_successful_session(
@@ -582,6 +732,7 @@ def test_poll_deadline_does_not_delete_a_possibly_successful_session(
     monkeypatch.setattr(daytona_backend, "_SESSION_POLL_GRACE_SEC", 0)
     process = _process()
     sandbox = _sandbox_with_process(process)
+    sandbox._sb.fs.download_file.side_effect = FileNotFoundError("not found")
 
     with pytest.raises(TimeoutError, match="without replaying"):
         asyncio.run(

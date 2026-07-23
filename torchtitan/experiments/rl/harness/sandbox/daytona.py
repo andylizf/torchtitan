@@ -43,6 +43,7 @@ _DEFAULT_EXEC_REQUEST_TIMEOUT_SEC = 120
 _SESSION_POLL_GRACE_SEC = 120
 _SESSION_RPC_TIMEOUT_SEC = 60
 _COMMAND_RECOVERY_DELAYS_SEC = (0.0, 0.25, 1.0)
+_EXEC_RESULT_DIR = "/tmp/.torchtitan_exec"
 
 
 def _error_status_code(error: BaseException) -> int | None:
@@ -127,6 +128,49 @@ def _build_exec_command(
         *argv,
     ]
     return shlex.join(argv)
+
+
+def _build_observable_exec_command(full: str, command_key: str) -> tuple[str, str, str]:
+    """Wrap a command with an atomic result sentinel and captured output."""
+    result_prefix = f"{_EXEC_RESULT_DIR}/{command_key}"
+    output_path = f"{result_prefix}.output"
+    status_path = f"{result_prefix}.status"
+    status_tmp_path = f"{status_path}.tmp"
+    quoted_dir = shlex.quote(_EXEC_RESULT_DIR)
+    quoted_output = shlex.quote(output_path)
+    quoted_status = shlex.quote(status_path)
+    quoted_status_tmp = shlex.quote(status_tmp_path)
+    observed = (
+        f"mkdir -p {quoted_dir}; "
+        f"rm -f {quoted_output} {quoted_status} {quoted_status_tmp}; "
+        f"{{ {full}; }} > {quoted_output} 2>&1; "
+        "_tt_exec_rc=$?; "
+        f"printf '%s\\n' \"$_tt_exec_rc\" > {quoted_status_tmp}; "
+        f"mv -f {quoted_status_tmp} {quoted_status}"
+    )
+    return observed, status_path, output_path
+
+
+def _is_missing_file_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    if (
+        ("sandbox" in message and "not found" in message)
+        or "sandbox has been deleted" in message
+        or "no such container" in message
+        or "no ip address" in message
+    ):
+        return False
+    if _error_status_code(error) == 404 or isinstance(error, FileNotFoundError):
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "file not found",
+            "no such file",
+            "does not exist",
+            "not found",
+        )
+    )
 
 
 def _eager_rebuild_daytona_models() -> None:
@@ -688,10 +732,15 @@ class DaytonaSandbox:
         command_timeout: int,
         request_timeout: int,
     ) -> tuple[int, str]:
-        """Submit one command, recover an ambiguous response, then poll it.
+        """Submit one command, recover an ambiguous response, then read its result.
 
         Successful sessions are intentionally retained: deleting one kills
         detached children used by the bridge and Claude launcher.
+
+        Daytona can keep a session command in RUNNING forever when the foreground
+        shell exits after starting a background daemon. The wrapper writes the
+        foreground exit code atomically, so completion does not depend on Daytona's
+        descendant-aware command status.
         """
         import asyncio
         import random
@@ -701,12 +750,18 @@ class DaytonaSandbox:
 
         # Pass every optional field explicitly (= the SDK's own defaults). In the
         # torchtitan/vllm import context the SDK rebuild drops these defaults.
+        command_key = uuid.uuid4().hex
+        observed_full, status_path, output_path = _build_observable_exec_command(
+            full, command_key
+        )
         request = SessionExecuteRequest(
-            command=full,
+            command=observed_full,
             run_async=True,
             var_async=None,
             suppress_input_echo=None,
-            additional_properties={},
+            # Older Toolbox deployments use the deprecated JSON field while the
+            # current SDK emits runAsync. Sending both true is unambiguous.
+            additional_properties={"async": True},
         )
 
         # Retrying creation of an empty session is safe. Command submission below
@@ -773,6 +828,14 @@ class DaytonaSandbox:
                 await asyncio.sleep(backoff * (0.5 + random.random()))
                 backoff = min(backoff * 2, 60.0)
 
+        loop = asyncio.get_running_loop()
+        deadline = (
+            loop.time()
+            + command_timeout
+            + _COMMAND_KILL_GRACE_SEC
+            + _SESSION_POLL_GRACE_SEC
+        )
+
         cid = ""
         try:
             resp = await self._sb.process.execute_session_command(
@@ -782,7 +845,7 @@ class DaytonaSandbox:
             )
             cid = resp.cmd_id or ""
         except Exception as e:
-            cid = await self._recover_session_command_id(sid, full)
+            cid = await self._recover_session_command_id(sid, observed_full)
             if not cid:
                 self._record_issue(
                     "execute_response_unconfirmed",
@@ -804,7 +867,7 @@ class DaytonaSandbox:
                 emit_log=False,
             )
         if not cid:
-            cid = await self._recover_session_command_id(sid, full)
+            cid = await self._recover_session_command_id(sid, observed_full)
             if not cid:
                 self._record_issue(
                     "execute_missing_command_id",
@@ -817,30 +880,17 @@ class DaytonaSandbox:
                 )
                 raise RuntimeError("daytona session exec returned no cmd_id")
 
-        loop = asyncio.get_running_loop()
-        deadline = (
-            loop.time()
-            + command_timeout
-            + _COMMAND_KILL_GRACE_SEC
-            + _SESSION_POLL_GRACE_SEC
-        )
-
-        async def poll():
-            # Daytona briefly returns an empty exit_code mid-command; the SDK then
-            # raises "convert exit code to int". Treat that as "still running".
-            # A single status query returns in seconds, so wrap it in a hard per-call
-            # cap: a hung host->daytona HTTP call would otherwise block here forever
-            # (the outer deadline is only checked between polls), stranding this
-            # rollout and, under strict-FIFO batching, its whole group. On a hung
-            # call, report "still running" so the outer deadline fires the clean
-            # TimeoutError path instead.
+        async def read_status() -> int | None:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return None
             self._raise_if_sandbox_lost()
             try:
-                return await asyncio.wait_for(
-                    self._sb.process.get_session_command(sid, cid),
+                raw_status = await asyncio.wait_for(
+                    self._sb.fs.download_file(
+                        status_path,
+                        min(_SESSION_RPC_TIMEOUT_SEC, max(1, int(remaining))),
+                    ),
                     timeout=min(float(_SESSION_RPC_TIMEOUT_SEC), remaining),
                 )
             except asyncio.TimeoutError as e:
@@ -855,20 +905,11 @@ class DaytonaSandbox:
                 )
                 return None
             except Exception as e:
-                msg = str(e)
-                # "convert exit code": Daytona briefly returns an empty exit_code
-                # mid-command -> treat as still running.
-                # Transient host->daytona disconnects (e.g. DaytonaConnectionError
-                # "Server disconnected") during a poll must NOT discard the whole
-                # multi-turn rollout on one network hiccup: treat them as still
-                # running so the poll loop retries (bounded by the outer deadline,
-                # which fires a clean TimeoutError if the sandbox is truly gone).
-                low = msg.lower()
+                if _is_missing_file_error(e):
+                    return None
                 if _is_sandbox_gone_error(e):
                     self._mark_sandbox_lost(e, phase="command_poll")
                     raise
-                if "convert exit code" in low:
-                    return None
                 if _is_transient_rpc_error(e):
                     self._record_issue(
                         "poll_transient",
@@ -881,10 +922,27 @@ class DaytonaSandbox:
                     )
                     return None
                 raise
+            if isinstance(raw_status, bytes):
+                status_text = raw_status.decode("utf-8", errors="replace").strip()
+            else:
+                status_text = str(raw_status).strip()
+            try:
+                return int(status_text)
+            except ValueError as e:
+                self._record_issue(
+                    "command_status_invalid",
+                    phase="command_poll",
+                    error=f"invalid command status {status_text!r}",
+                    session_id=sid,
+                    command_id=cid,
+                )
+                raise RuntimeError(
+                    f"daytona command wrote invalid status {status_text!r}"
+                ) from e
 
-        cmd = await poll()
+        exit_code = await read_status()
         polls = 0
-        while cmd is None or cmd.exit_code is None:
+        while exit_code is None:
             if loop.time() >= deadline:
                 self._record_issue(
                     "command_status_timeout",
@@ -899,21 +957,20 @@ class DaytonaSandbox:
                     f"without replaying the command; cmd={full[:80]}"
                 )
             await asyncio.sleep(0.1 if polls < 5 else 1.0)
-            cmd = await poll()
+            exit_code = await read_status()
             polls += 1
 
-        logs = await self._retry_idempotent_rpc(
-            lambda: self._sb.process.get_session_command_logs(sid, cid),
-            phase="command_logs",
-            retry_kind="command_logs_retry",
-            failed_kind="command_logs_failed",
+        output = await self._retry_idempotent_rpc(
+            lambda: self._sb.fs.download_file(output_path, _SESSION_RPC_TIMEOUT_SEC),
+            phase="command_output",
+            retry_kind="command_output_retry",
+            failed_kind="command_output_failed",
             session_id=sid,
             command_id=cid,
         )
-        out = getattr(logs, "stdout", "") or ""
-        err = getattr(logs, "stderr", "") or ""
-        exit_code = int(cmd.exit_code)
-        return exit_code, out + err
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return exit_code, str(output)
 
     async def write_file(
         self, sandbox_path: str, content: FileContent, *, user: str = "root"
