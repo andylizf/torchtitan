@@ -16,6 +16,7 @@ Ported from THUDM/slime ``slime/agent/sandbox.py``.
 
 from __future__ import annotations
 
+import base64
 import json
 
 import logging
@@ -43,7 +44,22 @@ _DEFAULT_EXEC_REQUEST_TIMEOUT_SEC = 120
 _SESSION_POLL_GRACE_SEC = 120
 _SESSION_RPC_TIMEOUT_SEC = 60
 _COMMAND_RECOVERY_DELAYS_SEC = (0.0, 0.25, 1.0)
-_EXEC_RESULT_DIR = "/tmp/.torchtitan_exec"
+_EXEC_OUTPUT_DIR = "/tmp/.torchtitan_exec"
+_EXEC_RESULT_DIR = "/dev/shm/.torchtitan_exec"
+_EXEC_RAW_OUTPUT_LIMIT_BYTES = 1_048_576
+_EXEC_OUTPUT_HEAD_BYTES = 10_000
+_EXEC_OUTPUT_TAIL_BYTES = 10_000
+_PROVIDER_STATUS_FIRST_POLL_SEC = 5.0
+_PROVIDER_STATUS_POLL_INTERVAL_SEC = 30.0
+_PROVIDER_STATUS_RPC_TIMEOUT_SEC = 10.0
+_FINAL_RESULT_PROBE_TIMEOUT_SEC = 5.0
+_RESULT_POLL_DELAYS_SEC = (0.5,)
+_RESULT_POLL_INTERVAL_SEC = 2.0
+_EXEC_SCRIPT_ENV = "__TORCHTITAN_EXEC_SCRIPT_B64"
+_OBSERVABLE_WRAPPER_ENV = "__TORCHTITAN_OBSERVABLE_WRAPPER_B64"
+_MISSING_OUTPUT_MESSAGE = (
+    "[torchtitan: command completed, but its captured output is unavailable]"
+)
 
 
 def _error_status_code(error: BaseException) -> int | None:
@@ -111,13 +127,27 @@ def _build_exec_command(
     timeout: int,
 ) -> str:
     """Build one shell-safe command for the Daytona session API."""
-    argv = ["bash", "-c", cmd]
+    if env and _EXEC_SCRIPT_ENV in env:
+        raise ValueError(
+            f"{_EXEC_SCRIPT_ENV} is reserved for Daytona command transport"
+        )
+    # Keep the script out of process command lines so its own ``pkill -f``
+    # patterns cannot match the Bash or observable supervisor running it.
+    encoded_cmd = base64.b64encode(cmd.encode()).decode("ascii")
+    command_wrapper = (
+        f"__torchtitan_exec_script=$(printf '%s' \"${_EXEC_SCRIPT_ENV}\" | base64 -d) "
+        "|| exit $?; "
+        f"unset {_EXEC_SCRIPT_ENV}; "
+        "set --; "
+        'eval "$__torchtitan_exec_script"'
+    )
+    argv = ["bash", "-c", command_wrapper, "bash"]
     if user and user != "root":
-        keys = ",".join((env or {}).keys())
+        keys = ",".join([*(env or {}).keys(), _EXEC_SCRIPT_ENV])
         argv = ["runuser", "-u", user]
         if keys:
             argv.append(f"--whitelist-environment={keys}")
-        argv.extend(["--", "bash", "-c", cmd])
+        argv.extend(["--", "bash", "-c", command_wrapper, "bash"])
     if env:
         argv = ["env", "--", *(f"{key}={value}" for key, value in env.items()), *argv]
     argv = [
@@ -127,26 +157,86 @@ def _build_exec_command(
         f"{timeout}s",
         *argv,
     ]
-    return shlex.join(argv)
+    return f"{_EXEC_SCRIPT_ENV}={shlex.quote(encoded_cmd)} {shlex.join(argv)}"
 
 
 def _build_observable_exec_command(full: str, command_key: str) -> tuple[str, str, str]:
-    """Wrap a command with an atomic result sentinel and captured output."""
+    """Wrap a command with an atomic result sentinel and bounded output."""
+    raw_output_path = f"{_EXEC_OUTPUT_DIR}/{command_key}.raw"
+    output_fifo_path = f"{_EXEC_OUTPUT_DIR}/{command_key}.fifo"
     result_prefix = f"{_EXEC_RESULT_DIR}/{command_key}"
     output_path = f"{result_prefix}.output"
+    output_tmp_path = f"{output_path}.tmp"
     status_path = f"{result_prefix}.status"
     status_tmp_path = f"{status_path}.tmp"
-    quoted_dir = shlex.quote(_EXEC_RESULT_DIR)
+    wrapper_path = f"{result_prefix}.wrapper"
+    quoted_output_dir = shlex.quote(_EXEC_OUTPUT_DIR)
+    quoted_result_dir = shlex.quote(_EXEC_RESULT_DIR)
+    quoted_raw_output = shlex.quote(raw_output_path)
+    quoted_output_fifo = shlex.quote(output_fifo_path)
     quoted_output = shlex.quote(output_path)
+    quoted_output_tmp = shlex.quote(output_tmp_path)
     quoted_status = shlex.quote(status_path)
     quoted_status_tmp = shlex.quote(status_tmp_path)
+    quoted_wrapper = shlex.quote(wrapper_path)
+    truncation_marker = shlex.quote("\n[torchtitan: command output truncated]\n")
+    wrapper = (
+        f"rm -f {quoted_wrapper}; "
+        f"_tt_run() {{ {full}; _tt_exec_rc=$?; }}; "
+        f"mkdir -p {quoted_result_dir} 2>/dev/null || :; "
+        f"rm -f {quoted_output} {quoted_output_tmp} {quoted_status} "
+        f"{quoted_status_tmp}; "
+        f"if mkdir -p {quoted_output_dir} 2>/dev/null "
+        "&& command -v stdbuf > /dev/null "
+        f"&& rm -f {quoted_raw_output} {quoted_output_fifo} "
+        f"&& mkfifo {quoted_output_fifo} 2>/dev/null "
+        f"&& : > {quoted_raw_output} "
+        f"&& exec 9>> {quoted_raw_output}; then "
+        f"(exec 8< {quoted_output_fifo}; "
+        f"stdbuf -o0 head -c {_EXEC_RAW_OUTPUT_LIMIT_BYTES} <&8 >&9; "
+        "exec 9>&-; cat <&8 > /dev/null) </dev/null > /dev/null 2>&1 & "
+        "_tt_drain_pid=$!; "
+        f"_tt_run > {quoted_output_fifo} 2>&1; "
+        "_tt_wait_i=0; "
+        'while kill -0 "$_tt_drain_pid" 2>/dev/null '
+        '&& [ "$_tt_wait_i" -lt 5 ]; do '
+        "sleep 0.02; _tt_wait_i=$((_tt_wait_i + 1)); "
+        "done; "
+        f"mkdir -p {quoted_result_dir} 2>/dev/null || :; "
+        "_tt_exec_size=$(stat -Lc '%s' /proc/$$/fd/9 2>/dev/null || printf '0'); "
+        f'if [ "$_tt_exec_size" -le '
+        f"{_EXEC_OUTPUT_HEAD_BYTES + _EXEC_OUTPUT_TAIL_BYTES} ]; then "
+        f'head -c "$_tt_exec_size" /proc/$$/fd/9 > {quoted_output_tmp}; '
+        "else "
+        f"head -c {_EXEC_OUTPUT_HEAD_BYTES} /proc/$$/fd/9 > {quoted_output_tmp}; "
+        f"printf %s {truncation_marker} >> {quoted_output_tmp}; "
+        f"tail -c {_EXEC_OUTPUT_TAIL_BYTES} /proc/$$/fd/9 >> {quoted_output_tmp}; "
+        "fi; "
+        "exec 9>&-; "
+        f"mv -f {quoted_output_tmp} {quoted_output}; "
+        f"rm -f {quoted_raw_output} {quoted_output_fifo}; "
+        "else "
+        f"rm -f {quoted_raw_output} {quoted_output_fifo}; "
+        "_tt_run; "
+        "fi; "
+        f"mkdir -p {quoted_result_dir} 2>/dev/null || :; "
+        f"(printf '%s\\n' \"$_tt_exec_rc\" > {quoted_status_tmp} "
+        f"&& mv -f {quoted_status_tmp} {quoted_status}) 2>/dev/null || :; "
+        '(exit "$_tt_exec_rc")'
+    )
+    encoded_wrapper = base64.b64encode(wrapper.encode()).decode("ascii")
+    materializer = (
+        f"mkdir -p {quoted_result_dir} 2>/dev/null || exit $?; "
+        f'printf %s "${_OBSERVABLE_WRAPPER_ENV}" | base64 -d > {quoted_wrapper} '
+        "|| exit $?; "
+        f"unset {_OBSERVABLE_WRAPPER_ENV}; "
+        "if command -v setsid > /dev/null 2>&1; then "
+        f"exec setsid sh {quoted_wrapper}; "
+        f"else exec sh {quoted_wrapper}; fi"
+    )
     observed = (
-        f"mkdir -p {quoted_dir}; "
-        f"rm -f {quoted_output} {quoted_status} {quoted_status_tmp}; "
-        f"{{ {full}; }} > {quoted_output} 2>&1; "
-        "_tt_exec_rc=$?; "
-        f"printf '%s\\n' \"$_tt_exec_rc\" > {quoted_status_tmp}; "
-        f"mv -f {quoted_status_tmp} {quoted_status}"
+        f"{_OBSERVABLE_WRAPPER_ENV}={shlex.quote(encoded_wrapper)} exec "
+        + shlex.join(["sh", "-c", materializer])
     )
     return observed, status_path, output_path
 
@@ -407,6 +497,7 @@ class DaytonaSandbox:
         phase: str,
         retry_kind: str,
         failed_kind: str,
+        missing_kind: str | None = None,
         session_id: str = "",
         command_id: str = "",
     ) -> Any:
@@ -424,6 +515,16 @@ class DaytonaSandbox:
             try:
                 return await asyncio.wait_for(call(), timeout=_SESSION_RPC_TIMEOUT_SEC)
             except Exception as error:
+                if missing_kind is not None and _is_missing_file_error(error):
+                    self._record_issue(
+                        missing_kind,
+                        phase=phase,
+                        error=error,
+                        recovered=True,
+                        session_id=session_id,
+                        command_id=command_id,
+                    )
+                    return None
                 if _is_sandbox_gone_error(error):
                     self._mark_sandbox_lost(error, phase=phase)
                     raise
@@ -880,18 +981,27 @@ class DaytonaSandbox:
                 )
                 raise RuntimeError("daytona session exec returned no cmd_id")
 
-        async def read_status() -> int | None:
+        async def read_status(*, final: bool = False) -> int | None:
             remaining = deadline - loop.time()
-            if remaining <= 0:
+            if remaining <= 0 and not final:
                 return None
+            rpc_timeout = (
+                _FINAL_RESULT_PROBE_TIMEOUT_SEC
+                if final
+                else min(float(_SESSION_RPC_TIMEOUT_SEC), remaining)
+            )
             self._raise_if_sandbox_lost()
             try:
+                await asyncio.wait_for(
+                    self._sb.fs.get_file_info(status_path),
+                    timeout=rpc_timeout,
+                )
                 raw_status = await asyncio.wait_for(
                     self._sb.fs.download_file(
                         status_path,
-                        min(_SESSION_RPC_TIMEOUT_SEC, max(1, int(remaining))),
+                        max(1, int(rpc_timeout)),
                     ),
-                    timeout=min(float(_SESSION_RPC_TIMEOUT_SEC), remaining),
+                    timeout=rpc_timeout,
                 )
             except asyncio.TimeoutError as e:
                 self._record_issue(
@@ -940,10 +1050,75 @@ class DaytonaSandbox:
                     f"daytona command wrote invalid status {status_text!r}"
                 ) from e
 
+        async def read_provider_status(*, final: bool = False) -> int | None:
+            remaining = deadline - loop.time()
+            if remaining <= 0 and not final:
+                return None
+            rpc_timeout = (
+                _FINAL_RESULT_PROBE_TIMEOUT_SEC
+                if final
+                else min(_PROVIDER_STATUS_RPC_TIMEOUT_SEC, remaining)
+            )
+            self._raise_if_sandbox_lost()
+            try:
+                command = await asyncio.wait_for(
+                    self._sb.process.get_session_command(sid, cid),
+                    timeout=rpc_timeout,
+                )
+            except Exception as e:
+                if _is_missing_file_error(e):
+                    return None
+                if _is_sandbox_gone_error(e):
+                    self._mark_sandbox_lost(e, phase="command_status_fallback")
+                    raise
+                self._record_issue(
+                    "command_status_query_failed",
+                    phase="command_status_fallback",
+                    error=e,
+                    recovered=True,
+                    session_id=sid,
+                    command_id=cid,
+                    emit_log=False,
+                )
+                return None
+
+            raw_exit_code = getattr(command, "exit_code", None)
+            if raw_exit_code is None:
+                return None
+            try:
+                exit_code = int(raw_exit_code)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(raw_exit_code, float) and raw_exit_code != exit_code:
+                return None
+            return exit_code
+
         exit_code = await read_status()
         polls = 0
+        next_provider_poll = loop.time() + _PROVIDER_STATUS_FIRST_POLL_SEC
         while exit_code is None:
             if loop.time() >= deadline:
+                exit_code = await read_status(final=True)
+                used_provider_status = False
+                if exit_code is None:
+                    exit_code = await read_provider_status(final=True)
+                    used_provider_status = exit_code is not None
+                if exit_code is not None:
+                    if used_provider_status:
+                        self._record_issue(
+                            "command_status_fallback",
+                            phase="command_status_fallback",
+                            error=(
+                                "result sentinel unavailable; used Daytona "
+                                "command status"
+                            ),
+                            recovered=True,
+                            session_id=sid,
+                            command_id=cid,
+                            exit_code=exit_code,
+                            emit_log=False,
+                        )
+                    break
                 self._record_issue(
                     "command_status_timeout",
                     phase="command_poll",
@@ -956,7 +1131,27 @@ class DaytonaSandbox:
                     f"{command_timeout + _COMMAND_KILL_GRACE_SEC + _SESSION_POLL_GRACE_SEC:.0f}s "
                     f"without replaying the command; cmd={full[:80]}"
                 )
-            await asyncio.sleep(0.1 if polls < 5 else 1.0)
+            if loop.time() >= next_provider_poll:
+                exit_code = await read_provider_status()
+                next_provider_poll = loop.time() + _PROVIDER_STATUS_POLL_INTERVAL_SEC
+                if exit_code is not None:
+                    self._record_issue(
+                        "command_status_fallback",
+                        phase="command_status_fallback",
+                        error="result sentinel unavailable; used Daytona command status",
+                        recovered=True,
+                        session_id=sid,
+                        command_id=cid,
+                        exit_code=exit_code,
+                        emit_log=False,
+                    )
+                    break
+            delay = (
+                _RESULT_POLL_DELAYS_SEC[polls]
+                if polls < len(_RESULT_POLL_DELAYS_SEC)
+                else _RESULT_POLL_INTERVAL_SEC
+            )
+            await asyncio.sleep(delay * (0.8 + 0.4 * random.random()))
             exit_code = await read_status()
             polls += 1
 
@@ -965,9 +1160,33 @@ class DaytonaSandbox:
             phase="command_output",
             retry_kind="command_output_retry",
             failed_kind="command_output_failed",
+            missing_kind="command_output_missing",
             session_id=sid,
             command_id=cid,
         )
+        if output is None:
+            try:
+                logs = await self._retry_idempotent_rpc(
+                    lambda: self._sb.process.get_session_command_logs(sid, cid),
+                    phase="command_logs",
+                    retry_kind="command_logs_retry",
+                    failed_kind="command_logs_failed",
+                    missing_kind="command_logs_missing",
+                    session_id=sid,
+                    command_id=cid,
+                )
+            except Exception:
+                logs = None
+            output = getattr(logs, "output", None) if logs is not None else None
+            if not output and logs is not None:
+                stdout = getattr(logs, "stdout", None) or ""
+                stderr = getattr(logs, "stderr", None) or ""
+                separator = (
+                    "\n" if stdout and stderr and not stdout.endswith("\n") else ""
+                )
+                output = f"{stdout}{separator}{stderr}"
+            if not output:
+                output = _MISSING_OUTPUT_MESSAGE
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
         return exit_code, str(output)

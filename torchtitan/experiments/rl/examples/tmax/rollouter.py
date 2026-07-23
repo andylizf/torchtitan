@@ -102,11 +102,15 @@ _DISK_ISSUE_KINDS = {
 }
 _TRANSPORT_ISSUE_KINDS = {
     "command_logs_failed",
+    "command_logs_missing",
     "command_logs_retry",
     "command_output_failed",
+    "command_output_missing",
     "command_output_retry",
     "command_recovery_query_failed",
+    "command_status_fallback",
     "command_status_invalid",
+    "command_status_query_failed",
     "command_status_timeout",
     "delete_failed",
     "delete_retry",

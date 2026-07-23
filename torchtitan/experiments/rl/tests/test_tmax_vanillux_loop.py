@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shlex
+import subprocess
+import time
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -24,6 +28,9 @@ from torchtitan.experiments.rl.examples.tmax.rollouter import (
 from torchtitan.experiments.rl.harness import SandboxIssue
 from torchtitan.experiments.rl.observability.metrics import Mean
 from torchtitan.experiments.rl.rollout.types import Rollout, RolloutStatus
+
+
+_RUN_BASH = vanillux_loop._run_bash
 
 
 class _FakeAdapter:
@@ -78,6 +85,90 @@ def _run_loop(
             max_turns=max_turns,
         )
     )
+
+
+def test_persistent_bash_wrapper_avoids_pkill_pattern_self_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    wrapper_path = tmp_path / "wrapper.sh"
+    cwd_path = tmp_path / "cwd"
+    env_path = tmp_path / "env"
+    wrapper = vanillux_loop._BASH_WRAPPER.replace(
+        vanillux_loop._BASH_CWD_PATH, str(cwd_path)
+    ).replace(vanillux_loop._BASH_ENV_PATH, str(env_path))
+    wrapper_path.write_text(wrapper)
+    wrapper_path.chmod(0o755)
+    cwd_path.write_text(str(tmp_path))
+    env_path.touch()
+    monkeypatch.setattr(vanillux_loop, "_BASH_WRAPPER_PATH", str(wrapper_path))
+
+    class LocalSandbox:
+        command = ""
+
+        async def exec(self, command: str, **kwargs) -> tuple[int, str, str]:
+            self.command = command
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=kwargs["timeout"] + 2,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
+
+    sandbox = LocalSandbox()
+    pattern = f"tt_vanillux_wrapper_{os.getpid()}_{time.time_ns()}"
+    command = f"pkill -f {shlex.quote(pattern)} || :; printf survived"
+
+    output, exit_code = asyncio.run(_RUN_BASH(sandbox, command, 2))
+
+    assert command not in sandbox.command
+    assert (output, exit_code) == ("survived", 0)
+
+
+def test_persistent_bash_wrapper_preserves_command_argument_semantics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    wrapper_path = tmp_path / "wrapper.sh"
+    cwd_path = tmp_path / "cwd"
+    env_path = tmp_path / "env"
+    wrapper = vanillux_loop._BASH_WRAPPER.replace(
+        vanillux_loop._BASH_CWD_PATH, str(cwd_path)
+    ).replace(vanillux_loop._BASH_ENV_PATH, str(env_path))
+    wrapper_path.write_text(wrapper)
+    wrapper_path.chmod(0o755)
+    cwd_path.write_text(str(tmp_path))
+    env_path.touch()
+    monkeypatch.setattr(vanillux_loop, "_BASH_WRAPPER_PATH", str(wrapper_path))
+
+    class LocalSandbox:
+        async def exec(self, command: str, **kwargs) -> tuple[int, str, str]:
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=kwargs["timeout"] + 2,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
+
+    command = "printf '%s' \"$1\""
+
+    output, exit_code = asyncio.run(_RUN_BASH(LocalSandbox(), command, 2))
+
+    assert (output, exit_code) == (command, 0)
+
+    sandbox = LocalSandbox()
+    assert asyncio.run(_RUN_BASH(sandbox, "export _command=preserved", 2)) == (
+        "",
+        0,
+    )
+    assert asyncio.run(_RUN_BASH(sandbox, "printf '%s' \"$_command\"", 2)) == (
+        "preserved",
+        0,
+    )
+    assert asyncio.run(_RUN_BASH(sandbox, "export PATH=/tmp/missing", 2)) == ("", 0)
+    assert asyncio.run(_RUN_BASH(sandbox, "printf survived", 2)) == ("survived", 0)
 
 
 def test_finish_reason_submit(monkeypatch: pytest.MonkeyPatch) -> None:

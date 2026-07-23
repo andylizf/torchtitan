@@ -34,6 +34,7 @@ never submits is scored 0, matching the env (tests only run on submit).
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import shlex
@@ -97,11 +98,22 @@ _EXEC_TIMEOUT = int(os.environ.get("TMAX_EXEC_TIMEOUT_SEC", "120"))
 _BASH_WRAPPER_PATH = "/tmp/.tmax_vanillux_bash_wrapper.sh"
 _BASH_CWD_PATH = "/tmp/.tmax_vanillux_cwd"
 _BASH_ENV_PATH = "/tmp/.tmax_vanillux_env"
+_BASH_COMMAND_ENV = "__TORCHTITAN_VANILLUX_COMMAND_B64"
 _BASH_WRAPPER = f"""#!/bin/bash
+__torchtitan_vanillux_command="$(printf '%s' "${_BASH_COMMAND_ENV}" | base64 -d)"
+__torchtitan_vanillux_decode_exit_code=$?
+if [ "$__torchtitan_vanillux_decode_exit_code" -ne 0 ]; then
+  exit "$__torchtitan_vanillux_decode_exit_code"
+fi
+unset {_BASH_COMMAND_ENV}
+set -- "$__torchtitan_vanillux_command"
+unset __torchtitan_vanillux_command __torchtitan_vanillux_decode_exit_code
 set -a
 source {shlex.quote(_BASH_ENV_PATH)} 2>/dev/null || true
 set +a
-_cwd="$(cat {shlex.quote(_BASH_CWD_PATH)} 2>/dev/null || echo /app)"
+_cwd=
+IFS= read -r _cwd 2>/dev/null < {shlex.quote(_BASH_CWD_PATH)} || :
+[ -n "$_cwd" ] || _cwd=/app
 cd "$_cwd" 2>/dev/null || cd /workspace || exit 1
 eval "$1"
 _exit_code=$?
@@ -185,8 +197,10 @@ async def _prepare_runtime(sb: Sandbox) -> None:
 
 async def _run_bash(sb: Sandbox, command: str, timeout: int) -> tuple[str, int]:
     """Run one command through the persistent-shell wrapper; return (raw_output, ec)."""
+    encoded_command = base64.b64encode(command.encode()).decode("ascii")
     ec, out, err = await sb.exec(
-        f"bash {shlex.quote(_BASH_WRAPPER_PATH)} {shlex.quote(command)}",
+        f"{_BASH_COMMAND_ENV}={shlex.quote(encoded_command)} "
+        f"bash {shlex.quote(_BASH_WRAPPER_PATH)}",
         user="root",
         timeout=timeout,
         check=False,

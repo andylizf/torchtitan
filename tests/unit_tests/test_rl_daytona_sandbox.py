@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shlex
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -78,7 +80,10 @@ def _filesystem() -> SimpleNamespace:
             return b"ok"
         raise FileNotFoundError(path)
 
-    return SimpleNamespace(download_file=AsyncMock(side_effect=download_file))
+    return SimpleNamespace(
+        download_file=AsyncMock(side_effect=download_file),
+        get_file_info=AsyncMock(return_value=SimpleNamespace(size=2)),
+    )
 
 
 def _sandbox_with_process(process: SimpleNamespace) -> DaytonaSandbox:
@@ -99,15 +104,19 @@ def test_build_exec_command_preserves_complex_command() -> None:
 
     full = _build_exec_command(command, user="root", env=None, timeout=17)
 
-    assert shlex.split(full) == [
+    argv = shlex.split(full)
+    transport_env, argv = argv[0], argv[1:]
+    assert base64.b64decode(transport_env.split("=", 1)[1]).decode() == command
+    assert argv[:5] == [
         "timeout",
         "--signal=TERM",
         "--kill-after=10s",
         "17s",
         "bash",
-        "-c",
-        command,
     ]
+    assert argv[-1] == "bash"
+    assert "base64 -d" in argv[-2]
+    assert command not in full
 
 
 def test_build_exec_command_preserves_nonroot_env() -> None:
@@ -115,7 +124,10 @@ def test_build_exec_command_preserves_nonroot_env() -> None:
 
     full = _build_exec_command("env", user="agent", env=env, timeout=9)
 
-    assert shlex.split(full) == [
+    argv = shlex.split(full)
+    transport_env, argv = argv[0], argv[1:]
+    assert base64.b64decode(transport_env.split("=", 1)[1]).decode() == "env"
+    assert argv[:15] == [
         "timeout",
         "--signal=TERM",
         "--kill-after=10s",
@@ -127,12 +139,23 @@ def test_build_exec_command_preserves_nonroot_env() -> None:
         "runuser",
         "-u",
         "agent",
-        "--whitelist-environment=GREETING,LINES",
+        "--whitelist-environment=GREETING,LINES,__TORCHTITAN_EXEC_SCRIPT_B64",
         "--",
         "bash",
         "-c",
-        "env",
     ]
+    assert argv[-1] == "bash"
+    assert "base64 -d" in argv[-2]
+
+
+def test_build_exec_command_rejects_reserved_transport_env() -> None:
+    with pytest.raises(ValueError, match="reserved for Daytona command transport"):
+        _build_exec_command(
+            "true",
+            user="root",
+            env={"__TORCHTITAN_EXEC_SCRIPT_B64": "collision"},
+            timeout=9,
+        )
 
 
 def test_exec_separates_command_and_request_timeouts(
@@ -147,7 +170,7 @@ def test_exec_separates_command_and_request_timeouts(
     assert result == (0, "ok", "")
     call = sandbox._session_exec.await_args
     assert call is not None
-    assert shlex.split(call.args[0])[3] == "5s"
+    assert shlex.split(call.args[0])[4] == "5s"
     assert call.kwargs == {"command_timeout": 5, "request_timeout": 240}
 
 
@@ -162,7 +185,7 @@ def test_long_command_does_not_extend_request_timeout(
 
     call = sandbox._session_exec.await_args
     assert call is not None
-    assert shlex.split(call.args[0])[3] == "3600s"
+    assert shlex.split(call.args[0])[4] == "3600s"
     assert call.kwargs == {"command_timeout": 3600, "request_timeout": 120}
 
 
@@ -246,6 +269,309 @@ def test_observable_command_finishes_while_background_child_survives() -> None:
         os.unlink(output_path)
 
 
+@pytest.mark.skipif(shutil.which("timeout") is None, reason="GNU timeout is required")
+def test_observable_command_restores_deleted_result_directories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    result_dir = tmp_path / "result"
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(result_dir))
+    full = _build_exec_command(
+        f"rm -rf {shlex.quote(str(output_dir))} {shlex.quote(str(result_dir))}; "
+        "printf restored; exit 7",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, "deleted_dirs"
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 7
+    with open(status_path) as status_file:
+        assert status_file.read().strip() == "7"
+    with open(output_path) as output_file:
+        assert output_file.read() == "restored"
+
+
+@pytest.mark.skipif(
+    shutil.which("timeout") is None or shutil.which("setsid") is None,
+    reason="GNU timeout and setsid are required",
+)
+def test_observable_supervisor_survives_inner_bash_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
+    full = _build_exec_command(
+        "kill -9 $$",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, status_path, _ = _build_observable_exec_command(
+        full, "inner_bash_sigkill"
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 137
+    assert Path(status_path).read_text().strip() == "137"
+
+
+@pytest.mark.skipif(
+    shutil.which("base64") is None
+    or shutil.which("pkill") is None
+    or shutil.which("timeout") is None,
+    reason="base64, pkill, and GNU timeout are required",
+)
+def test_observable_command_avoids_pkill_pattern_self_match(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
+    pattern = f"tt_daytona_wrapper_{os.getpid()}_{time.time_ns()}"
+    command = f"pkill -f {shlex.quote(pattern)} || :; printf survived"
+    full = _build_exec_command(command, user="root", env=None, timeout=2)
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, "pkill_self_match"
+    )
+
+    assert pattern not in observed
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 0
+    assert Path(status_path).read_text().strip() == "0"
+    assert Path(output_path).read_text() == "survived"
+
+
+@pytest.mark.skipif(
+    shutil.which("base64") is None
+    or shutil.which("pkill") is None
+    or shutil.which("timeout") is None,
+    reason="base64, pkill, and GNU timeout are required",
+)
+def test_observable_supervisor_hides_static_wrapper_from_pkill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
+    pattern = "torchtitan: command output truncated"
+    full = _build_exec_command(
+        f"pkill -9 -f {shlex.quote(pattern)} || :; printf survived",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, "static_wrapper_pkill"
+    )
+
+    assert pattern not in observed
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 0
+    assert Path(status_path).read_text().strip() == "0"
+    assert Path(output_path).read_text() == "survived"
+
+
+def test_observable_supervisor_keeps_payload_out_of_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
+    full = _build_exec_command(
+        "printf survived; # " + "x" * 30_000,
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, _, _ = _build_observable_exec_command(full, "payload_not_in_argv")
+
+    transport_env, exec_name, shell, flag, materializer = shlex.split(observed)
+    env_name, encoded_wrapper = transport_env.split("=", 1)
+    assert env_name == "__TORCHTITAN_OBSERVABLE_WRAPPER_B64"
+    assert [exec_name, shell, flag] == ["exec", "sh", "-c"]
+    assert encoded_wrapper not in materializer
+    assert len(materializer) < 1_000
+
+
+@pytest.mark.skipif(
+    shutil.which("base64") is None or shutil.which("timeout") is None,
+    reason="base64 and GNU timeout are required",
+)
+def test_observable_command_does_not_duplicate_large_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
+    command = "printf survived; # " + "x" * 30_000
+    full = _build_exec_command(command, user="root", env=None, timeout=2)
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, "large_payload"
+    )
+
+    assert command not in observed
+    assert len(observed) < 100_000
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 0
+    assert Path(status_path).read_text().strip() == "0"
+    assert Path(output_path).read_text() == "survived"
+
+
+@pytest.mark.skipif(
+    shutil.which("base64") is None or shutil.which("timeout") is None,
+    reason="base64 and GNU timeout are required",
+)
+def test_wrapped_command_preserves_stdin() -> None:
+    full = _build_exec_command(
+        "IFS= read -r value; printf '%s' \"$value\"",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", full],
+        input=b"caller input\n",
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == b"caller input"
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("timeout") is None,
+    reason="Bash and GNU timeout are required",
+)
+def test_wrapped_command_reports_missing_decoder(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    os.symlink(shutil.which("bash"), bin_dir / "bash")
+    os.symlink(shutil.which("timeout"), bin_dir / "timeout")
+    marker = tmp_path / "executed"
+    full = _build_exec_command(
+        f"printf executed > {shlex.quote(str(marker))}",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+
+    completed = subprocess.run(
+        [str(bin_dir / "bash"), "-c", full],
+        capture_output=True,
+        check=False,
+        env={"PATH": str(bin_dir)},
+        timeout=5,
+    )
+
+    assert completed.returncode == 127
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("timeout") is None, reason="GNU timeout is required")
+def test_observable_command_materializes_bounded_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    result_dir = tmp_path / "result"
+    pid_path = tmp_path / "child.pid"
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(result_dir))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RAW_OUTPUT_LIMIT_BYTES", 64_000)
+    full = _build_exec_command(
+        "head -c 200000 /dev/zero | tr '\\0' x; "
+        f"sleep 30 & printf '%s' $! > {shlex.quote(str(pid_path))}",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, "bounded_output"
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", observed], capture_output=True, check=False, timeout=5
+    )
+
+    assert completed.returncode == 0
+    with open(status_path) as status_file:
+        assert status_file.read().strip() == "0"
+    output = open(output_path, "rb").read()
+    assert b"[torchtitan: command output truncated]" in output
+    assert len(output) <= (
+        daytona_backend._EXEC_OUTPUT_HEAD_BYTES
+        + daytona_backend._EXEC_OUTPUT_TAIL_BYTES
+        + 100
+    )
+    assert not list(output_dir.iterdir())
+    pid = int(pid_path.read_text())
+    try:
+        os.kill(pid, 0)
+    finally:
+        os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(shutil.which("timeout") is None, reason="GNU timeout is required")
+def test_observable_command_runs_when_capture_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "result"
+    monkeypatch.setattr(
+        daytona_backend,
+        "_EXEC_OUTPUT_DIR",
+        "/proc/torchtitan-unwritable",
+    )
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(result_dir))
+    full = _build_exec_command(
+        "printf fallback; exit 3",
+        user="root",
+        env=None,
+        timeout=2,
+    )
+    observed, status_path, output_path = _build_observable_exec_command(
+        full, "capture_failure"
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", observed],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 3
+    assert completed.stdout == "fallback"
+    assert Path(status_path).read_text().strip() == "3"
+    assert not Path(output_path).exists()
+
+
 def test_lost_execute_response_recovers_without_replay(
     fake_daytona: None,
 ) -> None:
@@ -311,6 +637,96 @@ def test_result_sentinel_preserves_nonzero_exit_and_output(
     process.execute_session_command.assert_awaited_once()
     process.get_session_command.assert_not_awaited()
     process.get_session_command_logs.assert_not_awaited()
+
+
+def test_provider_status_recovers_when_wrapper_is_killed(
+    fake_daytona: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_PROVIDER_STATUS_FIRST_POLL_SEC", 0)
+    process = _process()
+    process.get_session_command.return_value = SimpleNamespace(exit_code=137)
+    sandbox = _sandbox_with_process(process)
+    sandbox._sb.fs.download_file.side_effect = FileNotFoundError("not found")
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "pkill -9 bash",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (137, "ok")
+    process.execute_session_command.assert_awaited_once()
+    process.get_session_command.assert_awaited_once()
+    process.get_session_command_logs.assert_awaited_once()
+    process.delete_session.assert_not_awaited()
+    assert sandbox.issue_tracker.counts == {
+        "command_status_fallback": 1,
+        "command_output_missing": 1,
+    }
+
+
+def test_missing_captured_output_uses_provider_logs(fake_daytona: None) -> None:
+    process = _process()
+    process.get_session_command_logs.return_value = SimpleNamespace(
+        output="",
+        stdout="ok",
+        stderr="warning",
+    )
+    sandbox = _sandbox_with_process(process)
+
+    async def download_file(path: str, _timeout: int) -> bytes:
+        if path.endswith(".status"):
+            return b"0\n"
+        raise FileNotFoundError(path)
+
+    sandbox._sb.fs.download_file.side_effect = download_file
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "echo ok",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (0, "ok\nwarning")
+    process.execute_session_command.assert_awaited_once()
+    process.get_session_command_logs.assert_awaited_once()
+    assert sandbox.issue_tracker.counts == {"command_output_missing": 1}
+
+
+def test_missing_captured_output_and_logs_returns_diagnostic(
+    fake_daytona: None,
+) -> None:
+    process = _process()
+    process.get_session_command_logs.side_effect = FileNotFoundError("not found")
+    sandbox = _sandbox_with_process(process)
+
+    async def download_file(path: str, _timeout: int) -> bytes:
+        if path.endswith(".status"):
+            return b"0\n"
+        raise FileNotFoundError(path)
+
+    sandbox._sb.fs.download_file.side_effect = download_file
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "echo ok",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (0, daytona_backend._MISSING_OUTPUT_MESSAGE)
+    process.execute_session_command.assert_awaited_once()
+    process.get_session_command_logs.assert_awaited_once()
+    assert sandbox.issue_tracker.counts == {
+        "command_output_missing": 1,
+        "command_logs_missing": 1,
+    }
 
 
 def test_session_create_enospc_is_not_retried(
@@ -708,9 +1124,7 @@ def test_result_poll_treats_file_404_as_pending(fake_daytona: None) -> None:
 def test_result_poll_preserves_explicit_sandbox_404(fake_daytona: None) -> None:
     process = _process()
     sandbox = _sandbox_with_process(process)
-    sandbox._sb.fs.download_file.side_effect = _StatusError(
-        "sandbox not found", 404
-    )
+    sandbox._sb.fs.download_file.side_effect = _StatusError("sandbox not found", 404)
 
     with pytest.raises(_StatusError, match="sandbox not found"):
         asyncio.run(
@@ -731,6 +1145,7 @@ def test_poll_deadline_does_not_delete_a_possibly_successful_session(
     monkeypatch.setattr(daytona_backend, "_COMMAND_KILL_GRACE_SEC", 0)
     monkeypatch.setattr(daytona_backend, "_SESSION_POLL_GRACE_SEC", 0)
     process = _process()
+    process.get_session_command.return_value = SimpleNamespace(exit_code=None)
     sandbox = _sandbox_with_process(process)
     sandbox._sb.fs.download_file.side_effect = FileNotFoundError("not found")
 
@@ -744,7 +1159,7 @@ def test_poll_deadline_does_not_delete_a_possibly_successful_session(
         )
 
     process.execute_session_command.assert_awaited_once()
-    process.get_session_command.assert_not_awaited()
+    process.get_session_command.assert_awaited_once()
     process.delete_session.assert_not_awaited()
 
 
