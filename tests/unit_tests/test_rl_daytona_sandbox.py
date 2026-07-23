@@ -106,18 +106,18 @@ def test_build_exec_command_preserves_complex_command() -> None:
 
     full = _build_exec_command(command, user="root", env=None, timeout=17)
 
-    argv = shlex.split(full)
-    transport_env, argv = argv[0], argv[1:]
-    assert base64.b64decode(transport_env.split("=", 1)[1]).decode() == command
-    assert argv[:5] == [
-        "timeout",
-        "--signal=TERM",
-        "--kill-after=10s",
-        "17s",
-        "bash",
-    ]
-    assert argv[-1] == "bash"
-    assert "base64 -d" in argv[-2]
+    completed = subprocess.run(
+        ["bash", "-c", full],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "HOME": "/example-home"},
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.decode() == "/example-home\nline 1\nline 2\n"
+    assert base64.b64encode(command.encode()).decode() in full
+    assert "timeout --signal=TERM --kill-after=10s 17s bash" in full
     assert command not in full
 
 
@@ -126,38 +126,41 @@ def test_build_exec_command_preserves_nonroot_env() -> None:
 
     full = _build_exec_command("env", user="agent", env=env, timeout=9)
 
-    argv = shlex.split(full)
-    transport_env, argv = argv[0], argv[1:]
-    assert base64.b64decode(transport_env.split("=", 1)[1]).decode() == "env"
-    assert argv[:15] == [
-        "timeout",
-        "--signal=TERM",
-        "--kill-after=10s",
-        "9s",
-        "env",
-        "--",
-        "GREETING=hello world",
-        "LINES=first\nsecond",
-        "runuser",
-        "-u",
-        "agent",
-        "--whitelist-environment=GREETING,LINES,__TORCHTITAN_EXEC_SCRIPT_B64",
-        "--",
-        "bash",
-        "-c",
-    ]
-    assert argv[-1] == "bash"
-    assert "base64 -d" in argv[-2]
+    runner = shlex.join(
+        [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=10s",
+            "9s",
+            "env",
+            "--",
+            "GREETING=hello world",
+            "LINES=first\nsecond",
+            "runuser",
+            "-u",
+            "agent",
+            "--whitelist-environment=GREETING,LINES",
+            "--",
+            "bash",
+        ]
+    )
+    assert base64.b64encode(b"env").decode() in full
+    assert f'{runner} "$_tt_script_path"' in full
 
 
-def test_build_exec_command_rejects_reserved_transport_env() -> None:
-    with pytest.raises(ValueError, match="reserved for Daytona command transport"):
-        _build_exec_command(
-            "true",
-            user="root",
-            env={"__TORCHTITAN_EXEC_SCRIPT_B64": "collision"},
-            timeout=9,
-        )
+def test_build_exec_command_has_no_reserved_transport_env() -> None:
+    full = _build_exec_command(
+        "printf '%s' \"$__TORCHTITAN_EXEC_SCRIPT_B64\"",
+        user="root",
+        env={"__TORCHTITAN_EXEC_SCRIPT_B64": "preserved"},
+        timeout=9,
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", full], capture_output=True, check=False, timeout=5
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == b"preserved"
 
 
 def test_exec_separates_command_and_request_timeouts(
@@ -172,7 +175,7 @@ def test_exec_separates_command_and_request_timeouts(
     assert result == (0, "ok", "")
     call = sandbox._session_exec.await_args
     assert call is not None
-    assert shlex.split(call.args[0])[4] == "5s"
+    assert "timeout --signal=TERM --kill-after=10s 5s bash" in call.args[0]
     assert call.kwargs == {"command_timeout": 5, "request_timeout": 240}
 
 
@@ -187,7 +190,7 @@ def test_long_command_does_not_extend_request_timeout(
 
     call = sandbox._session_exec.await_args
     assert call is not None
-    assert shlex.split(call.args[0])[4] == "3600s"
+    assert "timeout --signal=TERM --kill-after=10s 3600s bash" in call.args[0]
     assert call.kwargs == {"command_timeout": 3600, "request_timeout": 120}
 
 
@@ -451,11 +454,13 @@ def test_uploaded_observable_command_handles_oversized_payload(
 ) -> None:
     monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
     monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
-    command = "printf survived; # " + "x" * 72_000
+    monkeypatch.setattr(daytona_backend, "_EXEC_STAGING_DIR", str(tmp_path))
+    command = "printf survived; # " + "x" * 256_000
     full = _build_exec_command(command, user="root", env=None, timeout=2)
     command_key = f"uploaded_{os.getpid()}_{time.time_ns()}"
     observable = _build_observable_exec(full, command_key)
 
+    assert len(base64.b64encode(command.encode())) > 131_072
     assert len(observable.inline_command.encode()) + 1 > 131_072
     assert len(observable.uploaded_command.encode()) < 1_000
     assert command not in observable.uploaded_command
@@ -494,7 +499,7 @@ def test_session_exec_uploads_oversized_observable(
     assert upload is not None
     wrapper, wrapper_path, upload_timeout = upload.args
     assert b"printf once" in wrapper
-    assert wrapper_path.startswith("/tmp/.torchtitan_exec_")
+    assert wrapper_path.startswith("/dev/shm/.torchtitan_exec_")
     assert upload_timeout == daytona_backend._SESSION_RPC_TIMEOUT_SEC
     request = process.execute_session_command.await_args.args[1]
     assert request.command.endswith(shlex.quote(wrapper_path))

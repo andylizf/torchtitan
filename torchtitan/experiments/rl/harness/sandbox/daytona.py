@@ -47,6 +47,7 @@ _SESSION_RPC_TIMEOUT_SEC = 60
 _COMMAND_RECOVERY_DELAYS_SEC = (0.0, 0.25, 1.0)
 _EXEC_OUTPUT_DIR = "/tmp/.torchtitan_exec"
 _EXEC_RESULT_DIR = "/dev/shm/.torchtitan_exec"
+_EXEC_STAGING_DIR = "/dev/shm"
 _EXEC_RAW_OUTPUT_LIMIT_BYTES = 1_048_576
 _EXEC_OUTPUT_HEAD_BYTES = 10_000
 _EXEC_OUTPUT_TAIL_BYTES = 10_000
@@ -59,7 +60,6 @@ _PROVIDER_STATUS_RPC_TIMEOUT_SEC = 10.0
 _FINAL_RESULT_PROBE_TIMEOUT_SEC = 5.0
 _RESULT_POLL_DELAYS_SEC = (0.5,)
 _RESULT_POLL_INTERVAL_SEC = 2.0
-_EXEC_SCRIPT_ENV = "__TORCHTITAN_EXEC_SCRIPT_B64"
 _OBSERVABLE_WRAPPER_ENV = "__TORCHTITAN_OBSERVABLE_WRAPPER_B64"
 _MISSING_OUTPUT_MESSAGE = (
     "[torchtitan: command completed, but its captured output is unavailable]"
@@ -141,27 +141,18 @@ def _build_exec_command(
     timeout: int,
 ) -> str:
     """Build one shell-safe command for the Daytona session API."""
-    if env and _EXEC_SCRIPT_ENV in env:
-        raise ValueError(
-            f"{_EXEC_SCRIPT_ENV} is reserved for Daytona command transport"
-        )
-    # Keep the script out of process command lines so its own ``pkill -f``
-    # patterns cannot match the Bash or observable supervisor running it.
+    # Decode through a tmpfs script rather than argv or the environment. Besides
+    # hiding pkill patterns from ancestor argv, this avoids MAX_ARG_STRLEN for
+    # large model-generated shell actions while preserving their original stdin.
     encoded_cmd = base64.b64encode(cmd.encode()).decode("ascii")
-    command_wrapper = (
-        f"__torchtitan_exec_script=$(printf '%s' \"${_EXEC_SCRIPT_ENV}\" | base64 -d) "
-        "|| exit $?; "
-        f"unset {_EXEC_SCRIPT_ENV}; "
-        "set --; "
-        'eval "$__torchtitan_exec_script"'
-    )
-    argv = ["bash", "-c", command_wrapper, "bash"]
+    script_path_prefix = shlex.quote(f"{_EXEC_STAGING_DIR}/.torchtitan_exec_command.")
+    argv = ["bash"]
     if user and user != "root":
-        keys = ",".join([*(env or {}).keys(), _EXEC_SCRIPT_ENV])
+        keys = ",".join((env or {}).keys())
         argv = ["runuser", "-u", user]
         if keys:
             argv.append(f"--whitelist-environment={keys}")
-        argv.extend(["--", "bash", "-c", command_wrapper, "bash"])
+        argv.extend(["--", "bash"])
     if env:
         argv = ["env", "--", *(f"{key}={value}" for key, value in env.items()), *argv]
     argv = [
@@ -171,7 +162,16 @@ def _build_exec_command(
         f"{timeout}s",
         *argv,
     ]
-    return f"{_EXEC_SCRIPT_ENV}={shlex.quote(encoded_cmd)} {shlex.join(argv)}"
+    runner = f'{shlex.join(argv)} "$_tt_script_path"'
+    return (
+        f"_tt_script_path={script_path_prefix}$$; "
+        f"if printf %s {shlex.quote(encoded_cmd)} | base64 -d "
+        '   > "$_tt_script_path"; then '
+        f"{runner}; _tt_script_rc=$?; "
+        "else _tt_script_rc=$?; fi; "
+        'rm -f "$_tt_script_path"; '
+        '(exit "$_tt_script_rc")'
+    )
 
 
 def _build_observable_exec(full: str, command_key: str) -> _ObservableExecCommand:
@@ -183,7 +183,7 @@ def _build_observable_exec(full: str, command_key: str) -> _ObservableExecComman
     output_tmp_path = f"{output_path}.tmp"
     status_path = f"{result_prefix}.status"
     status_tmp_path = f"{status_path}.tmp"
-    wrapper_path = f"/tmp/.torchtitan_exec_{command_key}.wrapper"
+    wrapper_path = f"{_EXEC_STAGING_DIR}/.torchtitan_exec_{command_key}.wrapper"
     quoted_output_dir = shlex.quote(_EXEC_OUTPUT_DIR)
     quoted_result_dir = shlex.quote(_EXEC_RESULT_DIR)
     quoted_raw_output = shlex.quote(raw_output_path)
@@ -769,8 +769,8 @@ class DaytonaSandbox:
             int(os.environ.get("TT_DAYTONA_EXEC_TIMEOUT_MIN", "0")),
         )
 
-        # The original command remains one opaque `bash -c` argument even when it
-        # contains quotes or newlines.
+        # The original command remains opaque even when it contains quotes or
+        # newlines, and is decoded into a tmpfs script inside the sandbox.
         full = _build_exec_command(cmd, user=user, env=env, timeout=timeout)
         num_issues_before = self.issue_tracker.num_events
         try:
