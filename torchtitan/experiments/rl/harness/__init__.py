@@ -35,6 +35,9 @@ from torchtitan.experiments.rl.harness.sandbox import (
     DaytonaSandbox,
     make_sandbox,
     Sandbox,
+    SandboxIssue,
+    SandboxIssueTracker,
+    SandboxLogContext,
 )
 
 __all__ = [
@@ -42,6 +45,9 @@ __all__ = [
     "CapturedTurn",
     "DaytonaSandbox",
     "Sandbox",
+    "SandboxIssue",
+    "SandboxIssueTracker",
+    "SandboxLogContext",
     "apply_pre_commands",
     "boot_agent_sandbox",
     "git_diff",

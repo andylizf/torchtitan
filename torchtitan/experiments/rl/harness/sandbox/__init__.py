@@ -16,6 +16,9 @@ from torchtitan.experiments.rl.harness.sandbox.base import (
     FileContent,
     make_sandbox,
     Sandbox,
+    SandboxIssue,
+    SandboxIssueTracker,
+    SandboxLogContext,
 )
 from torchtitan.experiments.rl.harness.sandbox.bridge import DaytonaBridge, start_bridge
 from torchtitan.experiments.rl.harness.sandbox.daytona import DaytonaSandbox
@@ -26,6 +29,9 @@ __all__ = [
     "ExecResult",
     "FileContent",
     "Sandbox",
+    "SandboxIssue",
+    "SandboxIssueTracker",
+    "SandboxLogContext",
     "make_sandbox",
     "start_bridge",
 ]

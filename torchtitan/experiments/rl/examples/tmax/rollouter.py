@@ -48,7 +48,8 @@ import json
 import logging
 import os
 import statistics
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
 from renderers import Renderer
@@ -63,6 +64,9 @@ from torchtitan.experiments.rl.harness import (
     AnthropicAdapter,
     boot_agent_sandbox,
     Sandbox,
+    SandboxIssue,
+    SandboxIssueTracker,
+    SandboxLogContext,
 )
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
@@ -91,6 +95,97 @@ _FINISH_REASONS = (
     "stopped_early",
     "error",
 )
+
+_DISK_ISSUE_KINDS = {
+    "command_disk_exhausted",
+    "session_disk_exhausted",
+}
+_TRANSPORT_ISSUE_KINDS = {
+    "command_logs_failed",
+    "command_recovery_query_failed",
+    "command_status_timeout",
+    "delete_failed",
+    "exec_failed",
+    "execute_missing_command_id",
+    "execute_response_recovered",
+    "execute_response_unconfirmed",
+    "file_upload_failed",
+    "poll_transient",
+    "session_cleanup_failed",
+}
+_PROVISION_ISSUE_KINDS = {
+    "create_failed",
+    "create_retry",
+    "provision_failed",
+    "provision_retry",
+    "session_create_failed",
+    "session_create_retry",
+}
+_TIMEOUT_ISSUE_KINDS = {
+    "command_status_timeout",
+    "command_timeout",
+}
+
+
+@dataclass(slots=True)
+class _SandboxRolloutDiagnostics:
+    sandbox_id: str
+    disk_gb: int | None
+    issue_counts: dict[str, int]
+    issues: tuple[SandboxIssue, ...]
+    num_dropped_details: int
+
+
+def _sandbox_issue_metrics(
+    issue_counts_by_rollout: list[Mapping[str, int]],
+) -> list[m.Metric]:
+    """Summarize bounded sandbox issue categories for one sibling group."""
+    assert issue_counts_by_rollout, "a TMax rollout group must contain siblings"
+    num_rollouts = len(issue_counts_by_rollout)
+
+    def _num_events(counts: Mapping[str, int], kinds: set[str] | None = None) -> int:
+        if kinds is None:
+            return sum(counts.values())
+        return sum(counts.get(kind, 0) for kind in kinds)
+
+    def _frac(kinds: set[str] | None = None) -> float:
+        return (
+            sum(
+                1.0
+                for counts in issue_counts_by_rollout
+                if _num_events(counts, kinds) > 0
+            )
+            / num_rollouts
+        )
+
+    def _events_mean(kinds: set[str] | None = None) -> float:
+        return (
+            sum(_num_events(counts, kinds) for counts in issue_counts_by_rollout)
+            / num_rollouts
+        )
+
+    return [
+        m.Metric("rollout/sandbox_issue_frac", m.Mean(_frac())),
+        m.Metric("rollout/sandbox_issue_events_mean", m.Mean(_events_mean())),
+        m.Metric("rollout/sandbox_disk_full_frac", m.Mean(_frac(_DISK_ISSUE_KINDS))),
+        m.Metric(
+            "rollout/sandbox_disk_full_events_mean",
+            m.Mean(_events_mean(_DISK_ISSUE_KINDS)),
+        ),
+        m.Metric(
+            "rollout/sandbox_transport_issue_frac",
+            m.Mean(_frac(_TRANSPORT_ISSUE_KINDS)),
+        ),
+        m.Metric(
+            "rollout/sandbox_transport_issue_events_mean",
+            m.Mean(_events_mean(_TRANSPORT_ISSUE_KINDS)),
+        ),
+        m.Metric(
+            "rollout/sandbox_provision_issue_frac",
+            m.Mean(_frac(_PROVISION_ISSUE_KINDS)),
+        ),
+        m.Metric("rollout/sandbox_timeout_frac", m.Mean(_frac(_TIMEOUT_ISSUE_KINDS))),
+    ]
 
 
 def _finish_reason_metrics(finish_reasons: list[str]) -> list[m.Metric]:
@@ -126,6 +221,14 @@ class _RootSandbox:
     @property
     def sandbox_id(self) -> str:
         return self._inner.sandbox_id
+
+    @property
+    def allocated_disk_gb(self) -> int | None:
+        return self._inner.allocated_disk_gb
+
+    @property
+    def issue_tracker(self) -> SandboxIssueTracker:
+        return self._inner.issue_tracker
 
     async def exec(self, cmd: str, *, user: str = "root", **kwargs):
         return await self._inner.exec(cmd, user="root", **kwargs)
@@ -312,10 +415,11 @@ class TMaxRollouter(Rollouter):
             # second cancel, which could interrupt an in-progress sandbox teardown.
             await asyncio.gather(*rollout_tasks, return_exceptions=True)
             raise
-        rollouts = [rollout for rollout, _, _, _ in results]
-        submitted_flags = [submitted for _, submitted, _, _ in results]
-        fmt_errors_list = [fmt for _, _, fmt, _ in results]
-        finish_reasons = [fr for _, _, _, fr in results]
+        rollouts = [rollout for rollout, _, _, _, _ in results]
+        submitted_flags = [submitted for _, submitted, _, _, _ in results]
+        fmt_errors_list = [fmt for _, _, fmt, _, _ in results]
+        finish_reasons = [fr for _, _, _, fr, _ in results]
+        sandbox_diagnostics = [diagnostics for _, _, _, _, diagnostics in results]
 
         # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
         outputs = await self.score_group(rollouts, sample)
@@ -341,6 +445,9 @@ class TMaxRollouter(Rollouter):
         # returned). The five fracs sum to 1.0 per group; cudagraph should push
         # time_budget down and submit up.
         finish_metrics = _finish_reason_metrics(finish_reasons)
+        sandbox_metrics = _sandbox_issue_metrics(
+            [diagnostics.issue_counts for diagnostics in sandbox_diagnostics]
+        )
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
@@ -349,6 +456,7 @@ class TMaxRollouter(Rollouter):
                 m.Metric("rollout/format_errors_mean", m.Mean(fmt_errors_mean)),
                 m.Metric("rollout/format_error_frac", m.Mean(fmt_error_frac)),
                 *finish_metrics,
+                *sandbox_metrics,
             ],
         )
         advantages = self.advantage_estimator(group)
@@ -397,11 +505,12 @@ class TMaxRollouter(Rollouter):
         rollout_idx: int,
         sampling: "SamplingConfig",
         renderer: Renderer,
-    ) -> tuple[Rollout, bool, int, str]:
+    ) -> tuple[Rollout, bool, int, str, _SandboxRolloutDiagnostics]:
         """Boot a sandbox, run the agent as root, grade the task in place.
 
-        Always returns ``(Rollout, submitted, fmt_errors, finish_reason)`` (errors
-        caught + marked terminal) so one bad sibling never fails the whole group.
+        Always returns ``(Rollout, submitted, fmt_errors, finish_reason,
+        sandbox_diagnostics)`` (errors caught + marked terminal) so one bad sibling
+        never fails the whole group.
         ``submitted`` is whether the agent emitted the submit marker (False on any
         error / no-submit); ``fmt_errors`` is the tool-call parse-failure count;
         ``finish_reason`` is how the loop ended (submit / hit_max_turns /
@@ -422,6 +531,15 @@ class TMaxRollouter(Rollouter):
         # Default for the timeout/exception paths where run_vanillux_loop never
         # returned (it sets its own reason on the normal path).
         finish_reason = "error"
+        issue_tracker = SandboxIssueTracker(
+            SandboxLogContext(
+                instance_id=sample.instance_id,
+                group_id=group_id,
+                rollout_id=rollout_idx,
+            )
+        )
+        sandbox: Sandbox | None = None
+        rollout_timeout = None
         await self._rollout_gate.acquire_sibling((group_id, rollout_idx))
         try:
             # open_session is inside the try so a failure still releases the slot.
@@ -432,14 +550,19 @@ class TMaxRollouter(Rollouter):
                 routing_session_id=rollout_id,
                 max_context_tokens=self._max_context_tokens,
             )
-            async with asyncio.timeout(self._guard_sec):
+            async with asyncio.timeout(self._guard_sec) as rollout_timeout:
                 # host_loop drives the sandbox with bash directly; it never runs the
                 # Claude Code CLI, so skip the curl-based install (the tmax task
                 # images have no curl, which would otherwise fail every boot).
-                async with boot_agent_sandbox(sample.image, install_claude=False) as sb:
+                async with boot_agent_sandbox(
+                    sample.image,
+                    install_claude=False,
+                    disk_gb=sample.daytona_disk_gb,
+                    issue_tracker=issue_tracker,
+                ) as sandbox:
                     # Force every tool command to run as root (tmax tasks touch
                     # system paths); the faithful Vanillux loop dispatches bash here.
-                    root_sb = _RootSandbox(sb)
+                    root_sb = _RootSandbox(sandbox)
                     # Seed the agent-facing inputs (environment/seeds/* -> /workspace)
                     # BEFORE the agent runs -- upstream seeds at reset. Without this,
                     # seed-bearing tasks are unsolvable (inputs absent during rollout).
@@ -462,7 +585,7 @@ class TMaxRollouter(Rollouter):
                     # git_diff: grade the agent's OWN sandbox in place.
                     if submitted:
                         reward = await grade_tmax(
-                            sb,
+                            sandbox,
                             sample.tmax,
                             workdir=sample.workdir,
                             timeout_sec=self._eval_timeout_sec,
@@ -471,9 +594,13 @@ class TMaxRollouter(Rollouter):
                         reward = 0.0
                 status = RolloutStatus.COMPLETED
         except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("[tmax] %s: wall-clock guard fired", rollout_id)
             status = RolloutStatus.ERROR_TIMEOUT
-            error_msg = "wall_clock_timeout"
+            if rollout_timeout is not None and rollout_timeout.expired():
+                logger.warning("[tmax] %s: wall-clock guard fired", rollout_id)
+                error_msg = "wall_clock_timeout"
+            else:
+                logger.exception("[tmax] %s: sandbox timeout", rollout_id)
+                error_msg = "sandbox_timeout"
         except Exception as e:
             logger.exception("[tmax] %s: rollout failed", rollout_id)
             status = RolloutStatus.ERROR
@@ -481,6 +608,20 @@ class TMaxRollouter(Rollouter):
         finally:
             self._rollout_gate.release()
             captured = await adapter.finish_session(rollout_id)
+
+        disk_gb = (
+            sandbox.allocated_disk_gb
+            if sandbox is not None
+            else sample.daytona_disk_gb
+            or int(os.environ.get("TT_DAYTONA_DISK_GB", "6"))
+        )
+        diagnostics = _SandboxRolloutDiagnostics(
+            sandbox_id=sandbox.sandbox_id if sandbox is not None else "",
+            disk_gb=disk_gb,
+            issue_counts=issue_tracker.counts,
+            issues=issue_tracker.issues,
+            num_dropped_details=issue_tracker.num_dropped_details,
+        )
 
         # Drop empty-completion turns so rollout_to_training_samples only sees
         # trainable turns (a non-final empty completion would otherwise raise).
@@ -524,6 +665,29 @@ class TMaxRollouter(Rollouter):
         else:
             turns[-1].env_rewards = {TMAX_REWARD_KEY: float(reward)}
 
+        if diagnostics.issue_counts:
+            logger.warning(
+                "[tmax_sandbox_summary] %s",
+                json.dumps(
+                    {
+                        "event": "tmax_sandbox_summary",
+                        "instance_id": sample.instance_id,
+                        "group_id": group_id,
+                        "rollout_id": rollout_idx,
+                        "sandbox_id": diagnostics.sandbox_id,
+                        "image": sample.image,
+                        "disk_gb": diagnostics.disk_gb,
+                        "status": str(status),
+                        "submitted": submitted,
+                        "reward": reward,
+                        "finish_reason": finish_reason,
+                        "issue_counts": diagnostics.issue_counts,
+                        "num_dropped_details": diagnostics.num_dropped_details,
+                    },
+                    sort_keys=True,
+                ),
+            )
+
         logger.info(
             "[tmax] %s: status=%s reward=%.2f turns=%d",
             rollout_id,
@@ -541,6 +705,8 @@ class TMaxRollouter(Rollouter):
             submitted=submitted,
             fmt_errors=fmt_errors,
             error_msg=error_msg,
+            finish_reason=finish_reason,
+            sandbox_diagnostics=diagnostics,
         )
         return (
             Rollout(
@@ -552,6 +718,7 @@ class TMaxRollouter(Rollouter):
             submitted,
             fmt_errors,
             finish_reason,
+            diagnostics,
         )
 
     def _maybe_dump_trace(
@@ -566,6 +733,8 @@ class TMaxRollouter(Rollouter):
         submitted: bool = False,
         fmt_errors: int = 0,
         error_msg: str = "",
+        finish_reason: str = "",
+        sandbox_diagnostics: _SandboxRolloutDiagnostics,
     ) -> None:
         """Write a human-readable per-rollout training trace when
         ``SWE_ROLLOUT_DUMP_DIR`` is set. Format mirrors the open-instruct diagnostic
@@ -609,7 +778,7 @@ class TMaxRollouter(Rollouter):
 
             response_len = sum(len(ct.completion_token_ids) for ct in captured)
             num_tool_calls = full_text.count("<tool_call>")
-            last_finish = captured[-1].finish_reason if captured else None
+            last_model_finish = captured[-1].finish_reason if captured else None
             any_length_finish = any(ct.finish_reason == "length" for ct in captured)
             outcome = "SUCCESS" if reward and reward > 0 else "FAIL"
 
@@ -622,7 +791,13 @@ class TMaxRollouter(Rollouter):
                 + f"\nrollout_id     : {rollout_id}"
                 + f"\nstatus         : {status}   submitted: {submitted}"
                 + f"\nreward         : {reward}"
-                + f"\nfinish_reason  : {last_finish}   any length-cap turn: {any_length_finish}"
+                + f"\nfinish_reason  : {finish_reason}"
+                + f"\nmodel finish   : {last_model_finish}   any length-cap turn: {any_length_finish}"
+                + f"\nsandbox_id     : {sandbox_diagnostics.sandbox_id}"
+                + f"\nsandbox disk   : {sandbox_diagnostics.disk_gb} GiB"
+                + "\nsandbox issues : "
+                + json.dumps(sandbox_diagnostics.issue_counts, sort_keys=True)
+                + f" (details dropped={sandbox_diagnostics.num_dropped_details})"
                 + f"\nnum turns      : {len(captured)}   num tool calls: {num_tool_calls}"
                 + f"\nresponse length: {response_len} tokens (model-generated, all turns)"
                 + f"\nformat_errors  : {fmt_errors}"
@@ -648,5 +823,32 @@ class TMaxRollouter(Rollouter):
                 f.write(full_text)
                 f.write("\n")
             logger.info("[tmax] rollout trace dumped: %s", path)
+            if sandbox_diagnostics.issue_counts:
+                issue_path = os.path.join(dump_dir, f"{safe}.sandbox.json")
+                with open(issue_path, "w") as f:
+                    json.dump(
+                        {
+                            "instance_id": sample.instance_id,
+                            "image": sample.image,
+                            "rollout_id": rollout_id,
+                            "sandbox_id": sandbox_diagnostics.sandbox_id,
+                            "disk_gb": sandbox_diagnostics.disk_gb,
+                            "status": status,
+                            "submitted": submitted,
+                            "reward": reward,
+                            "finish_reason": finish_reason,
+                            "error": error_msg,
+                            "issue_counts": sandbox_diagnostics.issue_counts,
+                            "num_dropped_details": (
+                                sandbox_diagnostics.num_dropped_details
+                            ),
+                            "issues": [
+                                asdict(issue) for issue in sandbox_diagnostics.issues
+                            ],
+                        },
+                        f,
+                        sort_keys=True,
+                    )
+                logger.info("[tmax] sandbox issue trace dumped: %s", issue_path)
         except Exception as e:
             logger.warning("[tmax] rollout trace dump failed: %s", e)

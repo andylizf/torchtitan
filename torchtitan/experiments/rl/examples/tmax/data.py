@@ -50,6 +50,9 @@ class TMaxSample:
     image: str
     """Public docker image the task runs in (e.g. ``docker.io/hamishi740/...``)."""
 
+    daytona_disk_gb: int | None = None
+    """Optional per-task Daytona root-disk allocation in GiB."""
+
     workdir: str
     """Working directory inside the sandbox (best-guess; default ``/workspace``)."""
 
@@ -115,10 +118,21 @@ class TMaxDataset(Configurable):
                     raise ValueError(
                         f"row {instance_id!r} missing image/tmax in metadata"
                     )
+                daytona_disk_gb = md.get("daytona_disk_gb")
+                if daytona_disk_gb is not None and (
+                    isinstance(daytona_disk_gb, bool)
+                    or not isinstance(daytona_disk_gb, int)
+                    or daytona_disk_gb <= 0
+                ):
+                    raise ValueError(
+                        f"row {instance_id!r} has invalid daytona_disk_gb "
+                        f"{daytona_disk_gb!r}; expected a positive integer"
+                    )
                 samples.append(
                     TMaxSample(
                         instance_id=instance_id,
                         image=image,
+                        daytona_disk_gb=daytona_disk_gb,
                         workdir=md.get("workdir") or "/workspace",
                         problem_statement=md.get("problem_statement")
                         or _coerce_prompt(row.get("prompt")),

@@ -16,6 +16,8 @@ Ported from THUDM/slime ``slime/agent/sandbox.py``.
 
 from __future__ import annotations
 
+import json
+
 import logging
 import shlex
 from pathlib import Path
@@ -25,6 +27,8 @@ from torchtitan.experiments.rl.harness.sandbox.base import (
     _getenv,
     ExecResult,
     FileContent,
+    SandboxIssue,
+    SandboxIssueTracker,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,7 +186,7 @@ class DaytonaSandbox:
       ``DAYTONA_API_URL`` / ``DAYTONA_TARGET`` -- override cloud endpoint/region.
       ``TT_DAYTONA_CPU``                   -- vCPUs per sandbox (default 2).
       ``TT_DAYTONA_MEM_GB``                -- memory GiB per sandbox (default 4).
-      ``TT_DAYTONA_DISK_GB``               -- disk GiB per sandbox (default 10).
+      ``TT_DAYTONA_DISK_GB``               -- disk GiB per sandbox (default 6).
       ``TT_DAYTONA_CREATE_TIMEOUT``        -- snapshot-build/boot wait (default 900s).
       ``TT_DAYTONA_EXEC_TIMEOUT_MIN``       -- SDK request timeout floor; does not
                                                extend the command runtime limit.
@@ -194,14 +198,87 @@ class DaytonaSandbox:
     api_url_env = ("DAYTONA_API_URL",)
     target_env = ("DAYTONA_TARGET",)
 
-    def __init__(self, image: str, *, timeout: int | None = None, **_ignored) -> None:
+    def __init__(
+        self,
+        image: str,
+        *,
+        timeout: int | None = None,
+        disk_gb: int | None = None,
+        issue_tracker: SandboxIssueTracker | None = None,
+        **_ignored,
+    ) -> None:
+        if disk_gb is not None and (
+            isinstance(disk_gb, bool) or not isinstance(disk_gb, int) or disk_gb <= 0
+        ):
+            raise ValueError(
+                f"daytona disk_gb must be a positive integer, got {disk_gb!r}"
+            )
         self.image = image
         self.timeout = timeout
+        self.disk_gb = disk_gb
+        self.allocated_disk_gb: int | None = None
+        self.issue_tracker = issue_tracker or SandboxIssueTracker()
         # Daytona is optional and imported lazily, so its SDK types are not
         # available for static annotations in this module.
         self._client: Any = None
         self._sb: Any = None
         self.sandbox_id = ""
+
+    def _record_issue(
+        self,
+        kind: str,
+        *,
+        phase: str,
+        error: BaseException | str,
+        recovered: bool = False,
+        session_id: str = "",
+        command_id: str = "",
+        attempt: int | None = None,
+        max_attempts: int | None = None,
+        exit_code: int | None = None,
+        emit_log: bool = True,
+    ) -> None:
+        message = " ".join(str(error).split())[:1000]
+        error_type = type(error).__name__ if isinstance(error, BaseException) else ""
+        issue = SandboxIssue(
+            provider="daytona",
+            kind=kind,
+            phase=phase,
+            recovered=recovered,
+            error_type=error_type,
+            message=message,
+            sandbox_id=self.sandbox_id,
+            session_id=session_id,
+            command_id=command_id,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            exit_code=exit_code,
+        )
+        self.issue_tracker.record(issue)
+        if not emit_log:
+            return
+        context = self.issue_tracker.context
+        payload = {
+            "event": "sandbox_issue",
+            "provider": issue.provider,
+            "kind": issue.kind,
+            "phase": issue.phase,
+            "recovered": issue.recovered,
+            "instance_id": context.instance_id,
+            "group_id": context.group_id,
+            "rollout_id": context.rollout_id,
+            "sandbox_id": issue.sandbox_id,
+            "image": self.image,
+            "disk_gb": self.allocated_disk_gb or self.disk_gb,
+            "session_id": issue.session_id,
+            "command_id": issue.command_id,
+            "attempt": issue.attempt,
+            "max_attempts": issue.max_attempts,
+            "exit_code": issue.exit_code,
+            "error_type": issue.error_type,
+            "message": issue.message,
+        }
+        logger.warning("[sandbox_issue] %s", json.dumps(payload, sort_keys=True))
 
     @property
     def daytona(self):
@@ -221,7 +298,12 @@ class DaytonaSandbox:
         )
         cpu = int(_getenv("TT_DAYTONA_CPU", default="2"))
         mem = int(_getenv("TT_DAYTONA_MEM_GB", default="4"))
-        disk = int(_getenv("TT_DAYTONA_DISK_GB", default="10"))
+        disk = (
+            self.disk_gb
+            if self.disk_gb is not None
+            else int(_getenv("TT_DAYTONA_DISK_GB", default="6"))
+        )
+        self.allocated_disk_gb = disk
         create_timeout = float(_getenv("TT_DAYTONA_CREATE_TIMEOUT", default="900"))
         # Cloud-side TTL so an orphan (left by a SIGKILL'd run that never reached
         # __aexit__, e.g. MAST preemption) self-reaps: once it goes idle it
@@ -255,14 +337,17 @@ class DaytonaSandbox:
                     self._sb = await self._client.create(params, timeout=create_timeout)
                 break
             except Exception as e:
+                terminal = attempt >= retries
+                self._record_issue(
+                    "create_failed" if terminal else "create_retry",
+                    phase="create",
+                    error=e,
+                    recovered=not terminal,
+                    attempt=attempt + 1,
+                    max_attempts=retries + 1,
+                )
                 if attempt >= retries:
                     raise
-                logger.warning(
-                    "daytona create failed (attempt %d/%d): %s",
-                    attempt + 1,
-                    retries + 1,
-                    e,
-                )
                 await asyncio.sleep(backoff * (0.5 + random.random()))
                 backoff = min(backoff * 2, 60.0)
         self.sandbox_id = self._sb.id
@@ -275,7 +360,7 @@ class DaytonaSandbox:
             if self._sb is not None:
                 await self._client.delete(self._sb)
         except Exception as e:
-            logger.warning("daytona delete %s failed: %s", self.sandbox_id[:8], e)
+            self._record_issue("delete_failed", phase="delete", error=e)
 
     async def exec(
         self,
@@ -301,14 +386,37 @@ class DaytonaSandbox:
         # The original command remains one opaque `bash -c` argument even when it
         # contains quotes or newlines.
         full = _build_exec_command(cmd, user=user, env=env, timeout=timeout)
-        rc, out = await self._session_exec(
-            full,
-            command_timeout=timeout,
-            request_timeout=request_timeout,
-        )
+        num_issues_before = self.issue_tracker.num_events
+        try:
+            rc, out = await self._session_exec(
+                full,
+                command_timeout=timeout,
+                request_timeout=request_timeout,
+            )
+        except Exception as e:
+            if self.issue_tracker.num_events == num_issues_before:
+                self._record_issue("exec_failed", phase="exec", error=e)
+            raise
+        out_lower = out.lower()
+        if rc != 0 and (
+            "no space left on device" in out_lower or "errno 28" in out_lower
+        ):
+            self._record_issue(
+                "command_disk_exhausted",
+                phase="command",
+                error=f"command exited {rc}: {out[:400]}",
+                exit_code=rc,
+            )
         # Match Open-Instruct's backend convention: GNU timeout reserves 124 for
         # the synthetic timeout diagnostic. Forced SIGKILL remains raw 137.
         err = f"Command timed out after {timeout}s." if rc == 124 else ""
+        if rc == 124:
+            self._record_issue(
+                "command_timeout",
+                phase="command",
+                error=err,
+                exit_code=rc,
+            )
         if check and rc != 0:
             detail = out + (f"\n{err}" if out and err else err)
             raise RuntimeError(
@@ -326,11 +434,11 @@ class DaytonaSandbox:
                 timeout=_SESSION_RPC_TIMEOUT_SEC,
             )
         except Exception as e:
-            logger.warning(
-                "daytona session cleanup failed (session=%s, reason=%s): %s",
-                sid[:8],
-                reason,
-                e,
+            self._record_issue(
+                "session_cleanup_failed",
+                phase="session_cleanup",
+                error=f"{reason}: {e}",
+                session_id=sid,
             )
 
     async def _recover_session_command_id(self, sid: str, full: str) -> str:
@@ -345,7 +453,15 @@ class DaytonaSandbox:
                     self._sb.process.get_session(sid),
                     timeout=_SESSION_RPC_TIMEOUT_SEC,
                 )
-            except Exception:
+            except Exception as e:
+                self._record_issue(
+                    "command_recovery_query_failed",
+                    phase="execute_recovery",
+                    error=e,
+                    recovered=True,
+                    session_id=sid,
+                    emit_log=False,
+                )
                 continue
             commands = getattr(session, "commands", None) or []
             for command in reversed(commands):
@@ -411,14 +527,31 @@ class DaytonaSandbox:
                     )
                 except Exception:
                     pass
+                # Toolbox has already failed to create its session directory.
+                # Retrying with a fresh UUID cannot free blocks or inodes, and the
+                # Daytona daemon may retain the shell it started before mkdir failed.
+                if "no space left on device" in str(e).lower():
+                    self._record_issue(
+                        "session_disk_exhausted",
+                        phase="session_create",
+                        error=e,
+                        session_id=sid,
+                        attempt=attempt + 1,
+                        max_attempts=retries + 1,
+                    )
+                    raise
+                terminal = attempt >= retries
+                self._record_issue(
+                    "session_create_failed" if terminal else "session_create_retry",
+                    phase="session_create",
+                    error=e,
+                    recovered=not terminal,
+                    session_id=sid,
+                    attempt=attempt + 1,
+                    max_attempts=retries + 1,
+                )
                 if attempt >= retries:
                     raise
-                logger.warning(
-                    "daytona session create failed (attempt %d/%d): %s",
-                    attempt + 1,
-                    retries + 1,
-                    e,
-                )
                 await asyncio.sleep(backoff * (0.5 + random.random()))
                 backoff = min(backoff * 2, 60.0)
 
@@ -430,22 +563,36 @@ class DaytonaSandbox:
                 timeout=request_timeout,
             )
             cid = resp.cmd_id or ""
-        except Exception:
+        except Exception as e:
             cid = await self._recover_session_command_id(sid, full)
             if not cid:
+                self._record_issue(
+                    "execute_response_unconfirmed",
+                    phase="execute_submit",
+                    error=e,
+                    session_id=sid,
+                )
                 await self._delete_exec_session(
                     sid, reason="command submission could not be confirmed"
                 )
                 raise
-            logger.warning(
-                "daytona recovered command after lost execute response "
-                "(session=%s, command=%s)",
-                sid[:8],
-                cid,
+            self._record_issue(
+                "execute_response_recovered",
+                phase="execute_submit",
+                error=e,
+                recovered=True,
+                session_id=sid,
+                command_id=cid,
             )
         if not cid:
             cid = await self._recover_session_command_id(sid, full)
             if not cid:
+                self._record_issue(
+                    "execute_missing_command_id",
+                    phase="execute_submit",
+                    error="execute response contained no command id",
+                    session_id=sid,
+                )
                 await self._delete_exec_session(
                     sid, reason="execute response contained no command id"
                 )
@@ -476,7 +623,16 @@ class DaytonaSandbox:
                     self._sb.process.get_session_command(sid, cid),
                     timeout=min(float(_SESSION_RPC_TIMEOUT_SEC), remaining),
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                self._record_issue(
+                    "poll_transient",
+                    phase="command_poll",
+                    error=e,
+                    recovered=True,
+                    session_id=sid,
+                    command_id=cid,
+                    emit_log=False,
+                )
                 return None
             except Exception as e:
                 msg = str(e)
@@ -488,12 +644,18 @@ class DaytonaSandbox:
                 # running so the poll loop retries (bounded by the outer deadline,
                 # which fires a clean TimeoutError if the sandbox is truly gone).
                 low = msg.lower()
-                if (
-                    "convert exit code" in low
-                    or "disconnect" in low
-                    or "connection" in low
-                    or "timeout" in low
-                ):
+                if "convert exit code" in low:
+                    return None
+                if "disconnect" in low or "connection" in low or "timeout" in low:
+                    self._record_issue(
+                        "poll_transient",
+                        phase="command_poll",
+                        error=e,
+                        recovered=True,
+                        session_id=sid,
+                        command_id=cid,
+                        emit_log=False,
+                    )
                     return None
                 raise
 
@@ -501,6 +663,13 @@ class DaytonaSandbox:
         polls = 0
         while cmd is None or cmd.exit_code is None:
             if loop.time() >= deadline:
+                self._record_issue(
+                    "command_status_timeout",
+                    phase="command_poll",
+                    error="command status remained unavailable until the deadline",
+                    session_id=sid,
+                    command_id=cid,
+                )
                 raise TimeoutError(
                     "daytona exec status unavailable after "
                     f"{command_timeout + _COMMAND_KILL_GRACE_SEC + _SESSION_POLL_GRACE_SEC:.0f}s "
@@ -510,10 +679,20 @@ class DaytonaSandbox:
             cmd = await poll()
             polls += 1
 
-        logs = await asyncio.wait_for(
-            self._sb.process.get_session_command_logs(sid, cid),
-            timeout=_SESSION_RPC_TIMEOUT_SEC,
-        )
+        try:
+            logs = await asyncio.wait_for(
+                self._sb.process.get_session_command_logs(sid, cid),
+                timeout=_SESSION_RPC_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            self._record_issue(
+                "command_logs_failed",
+                phase="command_logs",
+                error=e,
+                session_id=sid,
+                command_id=cid,
+            )
+            raise
         out = getattr(logs, "stdout", "") or ""
         err = getattr(logs, "stderr", "") or ""
         exit_code = int(cmd.exit_code)
@@ -533,7 +712,11 @@ class DaytonaSandbox:
         else:
             data = str(content).encode("utf-8")
         # fs.upload_file writes as root; chown afterwards for non-root owners.
-        await self._sb.fs.upload_file(data, sandbox_path)
+        try:
+            await self._sb.fs.upload_file(data, sandbox_path)
+        except Exception as e:
+            self._record_issue("file_upload_failed", phase="write_file", error=e)
+            raise
         if user and user != "root":
             await self.exec(
                 f"chown {shlex.quote(user)}:{shlex.quote(user)} {shlex.quote(sandbox_path)}",

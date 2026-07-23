@@ -7,12 +7,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
 
 from torchtitan.experiments.rl.examples.tmax import vanillux_loop
-from torchtitan.experiments.rl.examples.tmax.rollouter import _finish_reason_metrics
+from torchtitan.experiments.rl.examples.tmax.data import TMaxSample
+from torchtitan.experiments.rl.examples.tmax.rollouter import (
+    _finish_reason_metrics,
+    _sandbox_issue_metrics,
+    _SandboxRolloutDiagnostics,
+    TMaxRollouter,
+)
+from torchtitan.experiments.rl.harness import SandboxIssue
 from torchtitan.experiments.rl.observability.metrics import Mean
 
 
@@ -120,3 +128,100 @@ def test_finish_reason_metrics_are_exhaustive_fractions() -> None:
         "rollout/finish_error_frac": 0.2,
     }
     assert sum(fractions.values()) == pytest.approx(1.0)
+
+
+def test_sandbox_issue_metrics_count_events_and_affected_rollouts() -> None:
+    metrics = _sandbox_issue_metrics(
+        [
+            {},
+            {"command_disk_exhausted": 1},
+            {
+                "execute_response_recovered": 1,
+                "poll_transient": 1,
+            },
+            {},
+        ]
+    )
+    values = {}
+    for metric in metrics:
+        assert isinstance(metric.value, Mean)
+        values[metric.key] = metric.value.value / metric.value.count
+
+    assert values == {
+        "rollout/sandbox_issue_frac": 0.5,
+        "rollout/sandbox_issue_events_mean": 0.75,
+        "rollout/sandbox_disk_full_frac": 0.25,
+        "rollout/sandbox_disk_full_events_mean": 0.25,
+        "rollout/sandbox_transport_issue_frac": 0.25,
+        "rollout/sandbox_transport_issue_events_mean": 0.5,
+        "rollout/sandbox_provision_issue_frac": 0.0,
+        "rollout/sandbox_timeout_frac": 0.0,
+    }
+
+
+def test_rollout_dump_writes_machine_readable_sandbox_issues(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("SWE_ROLLOUT_DUMP_DIR", str(tmp_path))
+    sample = TMaxSample(
+        instance_id="task-123",
+        image="example/image",
+        workdir="/workspace",
+        problem_statement="test",
+    )
+    issue = SandboxIssue(
+        provider="daytona",
+        kind="session_disk_exhausted",
+        phase="session_create",
+        recovered=False,
+        error_type="RuntimeError",
+        message="no space left on device",
+        sandbox_id="sandbox-abc",
+        session_id="session-def",
+    )
+    diagnostics = _SandboxRolloutDiagnostics(
+        sandbox_id="sandbox-abc",
+        disk_gb=6,
+        issue_counts={"session_disk_exhausted": 1},
+        issues=(issue,),
+        num_dropped_details=0,
+    )
+    rollouter = object.__new__(TMaxRollouter)
+
+    rollouter._maybe_dump_trace(
+        rollout_id="group=1/rollout=2",
+        sample=sample,
+        captured=[],
+        renderer=object(),
+        status="completed",
+        reward=0.0,
+        submitted=False,
+        fmt_errors=0,
+        error_msg="",
+        finish_reason="hit_max_turns",
+        sandbox_diagnostics=diagnostics,
+    )
+
+    trace = (tmp_path / "group=1_rollout=2.txt").read_text()
+    assert "finish_reason  : hit_max_turns" in trace
+    assert "sandbox_id     : sandbox-abc" in trace
+    payload = json.loads((tmp_path / "group=1_rollout=2.sandbox.json").read_text())
+    assert payload["instance_id"] == "task-123"
+    assert payload["disk_gb"] == 6
+    assert payload["issue_counts"] == {"session_disk_exhausted": 1}
+    assert payload["issues"] == [
+        {
+            "attempt": None,
+            "command_id": "",
+            "error_type": "RuntimeError",
+            "exit_code": None,
+            "kind": "session_disk_exhausted",
+            "max_attempts": None,
+            "message": "no space left on device",
+            "phase": "session_create",
+            "provider": "daytona",
+            "recovered": False,
+            "sandbox_id": "sandbox-abc",
+            "session_id": "session-def",
+        }
+    ]

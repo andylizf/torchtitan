@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import shutil
@@ -16,11 +17,19 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
-from torchtitan.experiments.rl.harness.sandbox import daytona as daytona_backend
+from torchtitan.experiments.rl.examples.tmax.vanillux_loop import _run_bash
+from torchtitan.experiments.rl.harness.agents import claude_code as agent_backend
+from torchtitan.experiments.rl.harness.sandbox import (
+    daytona as daytona_backend,
+    SandboxIssue,
+    SandboxIssueTracker,
+    SandboxLogContext,
+)
 from torchtitan.experiments.rl.harness.sandbox.daytona import (
     _build_exec_command,
     DaytonaSandbox,
@@ -58,6 +67,13 @@ def _sandbox_with_process(process: SimpleNamespace) -> DaytonaSandbox:
     sandbox = DaytonaSandbox("example/image")
     sandbox._sb = SimpleNamespace(process=process)
     return sandbox
+
+
+def test_disk_override_is_validated() -> None:
+    assert DaytonaSandbox("example/image", disk_gb=20).disk_gb == 20
+    for invalid_disk_gb in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="disk_gb must be a positive integer"):
+            DaytonaSandbox("example/image", disk_gb=cast(int, invalid_disk_gb))
 
 
 def test_build_exec_command_preserves_complex_command() -> None:
@@ -205,6 +221,183 @@ def test_lost_execute_response_recovers_without_replay(
     process.execute_session_command.assert_awaited_once()
     assert process.execute_session_command.await_args.kwargs["timeout"] == 30
     process.delete_session.assert_not_awaited()
+    assert sandbox.issue_tracker.counts == {"execute_response_recovered": 1}
+    issue = sandbox.issue_tracker.issues[0]
+    assert issue.recovered
+    assert issue.session_id
+    assert issue.command_id == "recovered-id"
+
+
+def test_session_create_enospc_is_not_retried(
+    caplog: pytest.LogCaptureFixture,
+    fake_daytona: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_DAYTONA_SESSION_CREATE_RETRIES", "5")
+    process = _process()
+    process.create_session.side_effect = RuntimeError("no space left on device")
+    tracker = SandboxIssueTracker(
+        SandboxLogContext(
+            instance_id="task-123",
+            group_id=7,
+            rollout_id=11,
+        )
+    )
+    sandbox = DaytonaSandbox("example/image", disk_gb=20, issue_tracker=tracker)
+    sandbox._sb = SimpleNamespace(process=process)
+    sandbox.sandbox_id = "sandbox-id"
+
+    with pytest.raises(RuntimeError, match="no space left on device"):
+        asyncio.run(
+            sandbox._session_exec(
+                "echo once",
+                command_timeout=5,
+                request_timeout=30,
+            )
+        )
+
+    process.create_session.assert_awaited_once()
+    process.delete_session.assert_awaited_once()
+    assert tracker.counts == {"session_disk_exhausted": 1}
+    issue = tracker.issues[0]
+    assert issue.phase == "session_create"
+    assert issue.sandbox_id == "sandbox-id"
+    assert issue.session_id
+    assert issue.attempt == 1
+    assert issue.max_attempts == 6
+    payload = json.loads(caplog.records[-1].getMessage().split("] ", 1)[1])
+    assert payload == {
+        "attempt": 1,
+        "command_id": "",
+        "disk_gb": 20,
+        "error_type": "RuntimeError",
+        "event": "sandbox_issue",
+        "exit_code": None,
+        "group_id": 7,
+        "image": "example/image",
+        "instance_id": "task-123",
+        "kind": "session_disk_exhausted",
+        "max_attempts": 6,
+        "message": "no space left on device",
+        "phase": "session_create",
+        "provider": "daytona",
+        "recovered": False,
+        "rollout_id": 11,
+        "sandbox_id": "sandbox-id",
+        "session_id": issue.session_id,
+    }
+
+
+def test_nonzero_command_enospc_is_recorded() -> None:
+    sandbox = DaytonaSandbox("example/image", disk_gb=20)
+    sandbox._session_exec = AsyncMock(
+        return_value=(1, "OSError: [Errno 28] No space left on device")
+    )
+
+    result = asyncio.run(sandbox.exec("pip install package", timeout=5))
+
+    assert result == (1, "OSError: [Errno 28] No space left on device", "")
+    assert sandbox.issue_tracker.counts == {"command_disk_exhausted": 1}
+    issue = sandbox.issue_tracker.issues[0]
+    assert issue.phase == "command"
+    assert issue.exit_code == 1
+
+
+def test_successful_command_output_does_not_misclassify_enospc_text() -> None:
+    sandbox = DaytonaSandbox("example/image")
+    sandbox._session_exec = AsyncMock(
+        return_value=(0, "binary contains no space left on device")
+    )
+
+    assert asyncio.run(sandbox.exec("strings binary")) == (
+        0,
+        "binary contains no space left on device",
+        "",
+    )
+    assert sandbox.issue_tracker.counts == {}
+
+
+def test_tracker_keeps_exec_error_swallowed_by_agent_loop() -> None:
+    sandbox = DaytonaSandbox("example/image")
+    sandbox._session_exec = AsyncMock(
+        side_effect=RuntimeError("no space left on device")
+    )
+
+    output, exit_code = asyncio.run(_run_bash(sandbox, "echo ok", timeout=5))
+
+    assert exit_code == 1
+    assert "exec failed: RuntimeError: no space left on device" in output
+    assert sandbox.issue_tracker.counts == {"exec_failed": 1}
+
+
+def test_boot_retries_share_rollout_issue_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = SandboxIssueTracker(
+        SandboxLogContext(instance_id="task-123", group_id=7, rollout_id=11)
+    )
+    received_trackers: list[SandboxIssueTracker] = []
+    num_candidates = 0
+
+    class _Candidate:
+        allocated_disk_gb = 20
+
+        def __init__(
+            self, candidate_tracker: SandboxIssueTracker, *, fail: bool
+        ) -> None:
+            self.issue_tracker = candidate_tracker
+            self.fail = fail
+            self.sandbox_id = "failed-sandbox" if fail else "active-sandbox"
+
+        async def __aenter__(self):
+            if self.fail:
+                self.issue_tracker.record(
+                    SandboxIssue(
+                        provider="daytona",
+                        kind="create_retry",
+                        phase="create",
+                        recovered=True,
+                        error_type="RuntimeError",
+                        message="transient create failure",
+                        attempt=1,
+                        max_attempts=2,
+                    )
+                )
+                raise RuntimeError("transient create failure")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def make_sandbox(image: str, **kwargs):
+        nonlocal num_candidates
+        candidate_tracker = kwargs["issue_tracker"]
+        received_trackers.append(candidate_tracker)
+        candidate = _Candidate(candidate_tracker, fail=num_candidates == 0)
+        num_candidates += 1
+        return candidate
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(agent_backend, "SWE_BOOT_RETRIES", 2)
+    monkeypatch.setattr(agent_backend, "_BOOT_SEM", None)
+    monkeypatch.setattr(agent_backend, "make_sandbox", make_sandbox)
+    monkeypatch.setattr(agent_backend.asyncio, "sleep", no_sleep)
+
+    async def run() -> None:
+        async with agent_backend.boot_agent_sandbox(
+            "example/image",
+            install_claude=False,
+            disk_gb=20,
+            issue_tracker=tracker,
+        ) as sandbox:
+            assert sandbox.sandbox_id == "active-sandbox"
+
+    asyncio.run(run())
+
+    assert received_trackers == [tracker, tracker]
+    assert tracker.counts == {"create_retry": 1}
 
 
 def test_poll_disconnect_does_not_replay_command(fake_daytona: None) -> None:
@@ -227,6 +420,8 @@ def test_poll_disconnect_does_not_replay_command(fake_daytona: None) -> None:
     process.execute_session_command.assert_awaited_once()
     assert process.get_session_command.await_count == 2
     process.delete_session.assert_not_awaited()
+    assert sandbox.issue_tracker.counts == {"poll_transient": 1}
+    assert sandbox.issue_tracker.issues[0].recovered
 
 
 def test_poll_deadline_does_not_delete_a_possibly_successful_session(

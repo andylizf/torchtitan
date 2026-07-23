@@ -38,6 +38,8 @@ from torchtitan.experiments.rl.harness.sandbox import (
     DaytonaSandbox,
     make_sandbox,
     Sandbox,
+    SandboxIssue,
+    SandboxIssueTracker,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,7 +78,11 @@ _BOOT_SEM: asyncio.Semaphore | None = None
 
 @asynccontextmanager
 async def boot_agent_sandbox(
-    image: str, *, install_claude: bool = True
+    image: str,
+    *,
+    install_claude: bool = True,
+    disk_gb: int | None = None,
+    issue_tracker: SandboxIssueTracker | None = None,
 ) -> AsyncIterator[Sandbox]:
     """Boot a fresh sandbox, optionally installing the Claude Code toolchain.
 
@@ -93,10 +99,12 @@ async def boot_agent_sandbox(
     if _BOOT_SEM is None:
         _BOOT_SEM = asyncio.Semaphore(SWE_BOOT_CONCURRENCY)
 
+    tracker = issue_tracker or SandboxIssueTracker()
     sb = None
     last_err: Exception | None = None
     for attempt in range(SWE_BOOT_RETRIES):
-        cand = make_sandbox(image)
+        cand = make_sandbox(image, disk_gb=disk_gb, issue_tracker=tracker)
+        num_issues_before = tracker.num_events
         try:
             async with _BOOT_SEM:
                 await cand.__aenter__()
@@ -110,8 +118,34 @@ async def boot_agent_sandbox(
             break
         except Exception as e:
             last_err = e
+            if tracker.num_events == num_issues_before:
+                tracker.record(
+                    SandboxIssue(
+                        provider="harness",
+                        kind=(
+                            "provision_failed"
+                            if attempt + 1 >= SWE_BOOT_RETRIES
+                            else "provision_retry"
+                        ),
+                        phase="provision",
+                        recovered=attempt + 1 < SWE_BOOT_RETRIES,
+                        error_type=type(e).__name__,
+                        message=" ".join(str(e).split())[:1000],
+                        sandbox_id=cand.sandbox_id,
+                        attempt=attempt + 1,
+                        max_attempts=SWE_BOOT_RETRIES,
+                    )
+                )
+            context = tracker.context
             logger.warning(
-                "[claude_code] provision attempt %d/%d failed: %s: %s",
+                "[claude_code] provision failed "
+                "instance_id=%s group_id=%s rollout_id=%s image=%s "
+                "sandbox_id=%s attempt=%d/%d: %s: %s",
+                context.instance_id,
+                context.group_id,
+                context.rollout_id,
+                image,
+                cand.sandbox_id,
                 attempt + 1,
                 SWE_BOOT_RETRIES,
                 type(e).__name__,

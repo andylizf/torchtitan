@@ -173,16 +173,44 @@ held-out pass, set it to `32`; validation then runs at the start, end, and every
 controller-local rollouter rather than the worker gates, so a periodic pass may
 temporarily create up to 32 sandboxes in addition to the training concurrency.
 
+The launcher defaults every TMax sandbox to a 6 GiB root disk. A known heavier
+task can override this by adding a positive integer to its JSONL metadata, for
+example `"daytona_disk_gb": 20`. Tasks without that field use
+`TT_DAYTONA_DISK_GB`. This changes only newly created sandboxes.
+
+Sandbox failures emit immediate `[sandbox_issue]` JSON records in the controller
+log. Each record includes the task instance, group and sibling rollout IDs, full
+sandbox/session/command IDs, image, effective disk allocation, retry attempt,
+whether recovery succeeded, and a bounded error message. Affected rollouts also
+write `group=<G>_rollout=<R>.sandbox.json` beside the human-readable rollout
+trace. Use these W&B metrics for aggregate health:
+
+```text
+rollout/sandbox_issue_frac
+rollout/sandbox_issue_events_mean
+rollout/sandbox_disk_full_frac
+rollout/sandbox_disk_full_events_mean
+rollout/sandbox_transport_issue_frac
+rollout/sandbox_transport_issue_events_mean
+rollout/sandbox_provision_issue_frac
+rollout/sandbox_timeout_frac
+```
+
+The disk metrics distinguish a Daytona session-creation ENOSPC from an in-sandbox
+command that exits nonzero with `Errno 28`. A successful command whose output
+merely contains the same text is not classified as disk exhaustion.
+
 ## 5. Trying concurrency 1024
 
 As of 2026-07-21, the shared Daytona account limits are 5000 vCPU, 20000 GiB
 memory, and 25000 GiB storage. Each TMax sandbox requests 2 vCPU, 4 GiB memory,
-and 5 GiB storage.
+and 6 GiB storage. Raise disk-heavy tasks through `metadata.daytona_disk_gb`
+rather than increasing every sandbox allocation.
 
 | Concurrency | vCPU | Memory | Storage |
 | ---: | ---: | ---: | ---: |
-| 512 | 1024 | 2048 GiB | 2560 GiB |
-| 1024 | 2048 | 4096 GiB | 5120 GiB |
+| 512 | 1024 | 2048 GiB | 3072 GiB |
+| 1024 | 2048 | 4096 GiB | 6144 GiB |
 
 1024 fits the account limits in isolation, but the account is shared. Check live
 Daytona usage immediately before launch. Change only:

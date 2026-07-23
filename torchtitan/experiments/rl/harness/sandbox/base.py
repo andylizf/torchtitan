@@ -15,12 +15,87 @@ The backend lives in a sibling module (``daytona.py``).
 from __future__ import annotations
 
 import os
+
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
 ExecResult = tuple[int, str, str]  # (exit_code, stdout, stderr)
 FileContent = str | bytes | Path
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxLogContext:
+    """Stable rollout identity attached to sandbox diagnostics."""
+
+    instance_id: str = ""
+    group_id: int | None = None
+    rollout_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxIssue:
+    """One provider-side problem observed while operating a sandbox."""
+
+    provider: str
+    kind: str
+    phase: str
+    recovered: bool
+    error_type: str
+    message: str
+    sandbox_id: str = ""
+    session_id: str = ""
+    command_id: str = ""
+    attempt: int | None = None
+    max_attempts: int | None = None
+    exit_code: int | None = None
+
+
+class SandboxIssueTracker:
+    """Per-rollout issue counts plus bounded event details.
+
+    The tracker is owned by the rollout and shared across sandbox boot retries, so
+    diagnostics from failed candidates are not lost before a sandbox is yielded.
+    """
+
+    def __init__(
+        self,
+        context: SandboxLogContext | None = None,
+        *,
+        max_details: int = 256,
+    ) -> None:
+        if max_details <= 0:
+            raise ValueError(f"max_details must be positive, got {max_details}")
+        self.context = context or SandboxLogContext()
+        self._max_details = max_details
+        self._issues: list[SandboxIssue] = []
+        self._counts: Counter[str] = Counter()
+        self._num_dropped_details = 0
+
+    def record(self, issue: SandboxIssue) -> None:
+        self._counts[issue.kind] += 1
+        if len(self._issues) < self._max_details:
+            self._issues.append(issue)
+        else:
+            self._num_dropped_details += 1
+
+    @property
+    def issues(self) -> tuple[SandboxIssue, ...]:
+        return tuple(self._issues)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return dict(self._counts)
+
+    @property
+    def num_events(self) -> int:
+        return sum(self._counts.values())
+
+    @property
+    def num_dropped_details(self) -> int:
+        return self._num_dropped_details
 
 
 @runtime_checkable
@@ -32,6 +107,8 @@ class Sandbox(Protocol):
     """
 
     sandbox_id: str
+    allocated_disk_gb: int | None
+    issue_tracker: SandboxIssueTracker
 
     async def __aenter__(self) -> Sandbox:
         ...
