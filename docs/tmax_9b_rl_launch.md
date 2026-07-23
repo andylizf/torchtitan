@@ -4,9 +4,9 @@ This runbook launches the Qwen3.5-9B TMax terminal-agent RL recipe from
 `yichuan/qwen35-port-cotrain`, monitors the MAST job, and syncs its offline W&B
 run to `meta.wandb.io`.
 
-The command below is the current known-good baseline: DPPO, fp32 master
-parameters and AdamW states, the work-conserving async rollout scheduler, 512
-active rollouts, and no held-out validation.
+The command below is the current production candidate: DPPO, fp32 master
+parameters and AdamW states, MSL-style sliding-prefix Windowed FIFO, 512 active
+rollouts, and no inline held-out validation.
 
 ## 1. Prerequisites and shell setup
 
@@ -60,20 +60,22 @@ cd /home/yichuan/torchtitan-claude-code-harness-cotrain
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate rlmast
 
-RUN_TAG="q35_9b_tmax_asyncgate_dppo512_$(date +%Y%m%d_%H%M%S)"
+RUN_TAG="q35_9b_tmax_w20_dppo512_$(date +%Y%m%d_%H%M%S)"
 DUMP_DIR="/mnt/torchtrain_datasets/tree/yichuan/mast_runs/${RUN_TAG}"
 
 SWE_GEN_BACKEND=torchtitan_wrapper \
 SWE_LOSS=dppo \
-SWE_TIME_BUDGET_SEC=3600 \
+SWE_TIME_BUDGET_SEC=1200 \
 SWE_VAL_SAMPLES=0 \
 SWE_DISABLE_SHUFFLE=0 \
-SWE_SELECTION_WINDOW_GROUPS=12 \
+SWE_SELECTION_WINDOW_GROUPS=20 \
 SWE_MAX_BYPASS_GROUPS=off \
 SWE_STRICT_FIFO=0 \
 SWE_ROLLOUT_CONCURRENCY=512 \
-SWE_NUM_ROLLOUT_WORKERS=8 \
-TT_DAYTONA_CREATE_CONCURRENCY=16 \
+SWE_NUM_ROLLOUT_WORKERS=16 \
+SWE_MAX_NUM_SEQS=32 \
+TT_DAYTONA_DISK_GB=10 \
+TT_DAYTONA_CREATE_CONCURRENCY=8 \
 TT_DAYTONA_HEARTBEAT_SEC=180 \
 TT_DAYTONA_RPC_RETRIES=2 \
 SWE_NUM_GENERATORS=6 \
@@ -108,7 +110,8 @@ The important resolved values are:
 | Training batch | 8 retained prompt groups per step, 32 siblings per group |
 | Zero-std groups | all-failed and all-solved groups are dropped from gradients |
 | Async window | off-policy 4, therefore 40 active groups and at most 1280 schedulable siblings |
-| Rollout pool | 8 worker processes; global concurrency 512 becomes 64 sibling slots per worker |
+| Rollout pool | 16 worker processes; global concurrency 512 becomes 32 sibling slots per worker |
+| Generator batch ceiling | `max_num_seqs=32` per engine; this is a ceiling, not reserved KV capacity |
 | Generators | 6 generator roles, each exposing 8 TP-1 engines |
 | Checkpoints | every 20 optimizer steps, plus final model export |
 | Validation | disabled by `SWE_VAL_SAMPLES=0` |
@@ -118,7 +121,7 @@ immediately releases one slot; the next low-ID waiting sibling can start without
 waiting for the previous group to finish all 32 siblings. Group aggregation still
 waits for all siblings before classifying the group.
 
-`TT_DAYTONA_CREATE_CONCURRENCY=16` is per rollout worker, not global. With eight
+`TT_DAYTONA_CREATE_CONCURRENCY=8` is per rollout worker, not global. With 16
 workers the nominal create ceiling is 128 concurrent create calls. It limits
 sandbox boot bursts; `SWE_ROLLOUT_CONCURRENCY` limits active rollouts.
 
@@ -128,8 +131,8 @@ naming. It does not mean the selected loss is GRPO. Confirm the W&B config under
 
 ## 4. Shuffle, FIFO, and validation variants
 
-The baseline training run uses shuffled prompts and the work-conserving
-take-any buffer:
+The historical baseline uses shuffled prompts and the work-conserving take-any
+buffer:
 
 ```text
 SWE_DISABLE_SHUFFLE=0
@@ -138,20 +141,24 @@ SWE_MAX_BYPASS_GROUPS=off
 SWE_STRICT_FIFO=0
 ```
 
-For the first MSL-style Windowed FIFO trial, keep every other setting unchanged and
-set:
+The recommended MSL-style Windowed FIFO candidate keeps every other setting
+unchanged and sets:
 
 ```text
-SWE_SELECTION_WINDOW_GROUPS=12
+SWE_SELECTION_WINDOW_GROUPS=20
 SWE_MAX_BYPASS_GROUPS=off
 SWE_STRICT_FIFO=0
 ```
 
-Each selection scans the first 12 entries in the current active admission map.
-Removing any selected group shifts the next entry into that prefix, so `W=12`
-limits instantaneous look-ahead but not lifetime bypass count. Use `W=16` only
-as a follow-up if window-block time is excessive, and monitor head bypass. The
-local `mast_rl/submit_swe_tmax_9b.sh` entry point defaults to `W=12` and
+Each selection scans the first 20 entries in the current active admission map.
+Removing any selected group shifts the next entry into that prefix, so `W=20`
+limits instantaneous look-ahead but not lifetime bypass count. A replay of the
+first 20 steps of the live W16 trace reproduced all 308 choices and estimated
+that W20 would reduce window-blocked time by 59% while still changing 41% of
+selection positions relative to take-any. W24 reduced blocking further but
+changed only 11% of positions, making it too close to greedy selection for the
+next trial. Replay is a scheduler comparison, not evidence of reward gain; use
+fixed-task validation for that. The local launcher defaults to `W=20` and
 `max_bypass_groups=off`.
 
 `SWE_MAX_BYPASS_GROUPS=32` enables an experimental MSL-inspired global stall at
@@ -175,7 +182,7 @@ held-out pass, set it to `32`; validation then runs at the start, end, and every
 controller-local rollouter rather than the worker gates, so a periodic pass may
 temporarily create up to 32 sandboxes in addition to the training concurrency.
 
-The launcher defaults every TMax sandbox to a 6 GiB root disk. A known heavier
+The launcher defaults every TMax sandbox to a 10 GiB root disk. A known heavier
 task can override this by adding a positive integer to its JSONL metadata, for
 example `"daytona_disk_gb": 20`. Tasks without that field use
 `TT_DAYTONA_DISK_GB`. This changes only newly created sandboxes.
@@ -217,23 +224,28 @@ merely contains the same text is not classified as disk exhaustion.
 
 As of 2026-07-21, the shared Daytona account limits are 5000 vCPU, 20000 GiB
 memory, and 25000 GiB storage. Each TMax sandbox requests 2 vCPU, 4 GiB memory,
-and 6 GiB storage. Raise disk-heavy tasks through `metadata.daytona_disk_gb`
+and 10 GiB storage. Raise disk-heavy tasks through `metadata.daytona_disk_gb`
 rather than increasing every sandbox allocation.
 
 | Concurrency | vCPU | Memory | Storage |
 | ---: | ---: | ---: | ---: |
-| 512 | 1024 | 2048 GiB | 3072 GiB |
-| 1024 | 2048 | 4096 GiB | 6144 GiB |
+| 512 | 1024 | 2048 GiB | 5120 GiB |
+| 1024 | 2048 | 4096 GiB | 10240 GiB |
 
 1024 fits the account limits in isolation, but the account is shared. Check live
-Daytona usage immediately before launch. Change only:
+Daytona usage immediately before launch. The 16-worker production split cannot
+use concurrency 1024 with the default 40-group active cap: keeping every worker
+gate supplied would require 48 active groups. For a controlled 1024 comparison,
+change these values together:
 
 ```text
 SWE_ROLLOUT_CONCURRENCY=1024
+SWE_NUM_ROLLOUT_WORKERS=8
+TT_DAYTONA_CREATE_CONCURRENCY=16
 ```
 
-Keep `TT_DAYTONA_CREATE_CONCURRENCY=16` for the first comparison. With eight
-workers, 1024 means 128 sibling slots per worker. The recipe automatically starts
+With eight workers, 1024 means 128 sibling slots per worker and the nominal
+sandbox-create ceiling remains 128. The recipe automatically starts
 all 40 active groups at this concurrency, leaving one queued 32-sibling group per
 worker to refill completed slots; do not force `SWE_INITIAL_ACTIVE_GROUPS=32`.
 Concurrency above 1280 cannot do useful work with the default 40-group active
@@ -241,6 +253,7 @@ window. With eight workers, the largest concurrency that also leaves at least
 one queued sibling behind every gate is 1272. The launcher rejects worker and
 concurrency combinations whose even gate split would need more than the active
 group window; reduce either setting or increase `SWE_MAX_ACTIVE_GROUPS`.
+To retain 16 rollout workers, use concurrency 1008 (63 slots per worker) instead.
 
 Do not assume 1024 is faster. Compare Daytona create failures/rate limits,
 generator inflight and queue-time metrics, rollout-worker CPU load, and

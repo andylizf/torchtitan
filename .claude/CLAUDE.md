@@ -42,18 +42,20 @@ when sizing TMax runs. The observed live usage when these limits were recorded
 was 568 vCPU, 1136 GiB memory, and 1420 GiB storage; live usage is shared and
 must be checked again before increasing concurrency.
 
-The 9B TMax launcher currently allocates 2 vCPU, 4 GiB memory, and 6 GiB storage
+The 9B TMax launcher currently allocates 2 vCPU, 4 GiB memory, and 10 GiB storage
 per Daytona sandbox. Ignoring other jobs, the account-level sandbox ceiling is
-therefore `min(5000/2, 20000/4, 25000/6) = 2500`. For reference,
-`SWE_ROLLOUT_CONCURRENCY=1024` requests 2048 vCPU, 4096 GiB memory, and 6144 GiB
+therefore `min(5000/2, 20000/4, 25000/10) = 2500`. For reference,
+`SWE_ROLLOUT_CONCURRENCY=1024` requests 2048 vCPU, 4096 GiB memory, and 10240 GiB
 storage, so it fits the account limits. This does not guarantee a speedup: check
 Daytona failures/rate limits, generator queue and inflight metrics, rollout-worker
 CPU load, and trainer batch-wait time.
 
 The standard 9B recipe has 40 active groups of 32 siblings, or 1280 schedulable
 rollouts. Concurrency above 1280 cannot add useful rollout work without also
-increasing the active-group window. With 8 rollout workers, 1024 concurrency is
-128 sibling slots per worker.
+increasing the active-group window. The production 512-concurrency split uses 16
+rollout workers with 32 sibling slots each. A 1024-concurrency split over those
+same 16 workers would require 48 active groups and is rejected under the default
+40-group cap; use 8 workers for 1024, or concurrency 1008 with 16 workers.
 
 ### Validating Numerics
 Non-computation changes (e.g. activation checkpointing, refactoring) must produce
