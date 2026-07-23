@@ -896,6 +896,8 @@ class Controller(Configurable):
 
         sl.log_trace_instant("validation_start")
         pre_validation = await self._validate_and_log(step=self.start_step)
+        if num_training_steps == 0:
+            return
         sl.log_trace_instant("training_start")
 
         # Two policy version pointers, seeded from the resumed step: the trainer advances at the

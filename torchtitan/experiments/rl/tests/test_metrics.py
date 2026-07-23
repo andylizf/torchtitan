@@ -656,6 +656,12 @@ class TestMetricsProcessorBuild:
         assert cfg.console_log_keys_train == [r"^loss/mean$"]
         assert cfg.console_log_keys_validation == [r"^validation/reward$"]
 
+    def test_default_validation_console_keys_match_rollout_metrics(self) -> None:
+        cfg = m.MetricsProcessor.Config()
+
+        assert "validation_reward/_mean" in cfg.console_log_keys_validation
+        assert "validation_reward/_max" in cfg.console_log_keys_validation
+
     def test_wandb_project_default_titan_rl(self, tmp_path, monkeypatch) -> None:
         """When `WANDB_PROJECT` is unset and `wandb_project` is at the
         default, the build should write `titan_rl` to the env var."""

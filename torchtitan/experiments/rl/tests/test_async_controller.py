@@ -9,6 +9,7 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -163,6 +164,23 @@ def test_validation_group_ids_are_unique_across_passes() -> None:
 
     assert controller._allocate_validation_group_ids(3) == [-1, -2, -3]
     assert controller._allocate_validation_group_ids(2) == [-4, -5]
+
+
+def test_zero_step_run_only_validates_once() -> None:
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller.config = SimpleNamespace(
+            async_loop=SimpleNamespace(num_training_steps=0)
+        )
+        controller.start_step = 0
+        controller._validate_and_log = AsyncMock(return_value={})
+
+        await controller.run()
+
+        controller._validate_and_log.assert_awaited_once_with(step=0)
+        assert not hasattr(controller, "_group_buffer")
+
+    asyncio.run(run())
 
 
 def test_trainer_discards_stale_queued_batch_before_training() -> None:
