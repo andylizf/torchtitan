@@ -34,6 +34,7 @@ from torchtitan.experiments.rl.harness.sandbox import (
 )
 from torchtitan.experiments.rl.harness.sandbox.daytona import (
     _build_exec_command,
+    _build_observable_exec,
     _build_observable_exec_command,
     DaytonaSandbox,
 )
@@ -83,6 +84,7 @@ def _filesystem() -> SimpleNamespace:
     return SimpleNamespace(
         download_file=AsyncMock(side_effect=download_file),
         get_file_info=AsyncMock(return_value=SimpleNamespace(size=2)),
+        upload_file=AsyncMock(return_value=None),
     )
 
 
@@ -437,6 +439,88 @@ def test_observable_command_does_not_duplicate_large_payload(
     assert completed.returncode == 0
     assert Path(status_path).read_text().strip() == "0"
     assert Path(output_path).read_text() == "survived"
+
+
+@pytest.mark.skipif(
+    shutil.which("base64") is None or shutil.which("timeout") is None,
+    reason="base64 and GNU timeout are required",
+)
+def test_uploaded_observable_command_handles_oversized_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(daytona_backend, "_EXEC_RESULT_DIR", str(tmp_path / "result"))
+    command = "printf survived; # " + "x" * 72_000
+    full = _build_exec_command(command, user="root", env=None, timeout=2)
+    command_key = f"uploaded_{os.getpid()}_{time.time_ns()}"
+    observable = _build_observable_exec(full, command_key)
+
+    assert len(observable.inline_command.encode()) + 1 > 131_072
+    assert len(observable.uploaded_command.encode()) < 1_000
+    assert command not in observable.uploaded_command
+    Path(observable.wrapper_path).write_bytes(observable.wrapper)
+    completed = subprocess.run(
+        ["bash", "-c", observable.uploaded_command],
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    assert Path(observable.status_path).read_text().strip() == "0"
+    assert Path(observable.output_path).read_text() == "survived"
+    assert not Path(observable.wrapper_path).exists()
+
+
+def test_session_exec_uploads_oversized_observable(
+    fake_daytona: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_backend, "_EXEC_INLINE_COMMAND_LIMIT_BYTES", 1)
+    process = _process()
+    sandbox = _sandbox_with_process(process)
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "printf once",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (0, "ok")
+    upload = sandbox._sb.fs.upload_file.await_args
+    assert upload is not None
+    wrapper, wrapper_path, upload_timeout = upload.args
+    assert b"printf once" in wrapper
+    assert wrapper_path.startswith("/tmp/.torchtitan_exec_")
+    assert upload_timeout == daytona_backend._SESSION_RPC_TIMEOUT_SEC
+    request = process.execute_session_command.await_args.args[1]
+    assert request.command.endswith(shlex.quote(wrapper_path))
+    assert "printf once" not in request.command
+    assert len(request.command.encode()) < 1_000
+
+
+def test_session_exec_keeps_normal_observable_inline(fake_daytona: None) -> None:
+    process = _process()
+    sandbox = _sandbox_with_process(process)
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "printf once",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (0, "ok")
+    sandbox._sb.fs.upload_file.assert_not_awaited()
+    request = process.execute_session_command.await_args.args[1]
+    assert request.command.startswith("__TORCHTITAN_OBSERVABLE_WRAPPER_B64=")
+    assert len(request.command.encode()) <= (
+        daytona_backend._EXEC_INLINE_COMMAND_LIMIT_BYTES
+    )
 
 
 @pytest.mark.skipif(

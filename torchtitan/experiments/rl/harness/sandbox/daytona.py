@@ -22,6 +22,7 @@ import json
 import logging
 import shlex
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,9 @@ _EXEC_RESULT_DIR = "/dev/shm/.torchtitan_exec"
 _EXEC_RAW_OUTPUT_LIMIT_BYTES = 1_048_576
 _EXEC_OUTPUT_HEAD_BYTES = 10_000
 _EXEC_OUTPUT_TAIL_BYTES = 10_000
+# Daytona ultimately launches this string as one `sh -c` argument. Spill with
+# headroom below Linux MAX_ARG_STRLEN (128 KiB).
+_EXEC_INLINE_COMMAND_LIMIT_BYTES = 96 * 1024
 _PROVIDER_STATUS_FIRST_POLL_SEC = 5.0
 _PROVIDER_STATUS_POLL_INTERVAL_SEC = 30.0
 _PROVIDER_STATUS_RPC_TIMEOUT_SEC = 10.0
@@ -60,6 +64,16 @@ _OBSERVABLE_WRAPPER_ENV = "__TORCHTITAN_OBSERVABLE_WRAPPER_B64"
 _MISSING_OUTPUT_MESSAGE = (
     "[torchtitan: command completed, but its captured output is unavailable]"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservableExecCommand:
+    inline_command: str
+    uploaded_command: str
+    wrapper_path: str
+    wrapper: bytes
+    status_path: str
+    output_path: str
 
 
 def _error_status_code(error: BaseException) -> int | None:
@@ -160,8 +174,8 @@ def _build_exec_command(
     return f"{_EXEC_SCRIPT_ENV}={shlex.quote(encoded_cmd)} {shlex.join(argv)}"
 
 
-def _build_observable_exec_command(full: str, command_key: str) -> tuple[str, str, str]:
-    """Wrap a command with an atomic result sentinel and bounded output."""
+def _build_observable_exec(full: str, command_key: str) -> _ObservableExecCommand:
+    """Build inline and uploaded forms of an observable command."""
     raw_output_path = f"{_EXEC_OUTPUT_DIR}/{command_key}.raw"
     output_fifo_path = f"{_EXEC_OUTPUT_DIR}/{command_key}.fifo"
     result_prefix = f"{_EXEC_RESULT_DIR}/{command_key}"
@@ -169,7 +183,7 @@ def _build_observable_exec_command(full: str, command_key: str) -> tuple[str, st
     output_tmp_path = f"{output_path}.tmp"
     status_path = f"{result_prefix}.status"
     status_tmp_path = f"{status_path}.tmp"
-    wrapper_path = f"{result_prefix}.wrapper"
+    wrapper_path = f"/tmp/.torchtitan_exec_{command_key}.wrapper"
     quoted_output_dir = shlex.quote(_EXEC_OUTPUT_DIR)
     quoted_result_dir = shlex.quote(_EXEC_RESULT_DIR)
     quoted_raw_output = shlex.quote(raw_output_path)
@@ -234,11 +248,31 @@ def _build_observable_exec_command(full: str, command_key: str) -> tuple[str, st
         f"exec setsid sh {quoted_wrapper}; "
         f"else exec sh {quoted_wrapper}; fi"
     )
-    observed = (
+    inline_command = (
         f"{_OBSERVABLE_WRAPPER_ENV}={shlex.quote(encoded_wrapper)} exec "
         + shlex.join(["sh", "-c", materializer])
     )
-    return observed, status_path, output_path
+    dispatcher = (
+        'if command -v setsid > /dev/null 2>&1; then exec setsid sh "$1"; '
+        'else exec sh "$1"; fi'
+    )
+    uploaded_command = "exec " + shlex.join(
+        ["sh", "-c", dispatcher, "sh", wrapper_path]
+    )
+    return _ObservableExecCommand(
+        inline_command=inline_command,
+        uploaded_command=uploaded_command,
+        wrapper_path=wrapper_path,
+        wrapper=wrapper.encode(),
+        status_path=status_path,
+        output_path=output_path,
+    )
+
+
+def _build_observable_exec_command(full: str, command_key: str) -> tuple[str, str, str]:
+    """Wrap a command inline with an atomic result sentinel and bounded output."""
+    command = _build_observable_exec(full, command_key)
+    return command.inline_command, command.status_path, command.output_path
 
 
 def _is_missing_file_error(error: BaseException) -> bool:
@@ -852,9 +886,22 @@ class DaytonaSandbox:
         # Pass every optional field explicitly (= the SDK's own defaults). In the
         # torchtitan/vllm import context the SDK rebuild drops these defaults.
         command_key = uuid.uuid4().hex
-        observed_full, status_path, output_path = _build_observable_exec_command(
-            full, command_key
-        )
+        observable = _build_observable_exec(full, command_key)
+        observed_full = observable.inline_command
+        if len(observed_full.encode()) > _EXEC_INLINE_COMMAND_LIMIT_BYTES:
+            await self._retry_idempotent_rpc(
+                lambda: self._sb.fs.upload_file(
+                    observable.wrapper,
+                    observable.wrapper_path,
+                    _SESSION_RPC_TIMEOUT_SEC,
+                ),
+                phase="command_upload",
+                retry_kind="file_upload_retry",
+                failed_kind="file_upload_failed",
+            )
+            observed_full = observable.uploaded_command
+        status_path = observable.status_path
+        output_path = observable.output_path
         request = SessionExecuteRequest(
             command=observed_full,
             run_async=True,
