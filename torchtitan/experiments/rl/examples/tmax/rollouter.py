@@ -102,15 +102,20 @@ _DISK_ISSUE_KINDS = {
 }
 _TRANSPORT_ISSUE_KINDS = {
     "command_logs_failed",
+    "command_logs_retry",
     "command_recovery_query_failed",
     "command_status_timeout",
     "delete_failed",
+    "delete_retry",
     "exec_failed",
     "execute_missing_command_id",
     "execute_response_recovered",
     "execute_response_unconfirmed",
     "file_upload_failed",
+    "file_upload_retry",
+    "heartbeat_retry",
     "poll_transient",
+    "sandbox_lost",
     "session_cleanup_failed",
 }
 _PROVISION_ISSUE_KINDS = {
@@ -134,6 +139,7 @@ class _SandboxRolloutDiagnostics:
     issue_counts: dict[str, int]
     issues: tuple[SandboxIssue, ...]
     num_dropped_details: int
+    infra_failed: bool = False
 
 
 def _sandbox_issue_metrics(
@@ -421,12 +427,6 @@ class TMaxRollouter(Rollouter):
         finish_reasons = [fr for _, _, _, fr, _ in results]
         sandbox_diagnostics = [diagnostics for _, _, _, _, diagnostics in results]
 
-        # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
-        outputs = await self.score_group(rollouts, sample)
-        for rollout, output in zip(rollouts, outputs, strict=True):
-            rollout.reward = output.reward
-            rollout.reward_breakdown = output.reward_breakdown
-
         # Fraction of siblings that never emitted the submit marker (errored or ran to
         # the budget without submitting) -> the verifier never runs -> auto reward 0.
         # Mirrors open-instruct's val/non_submitting_completion_fraction; a high value
@@ -448,16 +448,54 @@ class TMaxRollouter(Rollouter):
         sandbox_metrics = _sandbox_issue_metrics(
             [diagnostics.issue_counts for diagnostics in sandbox_diagnostics]
         )
+        infra_failed_flags = [
+            diagnostics.infra_failed for diagnostics in sandbox_diagnostics
+        ]
+        infra_failed_frac = sum(infra_failed_flags) / len(infra_failed_flags)
+        group_metrics = [
+            m.Metric("rollout/nonsubmit_frac", m.Mean(nonsubmit_frac)),
+            m.Metric("rollout/format_errors_mean", m.Mean(fmt_errors_mean)),
+            m.Metric("rollout/format_error_frac", m.Mean(fmt_error_frac)),
+            m.Metric("rollout/infra_failed_frac", m.Mean(infra_failed_frac)),
+            m.Metric(
+                "rollout/infra_invalid_group_frac",
+                m.Mean(1.0 if any(infra_failed_flags) else 0.0),
+            ),
+            *finish_metrics,
+            *sandbox_metrics,
+        ]
+
+        # Sibling rewards form one centered-advantage unit. A transport or rollout
+        # infrastructure failure in any sibling invalidates that whole unit: scoring
+        # the failed sibling as zero would manufacture a negative advantage and turn
+        # a nearly all-solved group into a false partial group. Empty RolloutGroups are
+        # already a first-class failed-generation result in TrainingSampleBuilder.
+        if any(infra_failed_flags):
+            group_metrics.append(
+                m.Metric("rollout/num_groups_dropped_infra", m.Sum(1.0))
+            )
+            logger.warning(
+                "[tmax] group=%d dropped after %d/%d infrastructure failures",
+                group_id,
+                sum(infra_failed_flags),
+                len(infra_failed_flags),
+            )
+            return RolloutGroup(
+                group_id=group_id,
+                rollouts=[],
+                metrics=group_metrics,
+            )
+
+        # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
+        outputs = await self.score_group(rollouts, sample)
+        for rollout, output in zip(rollouts, outputs, strict=True):
+            rollout.reward = output.reward
+            rollout.reward_breakdown = output.reward_breakdown
+
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
-            metrics=[
-                m.Metric("rollout/nonsubmit_frac", m.Mean(nonsubmit_frac)),
-                m.Metric("rollout/format_errors_mean", m.Mean(fmt_errors_mean)),
-                m.Metric("rollout/format_error_frac", m.Mean(fmt_error_frac)),
-                *finish_metrics,
-                *sandbox_metrics,
-            ],
+            metrics=group_metrics,
         )
         advantages = self.advantage_estimator(group)
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
@@ -531,6 +569,7 @@ class TMaxRollouter(Rollouter):
         # Default for the timeout/exception paths where run_vanillux_loop never
         # returned (it sets its own reason on the normal path).
         finish_reason = "error"
+        infra_failed = False
         issue_tracker = SandboxIssueTracker(
             SandboxLogContext(
                 instance_id=sample.instance_id,
@@ -594,6 +633,7 @@ class TMaxRollouter(Rollouter):
                         reward = 0.0
                 status = RolloutStatus.COMPLETED
         except (TimeoutError, asyncio.TimeoutError):
+            infra_failed = True
             status = RolloutStatus.ERROR_TIMEOUT
             if rollout_timeout is not None and rollout_timeout.expired():
                 logger.warning("[tmax] %s: wall-clock guard fired", rollout_id)
@@ -602,6 +642,7 @@ class TMaxRollouter(Rollouter):
                 logger.exception("[tmax] %s: sandbox timeout", rollout_id)
                 error_msg = "sandbox_timeout"
         except Exception as e:
+            infra_failed = True
             logger.exception("[tmax] %s: rollout failed", rollout_id)
             status = RolloutStatus.ERROR
             error_msg = f"{type(e).__name__}: {e}"
@@ -621,6 +662,7 @@ class TMaxRollouter(Rollouter):
             issue_counts=issue_tracker.counts,
             issues=issue_tracker.issues,
             num_dropped_details=issue_tracker.num_dropped_details,
+            infra_failed=infra_failed,
         )
 
         # Drop empty-completion turns so rollout_to_training_samples only sees
@@ -681,6 +723,7 @@ class TMaxRollouter(Rollouter):
                         "submitted": submitted,
                         "reward": reward,
                         "finish_reason": finish_reason,
+                        "infra_failed": diagnostics.infra_failed,
                         "issue_counts": diagnostics.issue_counts,
                         "num_dropped_details": diagnostics.num_dropped_details,
                     },
@@ -795,6 +838,7 @@ class TMaxRollouter(Rollouter):
                 + f"\nmodel finish   : {last_model_finish}   any length-cap turn: {any_length_finish}"
                 + f"\nsandbox_id     : {sandbox_diagnostics.sandbox_id}"
                 + f"\nsandbox disk   : {sandbox_diagnostics.disk_gb} GiB"
+                + f"\ninfra failed   : {sandbox_diagnostics.infra_failed}"
                 + "\nsandbox issues : "
                 + json.dumps(sandbox_diagnostics.issue_counts, sort_keys=True)
                 + f" (details dropped={sandbox_diagnostics.num_dropped_details})"
@@ -837,6 +881,7 @@ class TMaxRollouter(Rollouter):
                             "submitted": submitted,
                             "reward": reward,
                             "finish_reason": finish_reason,
+                            "infra_failed": sandbox_diagnostics.infra_failed,
                             "error": error_msg,
                             "issue_counts": sandbox_diagnostics.issue_counts,
                             "num_dropped_details": (

@@ -20,6 +20,7 @@ import json
 
 import logging
 import shlex
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,63 @@ _DEFAULT_EXEC_REQUEST_TIMEOUT_SEC = 120
 _SESSION_POLL_GRACE_SEC = 120
 _SESSION_RPC_TIMEOUT_SEC = 60
 _COMMAND_RECOVERY_DELAYS_SEC = (0.0, 0.25, 1.0)
+
+
+def _error_status_code(error: BaseException) -> int | None:
+    for value in (
+        getattr(error, "status_code", None),
+        getattr(error, "status", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _is_sandbox_gone_error(error: BaseException) -> bool:
+    if _error_status_code(error) == 404:
+        return True
+    name = type(error).__name__.lower()
+    if "notfound" in name or "not_found" in name:
+        return True
+    message = str(error).lower()
+    return (
+        ("sandbox" in message and "not found" in message)
+        or "sandbox has been deleted" in message
+        or "no such container" in message
+        or "no ip address" in message
+    )
+
+
+def _is_transient_rpc_error(error: BaseException) -> bool:
+    status_code = _error_status_code(error)
+    if status_code == 429 or (status_code is not None and status_code >= 500):
+        return True
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return True
+    name = type(error).__name__.lower()
+    if "connection" in name or "timeout" in name or "throttl" in name:
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "connection reset",
+            "server disconnected",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "too many requests",
+            "status code 429",
+            "status code 500",
+            "status code 502",
+            "status code 503",
+            "status code 504",
+        )
+    )
 
 
 def _build_exec_command(
@@ -192,6 +250,9 @@ class DaytonaSandbox:
                                                extend the command runtime limit.
       ``TT_DAYTONA_SESSION_CREATE_RETRIES`` -- empty-session creation retries;
                                                defaults to 5.
+      ``TT_DAYTONA_RPC_RETRIES``            -- retries for idempotent RPCs; default 2.
+      ``TT_DAYTONA_HEARTBEAT_SEC``          -- activity refresh interval; default
+                                               180s, or 0 to disable.
     """
 
     api_key_env = ("DAYTONA_API_KEY",)
@@ -223,6 +284,8 @@ class DaytonaSandbox:
         self._client: Any = None
         self._sb: Any = None
         self.sandbox_id = ""
+        self._heartbeat_task: Any = None
+        self._lost_error: BaseException | None = None
 
     def _record_issue(
         self,
@@ -280,6 +343,88 @@ class DaytonaSandbox:
         }
         logger.warning("[sandbox_issue] %s", json.dumps(payload, sort_keys=True))
 
+    def _mark_sandbox_lost(self, error: BaseException, *, phase: str) -> None:
+        if self._lost_error is not None:
+            return
+        self._lost_error = error
+        self._record_issue("sandbox_lost", phase=phase, error=error)
+
+    def _raise_if_sandbox_lost(self) -> None:
+        if self._lost_error is None:
+            return
+        raise RuntimeError(
+            f"daytona sandbox {self.sandbox_id or '<unknown>'} is no longer available"
+        ) from self._lost_error
+
+    async def _retry_idempotent_rpc(
+        self,
+        call: Callable[[], Awaitable[Any]],
+        *,
+        phase: str,
+        retry_kind: str,
+        failed_kind: str,
+        session_id: str = "",
+        command_id: str = "",
+    ) -> Any:
+        import asyncio
+        import random
+
+        retries = int(_getenv("TT_DAYTONA_RPC_RETRIES", default="2"))
+        if retries < 0:
+            raise ValueError(
+                f"TT_DAYTONA_RPC_RETRIES must be non-negative, got {retries}"
+            )
+        max_attempts = retries + 1
+        backoff = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await asyncio.wait_for(call(), timeout=_SESSION_RPC_TIMEOUT_SEC)
+            except Exception as error:
+                if _is_sandbox_gone_error(error):
+                    self._mark_sandbox_lost(error, phase=phase)
+                    raise
+                terminal = attempt >= max_attempts or not _is_transient_rpc_error(error)
+                self._record_issue(
+                    failed_kind if terminal else retry_kind,
+                    phase=phase,
+                    error=error,
+                    recovered=not terminal,
+                    session_id=session_id,
+                    command_id=command_id,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    emit_log=terminal,
+                )
+                if terminal:
+                    raise
+                await asyncio.sleep(backoff * (0.5 + random.random()))
+                backoff = min(backoff * 2, 5.0)
+        raise AssertionError("idempotent RPC retry loop did not return or raise")
+
+    async def _heartbeat_loop(self, interval_sec: float) -> None:
+        import asyncio
+        import random
+
+        while True:
+            await asyncio.sleep(interval_sec * (0.9 + 0.2 * random.random()))
+            try:
+                await asyncio.wait_for(
+                    self._sb.refresh_activity(), timeout=_SESSION_RPC_TIMEOUT_SEC
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if _is_sandbox_gone_error(error):
+                    self._mark_sandbox_lost(error, phase="heartbeat")
+                    return
+                self._record_issue(
+                    "heartbeat_retry",
+                    phase="heartbeat",
+                    error=error,
+                    recovered=True,
+                    emit_log=False,
+                )
+
     @property
     def daytona(self):
         """Underlying ``daytona.AsyncSandbox`` (for the fs-relay bridge)."""
@@ -308,10 +453,23 @@ class DaytonaSandbox:
         # Cloud-side TTL so an orphan (left by a SIGKILL'd run that never reached
         # __aexit__, e.g. MAST preemption) self-reaps: once it goes idle it
         # auto-stops after auto_stop minutes, then auto-deletes immediately
-        # (auto_delete=0). A live rollout keeps the sandbox active (the host polls
-        # its fs continuously via the bridge), so it is never stopped mid-run.
+        # (auto_delete=0). The heartbeat below refreshes cloud activity while a live
+        # rollout is waiting on model generation and making no Daytona RPCs.
         auto_stop = int(_getenv("TT_DAYTONA_AUTO_STOP_MIN", default="10"))
         auto_delete = int(_getenv("TT_DAYTONA_AUTO_DELETE_MIN", default="0"))
+        default_heartbeat_sec = min(180.0, auto_stop * 20.0) if auto_stop > 0 else 0.0
+        heartbeat_sec = float(
+            _getenv(
+                "TT_DAYTONA_HEARTBEAT_SEC",
+                default=str(default_heartbeat_sec),
+            )
+        )
+        if heartbeat_sec < 0:
+            raise ValueError(
+                f"TT_DAYTONA_HEARTBEAT_SEC must be non-negative, got {heartbeat_sec}"
+            )
+        if int(_getenv("TT_DAYTONA_RPC_RETRIES", default="2")) < 0:
+            raise ValueError("TT_DAYTONA_RPC_RETRIES must be non-negative")
         params = CreateSandboxFromImageParams(
             image=self.image,
             resources=Resources(cpu=cpu, memory=mem, disk=disk),
@@ -351,16 +509,64 @@ class DaytonaSandbox:
                 await asyncio.sleep(backoff * (0.5 + random.random()))
                 backoff = min(backoff * 2, 60.0)
         self.sandbox_id = self._sb.id
+        if heartbeat_sec > 0:
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(heartbeat_sec),
+                name=f"daytona_heartbeat_{self.sandbox_id}",
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        import asyncio
+        import random
+
         # Delete only this sandbox; never close the process-wide shared client --
         # other concurrent rollouts are still using its pooled connections.
-        try:
-            if self._sb is not None:
-                await self._client.delete(self._sb)
-        except Exception as e:
-            self._record_issue("delete_failed", phase="delete", error=e)
+        heartbeat_task = self._heartbeat_task
+        self._heartbeat_task = None
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._sb is None:
+            return
+        retries = int(_getenv("TT_DAYTONA_RPC_RETRIES", default="2"))
+        if retries < 0:
+            raise ValueError(
+                f"TT_DAYTONA_RPC_RETRIES must be non-negative, got {retries}"
+            )
+        max_attempts = retries + 1
+        backoff = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await asyncio.wait_for(
+                    self._client.delete(self._sb),
+                    timeout=_SESSION_RPC_TIMEOUT_SEC,
+                )
+                break
+            except Exception as error:
+                # Delete is idempotent. A 404 means the desired final state already
+                # holds, commonly because Daytona auto-deleted an idle sandbox.
+                if _is_sandbox_gone_error(error):
+                    break
+                terminal = attempt >= max_attempts or not _is_transient_rpc_error(error)
+                self._record_issue(
+                    "delete_failed" if terminal else "delete_retry",
+                    phase="delete",
+                    error=error,
+                    recovered=not terminal,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    emit_log=terminal,
+                )
+                if terminal:
+                    break
+                await asyncio.sleep(backoff * (0.5 + random.random()))
+                backoff = min(backoff * 2, 5.0)
+        self._raise_if_sandbox_lost()
 
     async def exec(
         self,
@@ -373,6 +579,7 @@ class DaytonaSandbox:
     ) -> ExecResult:
         import os
 
+        self._raise_if_sandbox_lost()
         if timeout <= 0:
             raise ValueError(f"daytona exec timeout must be positive, got {timeout}")
 
@@ -454,6 +661,9 @@ class DaytonaSandbox:
                     timeout=_SESSION_RPC_TIMEOUT_SEC,
                 )
             except Exception as e:
+                if _is_sandbox_gone_error(e):
+                    self._mark_sandbox_lost(e, phase="execute_recovery")
+                    raise
                 self._record_issue(
                     "command_recovery_query_failed",
                     phase="execute_recovery",
@@ -509,6 +719,10 @@ class DaytonaSandbox:
                 default="5",
             )
         )
+        if retries < 0:
+            raise ValueError(
+                f"TT_DAYTONA_SESSION_CREATE_RETRIES must be non-negative, got {retries}"
+            )
         backoff = 5.0
         sid = ""
         for attempt in range(retries + 1):
@@ -520,6 +734,9 @@ class DaytonaSandbox:
                 )
                 break
             except Exception as e:
+                if _is_sandbox_gone_error(e):
+                    self._mark_sandbox_lost(e, phase="session_create")
+                    raise
                 try:
                     await asyncio.wait_for(
                         self._sb.process.delete_session(sid),
@@ -540,7 +757,7 @@ class DaytonaSandbox:
                         max_attempts=retries + 1,
                     )
                     raise
-                terminal = attempt >= retries
+                terminal = attempt >= retries or not _is_transient_rpc_error(e)
                 self._record_issue(
                     "session_create_failed" if terminal else "session_create_retry",
                     phase="session_create",
@@ -549,8 +766,9 @@ class DaytonaSandbox:
                     session_id=sid,
                     attempt=attempt + 1,
                     max_attempts=retries + 1,
+                    emit_log=terminal,
                 )
-                if attempt >= retries:
+                if terminal:
                     raise
                 await asyncio.sleep(backoff * (0.5 + random.random()))
                 backoff = min(backoff * 2, 60.0)
@@ -583,6 +801,7 @@ class DaytonaSandbox:
                 recovered=True,
                 session_id=sid,
                 command_id=cid,
+                emit_log=False,
             )
         if not cid:
             cid = await self._recover_session_command_id(sid, full)
@@ -618,6 +837,7 @@ class DaytonaSandbox:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return None
+            self._raise_if_sandbox_lost()
             try:
                 return await asyncio.wait_for(
                     self._sb.process.get_session_command(sid, cid),
@@ -644,9 +864,12 @@ class DaytonaSandbox:
                 # running so the poll loop retries (bounded by the outer deadline,
                 # which fires a clean TimeoutError if the sandbox is truly gone).
                 low = msg.lower()
+                if _is_sandbox_gone_error(e):
+                    self._mark_sandbox_lost(e, phase="command_poll")
+                    raise
                 if "convert exit code" in low:
                     return None
-                if "disconnect" in low or "connection" in low or "timeout" in low:
+                if _is_transient_rpc_error(e):
                     self._record_issue(
                         "poll_transient",
                         phase="command_poll",
@@ -679,20 +902,14 @@ class DaytonaSandbox:
             cmd = await poll()
             polls += 1
 
-        try:
-            logs = await asyncio.wait_for(
-                self._sb.process.get_session_command_logs(sid, cid),
-                timeout=_SESSION_RPC_TIMEOUT_SEC,
-            )
-        except Exception as e:
-            self._record_issue(
-                "command_logs_failed",
-                phase="command_logs",
-                error=e,
-                session_id=sid,
-                command_id=cid,
-            )
-            raise
+        logs = await self._retry_idempotent_rpc(
+            lambda: self._sb.process.get_session_command_logs(sid, cid),
+            phase="command_logs",
+            retry_kind="command_logs_retry",
+            failed_kind="command_logs_failed",
+            session_id=sid,
+            command_id=cid,
+        )
         out = getattr(logs, "stdout", "") or ""
         err = getattr(logs, "stderr", "") or ""
         exit_code = int(cmd.exit_code)
@@ -712,11 +929,12 @@ class DaytonaSandbox:
         else:
             data = str(content).encode("utf-8")
         # fs.upload_file writes as root; chown afterwards for non-root owners.
-        try:
-            await self._sb.fs.upload_file(data, sandbox_path)
-        except Exception as e:
-            self._record_issue("file_upload_failed", phase="write_file", error=e)
-            raise
+        await self._retry_idempotent_rpc(
+            lambda: self._sb.fs.upload_file(data, sandbox_path),
+            phase="write_file",
+            retry_kind="file_upload_retry",
+            failed_kind="file_upload_failed",
+        )
         if user and user != "root":
             await self.exec(
                 f"chown {shlex.quote(user)}:{shlex.quote(user)} {shlex.quote(sandbox_path)}",

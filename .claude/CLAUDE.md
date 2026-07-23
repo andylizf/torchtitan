@@ -42,10 +42,10 @@ when sizing TMax runs. The observed live usage when these limits were recorded
 was 568 vCPU, 1136 GiB memory, and 1420 GiB storage; live usage is shared and
 must be checked again before increasing concurrency.
 
-The 9B TMax launcher currently allocates 2 vCPU, 4 GiB memory, and 5 GiB storage
+The 9B TMax launcher currently allocates 2 vCPU, 4 GiB memory, and 6 GiB storage
 per Daytona sandbox. Ignoring other jobs, the account-level sandbox ceiling is
-therefore `min(5000/2, 20000/4, 25000/5) = 2500`. For reference,
-`SWE_ROLLOUT_CONCURRENCY=1024` requests 2048 vCPU, 4096 GiB memory, and 5120 GiB
+therefore `min(5000/2, 20000/4, 25000/6) = 2500`. For reference,
+`SWE_ROLLOUT_CONCURRENCY=1024` requests 2048 vCPU, 4096 GiB memory, and 6144 GiB
 storage, so it fits the account limits. This does not guarantee a speedup: check
 Daytona failures/rate limits, generator queue and inflight metrics, rollout-worker
 CPU load, and trainer batch-wait time.

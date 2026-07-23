@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -22,6 +23,7 @@ from torchtitan.experiments.rl.examples.tmax.rollouter import (
 )
 from torchtitan.experiments.rl.harness import SandboxIssue
 from torchtitan.experiments.rl.observability.metrics import Mean
+from torchtitan.experiments.rl.rollout.types import Rollout, RolloutStatus
 
 
 class _FakeAdapter:
@@ -156,6 +158,65 @@ def test_sandbox_issue_metrics_count_events_and_affected_rollouts() -> None:
         "rollout/sandbox_transport_issue_events_mean": 0.5,
         "rollout/sandbox_provision_issue_frac": 0.0,
         "rollout/sandbox_timeout_frac": 0.0,
+    }
+
+
+def test_infra_failed_sibling_drops_group_before_scoring() -> None:
+    rollouter = object.__new__(TMaxRollouter)
+    rollouter._ensure_adapter = AsyncMock(return_value=object())
+
+    async def run_sibling(**kwargs):
+        rollout_idx = kwargs["rollout_idx"]
+        infra_failed = rollout_idx == 1
+        return (
+            Rollout(
+                group_id=7,
+                rollout_id=rollout_idx,
+                status=(
+                    RolloutStatus.ERROR if infra_failed else RolloutStatus.COMPLETED
+                ),
+            ),
+            not infra_failed,
+            0,
+            "error" if infra_failed else "submit",
+            _SandboxRolloutDiagnostics(
+                sandbox_id=f"sandbox-{rollout_idx}",
+                disk_gb=6,
+                issue_counts={},
+                issues=(),
+                num_dropped_details=0,
+                infra_failed=infra_failed,
+            ),
+        )
+
+    rollouter._run_agent_rollout = AsyncMock(side_effect=run_sibling)
+    rollouter.score_group = AsyncMock()
+    rollouter.advantage_estimator = Mock()
+    rollouter._maybe_annotate_zero_std = Mock()
+
+    group = asyncio.run(
+        rollouter.run_group_rollouts(
+            generate_fn=AsyncMock(),
+            sample=object(),
+            group_id=7,
+            group_size=2,
+            sampling=object(),
+            renderer=object(),
+        )
+    )
+
+    assert group.rollouts == []
+    rollouter.score_group.assert_not_awaited()
+    rollouter.advantage_estimator.assert_not_called()
+    rollouter._maybe_annotate_zero_std.assert_not_called()
+    metric_values = {
+        metric.key: metric.value.value
+        for metric in group.metrics
+        if metric.key.startswith("rollout/infra")
+    }
+    assert metric_values == {
+        "rollout/infra_failed_frac": 0.5,
+        "rollout/infra_invalid_group_frac": 1.0,
     }
 
 

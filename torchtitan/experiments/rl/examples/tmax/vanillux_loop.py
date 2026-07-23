@@ -185,15 +185,12 @@ async def _prepare_runtime(sb: Sandbox) -> None:
 
 async def _run_bash(sb: Sandbox, command: str, timeout: int) -> tuple[str, int]:
     """Run one command through the persistent-shell wrapper; return (raw_output, ec)."""
-    try:
-        ec, out, err = await sb.exec(
-            f"bash {shlex.quote(_BASH_WRAPPER_PATH)} {shlex.quote(command)}",
-            user="root",
-            timeout=timeout,
-            check=False,
-        )
-    except Exception as e:  # exec transport failure -> surface to the agent
-        return f"error: exec failed: {type(e).__name__}: {e}", 1
+    ec, out, err = await sb.exec(
+        f"bash {shlex.quote(_BASH_WRAPPER_PATH)} {shlex.quote(command)}",
+        user="root",
+        timeout=timeout,
+        check=False,
+    )
     output = out or ""
     if err:
         output += f"\n{err}" if output else err

@@ -288,6 +288,32 @@ def test_session_create_enospc_is_not_retried(
     }
 
 
+def test_session_create_stops_when_sandbox_is_gone(
+    fake_daytona: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_DAYTONA_SESSION_CREATE_RETRIES", "5")
+    process = _process()
+    process.create_session.side_effect = RuntimeError("sandbox not found")
+    sandbox = _sandbox_with_process(process)
+    sandbox.sandbox_id = "sandbox-id"
+
+    with pytest.raises(RuntimeError, match="sandbox not found"):
+        asyncio.run(
+            sandbox._session_exec(
+                "echo once",
+                command_timeout=5,
+                request_timeout=30,
+            )
+        )
+
+    process.create_session.assert_awaited_once()
+    process.delete_session.assert_not_awaited()
+    assert sandbox.issue_tracker.counts == {"sandbox_lost": 1}
+    with pytest.raises(RuntimeError, match="is no longer available"):
+        asyncio.run(sandbox.exec("echo again"))
+
+
 def test_nonzero_command_enospc_is_recorded() -> None:
     sandbox = DaytonaSandbox("example/image", disk_gb=20)
     sandbox._session_exec = AsyncMock(
@@ -317,17 +343,141 @@ def test_successful_command_output_does_not_misclassify_enospc_text() -> None:
     assert sandbox.issue_tracker.counts == {}
 
 
-def test_tracker_keeps_exec_error_swallowed_by_agent_loop() -> None:
+def test_agent_loop_propagates_exec_transport_error() -> None:
     sandbox = DaytonaSandbox("example/image")
     sandbox._session_exec = AsyncMock(
         side_effect=RuntimeError("no space left on device")
     )
 
-    output, exit_code = asyncio.run(_run_bash(sandbox, "echo ok", timeout=5))
+    with pytest.raises(RuntimeError, match="no space left on device"):
+        asyncio.run(_run_bash(sandbox, "echo ok", timeout=5))
 
-    assert exit_code == 1
-    assert "exec failed: RuntimeError: no space left on device" in output
     assert sandbox.issue_tracker.counts == {"exec_failed": 1}
+
+
+def test_agent_loop_keeps_nonzero_command_as_observation() -> None:
+    sandbox = DaytonaSandbox("example/image")
+    sandbox._session_exec = AsyncMock(return_value=(1, "test failed"))
+
+    output, exit_code = asyncio.run(_run_bash(sandbox, "false", timeout=5))
+
+    assert (output, exit_code) == ("test failed", 1)
+    assert sandbox.issue_tracker.counts == {}
+
+
+def test_command_logs_retry_does_not_replay_command(
+    fake_daytona: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_DAYTONA_RPC_RETRIES", "2")
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    process = _process()
+    process.get_session_command_logs.side_effect = [
+        ConnectionError("server disconnected"),
+        SimpleNamespace(stdout="ok", stderr=""),
+    ]
+    sandbox = _sandbox_with_process(process)
+
+    result = asyncio.run(
+        sandbox._session_exec(
+            "echo once",
+            command_timeout=5,
+            request_timeout=30,
+        )
+    )
+
+    assert result == (0, "ok")
+    process.execute_session_command.assert_awaited_once()
+    assert process.get_session_command_logs.await_count == 2
+    assert sandbox.issue_tracker.counts == {"command_logs_retry": 1}
+
+
+def test_file_upload_retry_reuses_identical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_DAYTONA_RPC_RETRIES", "2")
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    upload_file = AsyncMock(side_effect=[ConnectionError("server disconnected"), None])
+    sandbox = DaytonaSandbox("example/image")
+    sandbox._sb = SimpleNamespace(fs=SimpleNamespace(upload_file=upload_file))
+    sandbox.exec = AsyncMock(return_value=(0, "", ""))
+
+    asyncio.run(sandbox.write_file("/tmp/payload", b"same bytes"))
+
+    assert upload_file.await_count == 2
+    assert [call.args for call in upload_file.await_args_list] == [
+        (b"same bytes", "/tmp/payload"),
+        (b"same bytes", "/tmp/payload"),
+    ]
+    assert sandbox.issue_tracker.counts == {"file_upload_retry": 1}
+
+
+def test_delete_retries_transient_failure_and_accepts_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_DAYTONA_RPC_RETRIES", "2")
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    sandbox = DaytonaSandbox("example/image")
+    sandbox._sb = SimpleNamespace(id="sandbox-id")
+    sandbox._client = SimpleNamespace(
+        delete=AsyncMock(
+            side_effect=[
+                ConnectionError("server disconnected"),
+                RuntimeError("sandbox not found"),
+            ]
+        )
+    )
+
+    asyncio.run(sandbox.__aexit__(None, None, None))
+
+    assert sandbox._client.delete.await_count == 2
+    assert sandbox.issue_tracker.counts == {"delete_retry": 1}
+
+
+def test_heartbeat_refreshes_until_teardown() -> None:
+    async def run() -> tuple[int, list[str]]:
+        order: list[str] = []
+
+        async def refresh_activity() -> None:
+            order.append("refresh")
+
+        async def delete(_sandbox) -> None:
+            order.append("delete")
+
+        sandbox = DaytonaSandbox("example/image")
+        sandbox._sb = SimpleNamespace(
+            id="sandbox-id",
+            refresh_activity=AsyncMock(side_effect=refresh_activity),
+        )
+        sandbox._client = SimpleNamespace(delete=AsyncMock(side_effect=delete))
+        sandbox._heartbeat_task = asyncio.create_task(sandbox._heartbeat_loop(0.001))
+        while sandbox._sb.refresh_activity.await_count == 0:
+            await asyncio.sleep(0.001)
+        await sandbox.__aexit__(None, None, None)
+        return sandbox._sb.refresh_activity.await_count, order
+
+    refresh_count, order = asyncio.run(run())
+
+    assert refresh_count >= 1
+    assert order[-1] == "delete"
+
+
+def test_heartbeat_detected_loss_propagates_after_delete() -> None:
+    async def run() -> int:
+        sandbox = DaytonaSandbox("example/image")
+        sandbox.sandbox_id = "sandbox-id"
+        sandbox._sb = SimpleNamespace(
+            id="sandbox-id",
+            refresh_activity=AsyncMock(side_effect=RuntimeError("sandbox not found")),
+        )
+        sandbox._client = SimpleNamespace(delete=AsyncMock(return_value=None))
+        sandbox._heartbeat_task = asyncio.create_task(sandbox._heartbeat_loop(0.001))
+        await sandbox._heartbeat_task
+        with pytest.raises(RuntimeError, match="is no longer available"):
+            await sandbox.__aexit__(None, None, None)
+        return sandbox._client.delete.await_count
+
+    assert asyncio.run(run()) == 1
 
 
 def test_boot_retries_share_rollout_issue_tracker(
