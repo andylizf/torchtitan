@@ -98,22 +98,23 @@ _EXEC_TIMEOUT = int(os.environ.get("TMAX_EXEC_TIMEOUT_SEC", "120"))
 _BASH_WRAPPER_PATH = "/tmp/.tmax_vanillux_bash_wrapper.sh"
 _BASH_CWD_PATH = "/tmp/.tmax_vanillux_cwd"
 _BASH_ENV_PATH = "/tmp/.tmax_vanillux_env"
-_BASH_COMMAND_ENV = "__TORCHTITAN_VANILLUX_COMMAND_B64"
+_BASH_COMMAND_PATH_PREFIX = "/dev/shm/.tmax_vanillux_command."
+_BASH_DEFAULT_CWD = "/app"
 _BASH_WRAPPER = f"""#!/bin/bash
-__torchtitan_vanillux_command="$(printf '%s' "${_BASH_COMMAND_ENV}" | base64 -d)"
-__torchtitan_vanillux_decode_exit_code=$?
-if [ "$__torchtitan_vanillux_decode_exit_code" -ne 0 ]; then
-  exit "$__torchtitan_vanillux_decode_exit_code"
+if [ ! -r "$1" ]; then
+  exit 1
 fi
-unset {_BASH_COMMAND_ENV}
+__torchtitan_vanillux_command=
+IFS= read -r -d '' __torchtitan_vanillux_command < "$1" || :
+rm -f "$1"
 set -- "$__torchtitan_vanillux_command"
-unset __torchtitan_vanillux_command __torchtitan_vanillux_decode_exit_code
+unset __torchtitan_vanillux_command
 set -a
 source {shlex.quote(_BASH_ENV_PATH)} 2>/dev/null || true
 set +a
 _cwd=
 IFS= read -r _cwd 2>/dev/null < {shlex.quote(_BASH_CWD_PATH)} || :
-[ -n "$_cwd" ] || _cwd=/app
+[ -n "$_cwd" ] || _cwd={shlex.quote(_BASH_DEFAULT_CWD)}
 cd "$_cwd" 2>/dev/null || cd /workspace || exit 1
 eval "$1"
 _exit_code=$?
@@ -180,7 +181,8 @@ async def _prepare_runtime(sb: Sandbox) -> None:
         "mkdir -p /workspace /output /logs/verifier /root && "
         "cd /workspace && "
         '[ -d /app ] || { _P="$(pwd)"; [ "$_P" != "/" ] && ln -sf "$_P" /app; } && '
-        f"printf '%s\\n' /app > {shlex.quote(_BASH_CWD_PATH)} && "
+        f"printf '%s\\n' {shlex.quote(_BASH_DEFAULT_CWD)} "
+        f"> {shlex.quote(_BASH_CWD_PATH)} && "
         f": > {shlex.quote(_BASH_ENV_PATH)}",
         user="root",
         check=False,
@@ -198,9 +200,40 @@ async def _prepare_runtime(sb: Sandbox) -> None:
 async def _run_bash(sb: Sandbox, command: str, timeout: int) -> tuple[str, int]:
     """Run one command through the persistent-shell wrapper; return (raw_output, ec)."""
     encoded_command = base64.b64encode(command.encode()).decode("ascii")
+    encoded_wrapper = base64.b64encode(_BASH_WRAPPER.encode()).decode("ascii")
+    runtime_dirs = sorted(
+        {
+            os.path.dirname(_BASH_WRAPPER_PATH),
+            os.path.dirname(_BASH_CWD_PATH),
+            os.path.dirname(_BASH_ENV_PATH),
+            os.path.dirname(_BASH_COMMAND_PATH_PREFIX),
+        }
+    )
+    command_path_prefix = shlex.quote(_BASH_COMMAND_PATH_PREFIX)
+    shell_command = (
+        f"{shlex.join(['mkdir', '-p', *runtime_dirs])} || exit $?; "
+        f"if [ ! -x {shlex.quote(_BASH_WRAPPER_PATH)} ]; then "
+        f"printf %s {shlex.quote(encoded_wrapper)} | base64 -d "
+        f"> {shlex.quote(_BASH_WRAPPER_PATH)} && "
+        f"chmod +x {shlex.quote(_BASH_WRAPPER_PATH)} || exit $?; "
+        "fi; "
+        f"[ -f {shlex.quote(_BASH_CWD_PATH)} ] || "
+        f"printf '%s\\n' {shlex.quote(_BASH_DEFAULT_CWD)} "
+        f"> {shlex.quote(_BASH_CWD_PATH)}; "
+        f"[ -f {shlex.quote(_BASH_ENV_PATH)} ] || "
+        f": > {shlex.quote(_BASH_ENV_PATH)}; "
+        f"_tt_vanillux_command_path={command_path_prefix}$$; "
+        f"if printf %s {shlex.quote(encoded_command)} | base64 -d "
+        '> "$_tt_vanillux_command_path"; then '
+        f"bash {shlex.quote(_BASH_WRAPPER_PATH)} "
+        '"$_tt_vanillux_command_path"; '
+        "_tt_vanillux_rc=$?; "
+        "else _tt_vanillux_rc=$?; fi; "
+        'rm -f "$_tt_vanillux_command_path"; '
+        '(exit "$_tt_vanillux_rc")'
+    )
     ec, out, err = await sb.exec(
-        f"{_BASH_COMMAND_ENV}={shlex.quote(encoded_command)} "
-        f"bash {shlex.quote(_BASH_WRAPPER_PATH)}",
+        shell_command,
         user="root",
         timeout=timeout,
         check=False,

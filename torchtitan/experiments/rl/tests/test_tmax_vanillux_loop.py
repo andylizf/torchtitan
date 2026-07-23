@@ -12,6 +12,7 @@ import os
 import shlex
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -31,6 +32,28 @@ from torchtitan.experiments.rl.rollout.types import Rollout, RolloutStatus
 
 
 _RUN_BASH = vanillux_loop._run_bash
+
+
+def _patch_self_healing_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path, Path]:
+    wrapper_path = tmp_path / "wrapper.sh"
+    cwd_path = tmp_path / "cwd"
+    env_path = tmp_path / "env"
+    wrapper = (
+        vanillux_loop._BASH_WRAPPER.replace(vanillux_loop._BASH_CWD_PATH, str(cwd_path))
+        .replace(vanillux_loop._BASH_ENV_PATH, str(env_path))
+        .replace(vanillux_loop._BASH_DEFAULT_CWD, str(tmp_path))
+    )
+    monkeypatch.setattr(vanillux_loop, "_BASH_WRAPPER_PATH", str(wrapper_path))
+    monkeypatch.setattr(vanillux_loop, "_BASH_CWD_PATH", str(cwd_path))
+    monkeypatch.setattr(vanillux_loop, "_BASH_ENV_PATH", str(env_path))
+    monkeypatch.setattr(
+        vanillux_loop, "_BASH_COMMAND_PATH_PREFIX", str(tmp_path / "command.")
+    )
+    monkeypatch.setattr(vanillux_loop, "_BASH_DEFAULT_CWD", str(tmp_path))
+    monkeypatch.setattr(vanillux_loop, "_BASH_WRAPPER", wrapper)
+    return wrapper_path, cwd_path, env_path
 
 
 class _FakeAdapter:
@@ -169,6 +192,64 @@ def test_persistent_bash_wrapper_preserves_command_argument_semantics(
     )
     assert asyncio.run(_RUN_BASH(sandbox, "export PATH=/tmp/missing", 2)) == ("", 0)
     assert asyncio.run(_RUN_BASH(sandbox, "printf survived", 2)) == ("survived", 0)
+
+
+def test_persistent_bash_wrapper_recovers_after_tmp_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    wrapper_path, cwd_path, env_path = _patch_self_healing_runtime(
+        monkeypatch, tmp_path
+    )
+
+    class LocalSandbox:
+        async def exec(self, command: str, **kwargs) -> tuple[int, str, str]:
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=kwargs["timeout"] + 2,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
+
+    cleanup = shlex.join(["rm", "-f", str(wrapper_path), str(cwd_path), str(env_path)])
+    sandbox = LocalSandbox()
+
+    assert asyncio.run(_RUN_BASH(sandbox, f"{cleanup}; printf first", 2)) == (
+        "first",
+        0,
+    )
+    assert not wrapper_path.exists()
+    cwd_path.unlink(missing_ok=True)
+    env_path.unlink(missing_ok=True)
+    assert asyncio.run(_RUN_BASH(sandbox, "printf second", 2)) == ("second", 0)
+    assert wrapper_path.is_file() and cwd_path.is_file() and env_path.is_file()
+
+
+def test_persistent_bash_wrapper_handles_large_command_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _patch_self_healing_runtime(monkeypatch, tmp_path)
+
+    class LocalSandbox:
+        async def exec(self, command: str, **kwargs) -> tuple[int, str, str]:
+            transport_path = tmp_path / "transport.sh"
+            transport_path.write_text(command)
+            completed = subprocess.run(
+                ["bash", str(transport_path)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=kwargs["timeout"] + 2,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
+
+    command = "printf large-command-ok; # " + "x" * 256_000
+
+    assert asyncio.run(_RUN_BASH(LocalSandbox(), command, 2)) == (
+        "large-command-ok",
+        0,
+    )
 
 
 def test_finish_reason_submit(monkeypatch: pytest.MonkeyPatch) -> None:
