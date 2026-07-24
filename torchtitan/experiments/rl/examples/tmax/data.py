@@ -92,6 +92,14 @@ class TMaxDataset(Configurable):
         Every ``instance_id`` in it is dropped at load, so prompts that gave no learning
         signal (all-pass or all-fail groups) are not sampled again. Empty = keep all rows."""
 
+        initial_skip_samples: int = 0
+        """Consume this many samples before the first sample is returned.
+
+        This supports an explicit data-stream offset when resuming a run whose controller
+        dataset state was not checkpointed. The skipped samples advance shuffle state in
+        exactly the same way as normal iteration, including across dataset wraps.
+        """
+
     def __init__(self, config: Config) -> None:
         if not config.data_path:
             raise ValueError("TMaxDataset.Config.data_path is required")
@@ -188,6 +196,18 @@ class TMaxDataset(Configurable):
                         f"all rows filtered out by skip_ids_path={config.skip_ids_path}"
                     )
         self._pos = 0
+        if config.initial_skip_samples < 0:
+            raise ValueError(
+                "TMaxDataset.Config.initial_skip_samples must be non-negative, "
+                f"got {config.initial_skip_samples}"
+            )
+        for _ in range(config.initial_skip_samples):
+            next(self)
+        if config.initial_skip_samples:
+            logger.info(
+                "TMaxDataset: skipped %d initial sample(s)",
+                config.initial_skip_samples,
+            )
 
     def __iter__(self) -> Iterator[TMaxSample]:
         return self
