@@ -40,6 +40,14 @@ class TrainingSampleBuilder(Configurable):
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
 
+        drop_groups_with_untrainable_rollouts: bool = True
+        """Drop a group when any sibling has no completion tokens.
+
+        When false, untrainable siblings still contribute their scored reward to
+        group advantage estimation, but produce no training tokens. This matches
+        systems that retain failed environment rollouts as zero-reward siblings.
+        """
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -61,10 +69,24 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
-        # Untrainable: any sibling with no completion tokens -> drop the whole group
-        if any(
+        # A rollout with no completion tokens cannot produce a training sample.
+        # Most recipes drop its whole centered-advantage group. Some environments
+        # intentionally score infrastructure failures as zero, in which case the
+        # empty sibling must stay in reward centering while contributing no tokens.
+        num_untrainable_rollouts = sum(
             not any(turn.completion_token_ids for turn in rollout.turns)
             for rollout in rollout_group.rollouts
+        )
+        if num_untrainable_rollouts:
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_untrainable_rollouts",
+                    m.Sum(float(num_untrainable_rollouts)),
+                )
+            )
+        if (
+            num_untrainable_rollouts
+            and self.config.drop_groups_with_untrainable_rollouts
         ):
             metrics.append(
                 m.Metric(

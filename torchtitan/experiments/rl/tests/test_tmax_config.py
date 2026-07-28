@@ -4,12 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
+
 import pytest
 
 from torchtitan.experiments.rl.examples.tmax.config_registry import (
     rl_grpo_qwen3_4b_tmax,
     rl_grpo_qwen3_5_9b_tmax,
 )
+from torchtitan.experiments.rl.rollout.types import Rollout, RolloutStatus
 
 
 @pytest.mark.parametrize(
@@ -47,7 +50,7 @@ def test_tmax_9b_uses_open_instruct_optimizer_and_mixed_precision(
     }
 
 
-def test_tmax_batch_invariant_diagnostics_keep_required_bf16(
+def test_tmax_batch_invariant_uses_fp32_master_and_bf16_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("SWE_LR", raising=False)
@@ -56,10 +59,13 @@ def test_tmax_batch_invariant_diagnostics_keep_required_bf16(
     config = rl_grpo_qwen3_5_9b_tmax()
 
     assert config.trainer.debug.batch_invariant
-    assert config.trainer.training.dtype == "bfloat16"
+    training = config.trainer.training
+    assert training.dtype == "float32"
+    assert training.mixed_precision_param == "bfloat16"
+    assert training.mixed_precision_reduce == "float32"
 
 
-def test_tmax_4b_diagnostic_keeps_required_bf16(
+def test_tmax_4b_batch_invariant_uses_fp32_master_and_bf16_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("SWE_GDN_BI", raising=False)
@@ -68,7 +74,50 @@ def test_tmax_4b_diagnostic_keeps_required_bf16(
     config = rl_grpo_qwen3_4b_tmax()
 
     assert config.trainer.debug.batch_invariant
-    assert config.trainer.training.dtype == "bfloat16"
+    training = config.trainer.training
+    assert training.dtype == "float32"
+    assert training.mixed_precision_param == "bfloat16"
+    assert training.mixed_precision_reduce == "float32"
+
+
+@pytest.mark.parametrize(
+    ("time_budget_override", "expected_time_budget"),
+    [(None, 2400), ("1800", 1800)],
+)
+def test_tmax_time_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    time_budget_override: str | None,
+    expected_time_budget: int,
+) -> None:
+    if time_budget_override is None:
+        monkeypatch.delenv("SWE_TIME_BUDGET_SEC", raising=False)
+    else:
+        monkeypatch.setenv("SWE_TIME_BUDGET_SEC", time_budget_override)
+
+    config = rl_grpo_qwen3_5_9b_tmax()
+
+    assert config.rollouter.time_budget_sec == expected_time_budget
+
+
+def test_tmax_keeps_zero_reward_infra_siblings_for_oi_parity() -> None:
+    config = rl_grpo_qwen3_5_9b_tmax()
+    builder = config.async_loop.training_sample_builder
+
+    assert not builder.drop_groups_with_untrainable_rollouts
+
+    rubric_config = config.rollouter.rubric
+    assert rubric_config.error_reward is None
+    assert rubric_config.truncation_reward is None
+
+    rollout = Rollout(
+        group_id=0,
+        rollout_id=0,
+        status=RolloutStatus.ERROR,
+    )
+    output = asyncio.run(rubric_config.build().score_group([rollout], object()))[0]
+
+    assert output.reward == 0.0
+    assert output.reward_breakdown == {"RewardTMax": 0.0}
 
 
 @pytest.mark.parametrize(

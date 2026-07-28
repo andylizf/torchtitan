@@ -28,6 +28,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchtitan.components.loss import (
     _LossParallelCrossEntropy,
     ChunkedLossWrapper,
+    compute_logprobs,
     cross_entropy_loss,
     CrossEntropyLoss,
     GradAccumulator,
@@ -410,6 +411,84 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                             logits_dtensor.grad.full_tensor(),
                         )
                     )
+
+    @with_comms
+    def test_compute_logprobs_vocab_parallel_parity(self):
+        torch.manual_seed(42)
+        B, L, V = 2, 8, 64
+        mesh = init_device_mesh(
+            self.device_type,
+            (1, self.world_size),
+            mesh_dim_names=("dp", "tp"),
+        )
+
+        logits = torch.randn(B, L, V, device=self.device_type)
+        labels = torch.randint(0, V, (B, L), device=self.device_type)
+        labels[0, 1] = IGNORE_INDEX
+
+        reference_logits = logits.clone().requires_grad_(True)
+        reference = -F.cross_entropy(
+            reference_logits.reshape(B * L, V),
+            labels.reshape(B * L),
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+        ).reshape(B, L)
+
+        logits_dtensor = distribute_tensor(
+            logits,
+            mesh,
+            (Replicate(), Shard(2)),
+        ).detach()
+        logits_dtensor.requires_grad_(True)
+        actual = compute_logprobs(logits_dtensor, labels)
+
+        torch.testing.assert_close(actual, reference)
+
+        actual.sum().backward()
+        reference.sum().backward()
+        torch.testing.assert_close(
+            logits_dtensor.grad.full_tensor(),
+            reference_logits.grad,
+        )
+
+    @with_comms
+    def test_compute_logprobs_singleton_vocab_axis_bitwise(self):
+        torch.manual_seed(42)
+        B, L, V = 2, 8, 64
+        mesh = init_device_mesh(
+            self.device_type,
+            (self.world_size, 1),
+            mesh_dim_names=("dp", "tp"),
+        )
+
+        logits = torch.randn(B, L, V, device=self.device_type)
+        labels = torch.randint(0, V, (B, L), device=self.device_type)
+        labels[0, 1] = IGNORE_INDEX
+
+        reference_logits = logits.clone().requires_grad_(True)
+        reference = -F.cross_entropy(
+            reference_logits.reshape(B * L, V),
+            labels.reshape(B * L),
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+        ).reshape(B, L)
+
+        logits_dtensor = distribute_tensor(
+            logits,
+            mesh,
+            (Replicate(), Shard(2)),
+        ).detach()
+        logits_dtensor.requires_grad_(True)
+        actual = compute_logprobs(logits_dtensor, labels)
+
+        assert torch.equal(actual, reference)
+
+        actual.sum().backward()
+        reference.sum().backward()
+        assert torch.equal(
+            logits_dtensor.grad.full_tensor(),
+            reference_logits.grad,
+        )
 
 
 class _FakeDecoder(nn.Module):

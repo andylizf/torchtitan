@@ -11,11 +11,16 @@ from __future__ import annotations
 import logging
 import math
 import os
-from unittest.mock import MagicMock
+from unittest.mock import call, MagicMock
 
 import pytest
 
-from torchtitan.components.metrics import BaseLogger, TensorBoardLogger, WandBLogger
+from torchtitan.components.metrics import (
+    BaseLogger,
+    LoggerContainer,
+    TensorBoardLogger,
+    WandBLogger,
+)
 from torchtitan.experiments.rl.observability import metrics as m
 
 
@@ -491,10 +496,18 @@ def test_metric_backend_is_base_logger() -> None:
 class _RecordingBackend(m.MetricBackend):
     def __init__(self) -> None:
         self.calls: list[tuple[dict, int]] = []
+        self.commits: list[bool | None] = []
         self.closed = False
 
-    def log(self, metrics: dict, step: int) -> None:
+    def log(
+        self,
+        metrics: dict,
+        step: int,
+        *,
+        commit: bool | None = None,
+    ) -> None:
         self.calls.append((dict(metrics), step))
+        self.commits.append(commit)
 
     def close(self) -> None:
         self.closed = True
@@ -505,7 +518,13 @@ class _RaisingBackend(m.MetricBackend):
         self.log_calls = 0
         self.close_calls = 0
 
-    def log(self, metrics: dict, step: int) -> None:
+    def log(
+        self,
+        metrics: dict,
+        step: int,
+        *,
+        commit: bool | None = None,
+    ) -> None:
         self.log_calls += 1
         raise RuntimeError("boom")
 
@@ -514,7 +533,24 @@ class _RaisingBackend(m.MetricBackend):
         raise RuntimeError("boom on close")
 
 
+class _LegacyBackend(BaseLogger):
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, int]] = []
+
+    def log(self, metrics: dict, step: int) -> None:
+        self.calls.append((dict(metrics), step))
+
+
 class TestMetricsProcessorFanOut:
+    def test_default_log_supports_legacy_backend(self) -> None:
+        backend = _LegacyBackend()
+        logger_inst = m.MetricsProcessor(m.MetricsProcessor.Config())
+        logger_inst._backends = [backend]
+
+        logger_inst.log(5, [m.Metric("k", m.NoReduce(2.0))])
+
+        assert backend.calls == [({"k": 2.0}, 5)]
+
     def test_log_aggregates_and_dispatches(self) -> None:
         b1 = _RecordingBackend()
         b2 = _RecordingBackend()
@@ -529,6 +565,27 @@ class TestMetricsProcessorFanOut:
         )
         assert b1.calls == [({"k/mean": 2.0, "k/max": 3.0}, 5)]
         assert b2.calls == [({"k/mean": 2.0, "k/max": 3.0}, 5)]
+        assert b1.commits == [None]
+        assert b2.commits == [None]
+
+    def test_log_forwards_commit(self) -> None:
+        backend = _RecordingBackend()
+        logger_inst = m.MetricsProcessor(m.MetricsProcessor.Config())
+        logger_inst._backends = [backend]
+
+        logger_inst.log(
+            10,
+            [m.Metric("train/loss", m.NoReduce(1.0))],
+            commit=False,
+        )
+        logger_inst.log(
+            10,
+            [m.Metric("validation/reward", m.NoReduce(0.5))],
+            is_validation=True,
+            commit=True,
+        )
+
+        assert backend.commits == [False, True]
 
     def test_log_isolates_failures(self, caplog: pytest.LogCaptureFixture) -> None:
         good = _RecordingBackend()
@@ -556,6 +613,15 @@ class TestMetricsProcessorFanOut:
 
 
 class TestMetricsProcessorBuild:
+    def test_logger_container_default_supports_legacy_logger(self) -> None:
+        backend = _LegacyBackend()
+        container = LoggerContainer()
+        container.add_logger(backend)
+
+        container.log({"k": 2.0}, step=5)
+
+        assert backend.calls == [({"k": 2.0}, 5)]
+
     def test_default_builds_no_backends(self) -> None:
         """Default config builds an empty backend list. Console line is
         suppressed by the empty allow list."""
@@ -635,6 +701,23 @@ class TestMetricsProcessorBuild:
         # `log` forwards to the stub.
         logger_inst.log(3, [m.Metric("k", m.NoReduce(1.0))])
         fake_wandb.log.assert_called_once_with({"k": 1.0}, step=3)
+
+        fake_wandb.log.reset_mock()
+        logger_inst.log(
+            10,
+            [m.Metric("train/loss", m.NoReduce(1.0))],
+            commit=False,
+        )
+        logger_inst.log(
+            10,
+            [m.Metric("validation/reward", m.NoReduce(0.5))],
+            is_validation=True,
+            commit=True,
+        )
+        assert fake_wandb.log.call_args_list == [
+            call({"train/loss": 1.0}, step=10, commit=False),
+            call({"validation/reward": 0.5}, step=10, commit=True),
+        ]
 
         # `close` calls `wandb.finish` when there's a run.
         fake_wandb.run = MagicMock()

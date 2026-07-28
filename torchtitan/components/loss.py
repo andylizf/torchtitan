@@ -371,21 +371,46 @@ def compute_logprobs(
 ) -> torch.Tensor:
     """Compute per-position logprobs from logits and labels.
 
-    Output shape matches input: ``[batch, seq_len]``. Any DTensor placement
-    handling is centralized here so RL losses that call ``compute_logprobs`` do
-    not need to duplicate the vocab-gather logic.
+    Output shape matches input: ``[batch, seq_len]``. DTensor placement handling
+    is centralized here so RL losses can consume vocab-sharded logits without
+    materializing the full vocabulary on every TP rank.
     """
     if isinstance(logits, DTensor):
-        # TODO: pass `grad_placements=[Replicate(), ...]` to make the autograd
-        # contract explicit (see .claude/rules/distributed.md).
-        # Gather vocab-sharded TP logits before computing per-token logprobs.
-        placements = tuple(
-            Replicate()
-            if isinstance(p, Shard) and p.dim in (-1, logits.ndim - 1)
-            else p
-            for p in logits.placements
-        )
-        logits = logits.redistribute(placements=placements).to_local()
+        vocab_shard_axes = [
+            axis
+            for axis, placement in enumerate(logits.placements)
+            if isinstance(placement, Shard) and placement.dim in (-1, logits.ndim - 1)
+        ]
+        if len(vocab_shard_axes) == 1:
+            vocab_shard_group = logits.device_mesh.get_group(vocab_shard_axes[0])
+            labels_local = labels.to_local() if isinstance(labels, DTensor) else labels
+            if dist.get_world_size(vocab_shard_group) > 1:
+                nll = _LossParallelCrossEntropy.apply(
+                    logits.to_local(),
+                    labels_local,
+                    vocab_shard_group,
+                    logits.shape[-1],
+                    "none",
+                )
+                return -nll.reshape(labels_local.shape)
+
+            # Preserve the plain F.cross_entropy path for a singleton TP axis.
+            # The BI generator uses that same op on plain logits, so replacing it
+            # with the manual distributed CE would break bitwise parity at TP=1.
+            logits = logits.to_local()
+            labels = labels_local
+
+        else:
+            # Preserve support for tensors whose vocabulary is not sharded or is
+            # sharded over multiple mesh axes. The latter cannot use the single-axis
+            # loss-parallel implementation above.
+            placements = tuple(
+                Replicate()
+                if isinstance(p, Shard) and p.dim in (-1, logits.ndim - 1)
+                else p
+                for p in logits.placements
+            )
+            logits = logits.redistribute(placements=placements).to_local()
 
     B, L, V = logits.shape
     return -F.cross_entropy(

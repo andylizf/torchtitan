@@ -104,7 +104,13 @@ def build_device_memory_monitor():
 class BaseLogger:
     """Logger that does nothing, used when logging is disabled."""
 
-    def log(self, metrics: dict[str, Any], step: int) -> None:
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        *,
+        commit: bool | None = None,
+    ) -> None:
         pass
 
     def close(self) -> None:
@@ -119,7 +125,13 @@ class TensorBoardLogger(BaseLogger):
         self.writer = SummaryWriter(log_dir, max_queue=1000)
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
-    def log(self, metrics: dict[str, Any], step: int) -> None:
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        *,
+        commit: bool | None = None,
+    ) -> None:
         for k, v in metrics.items():
             tag = k if self.tag is None else f"{self.tag}/{k}"
             self.writer.add_scalar(tag, v, step)
@@ -162,12 +174,21 @@ class WandBLogger(BaseLogger):
         )
         logger.info("WandB logging enabled")
 
-    def log(self, metrics: dict[str, Any], step: int) -> None:
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        *,
+        commit: bool | None = None,
+    ) -> None:
         wandb_metrics = {
             (k if self.tag is None else f"{self.tag}/{k}"): v
             for k, v in metrics.items()
         }
-        self.wandb.log(wandb_metrics, step=step)
+        if commit is None:
+            self.wandb.log(wandb_metrics, step=step)
+        else:
+            self.wandb.log(wandb_metrics, step=step, commit=commit)
 
     def close(self) -> None:
         if self.wandb.run is not None:
@@ -183,9 +204,18 @@ class LoggerContainer(BaseLogger):
     def add_logger(self, logger_instance: BaseLogger) -> None:
         self._loggers.append(logger_instance)
 
-    def log(self, metrics: dict[str, Any], step: int) -> None:
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        *,
+        commit: bool | None = None,
+    ) -> None:
         for logger_instance in self._loggers:
-            logger_instance.log(metrics, step)
+            if commit is None:
+                logger_instance.log(metrics, step)
+            else:
+                logger_instance.log(metrics, step, commit=commit)
 
     @property
     def number_of_loggers(self) -> int:

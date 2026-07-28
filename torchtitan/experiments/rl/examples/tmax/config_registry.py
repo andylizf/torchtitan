@@ -117,7 +117,7 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
         # names + defaults as before; the RolloutWorker pool splits
         # rollout_concurrency across workers.
         rollout_concurrency=int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "16")),
-        time_budget_sec=int(os.environ.get("SWE_TIME_BUDGET_SEC", "1200")),
+        time_budget_sec=int(os.environ.get("SWE_TIME_BUDGET_SEC", "2400")),
         eval_timeout_sec=int(os.environ.get("TMAX_EVAL_TIMEOUT_SEC", "600")),
         max_context_tokens=int(os.environ.get("SWE_MAX_CONTEXT_LEN", "32768")),
     )
@@ -327,6 +327,10 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         ),
         training_sample_builder=TrainingSampleBuilder.Config(
             drop_zero_std_reward_groups=True,
+            # Open-Instruct keeps an exhausted sandbox/reset failure as a
+            # zero-reward sibling. It participates in centered advantage while
+            # its empty completion contributes no training tokens.
+            drop_groups_with_untrainable_rollouts=False,
         ),
         batcher=dataclasses.replace(
             config.async_loop.batcher,
@@ -363,7 +367,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # re-prefill storm. SWE_SALT_KV=0 reverts to the reset-and-re-prefill path.
     _salt_kv = os.environ.get("SWE_SALT_KV", "1") == "1"
     # cudagraph FULL_DECODE_ONLY: ~3x GDN decode throughput (local bench 27->85 tok/s on
-    # the 4B unified), which directly cuts the 20min-wall nonsubmit rate (see the
+    # the 4B unified), which directly cuts the time-budget nonsubmit rate (see the
     # finish-reason analysis: ~30% of rollouts die on the wall). tmax DEFAULTS it ON
     # (SWE_GEN_CUDAGRAPH default "1" here, vs "0" in the swe base). Stays
     # FULL_DECODE_ONLY -- a mixed prefill-decode FULL graph corrupts (#3668).
@@ -475,10 +479,6 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         config.trainer = dataclasses.replace(
             config.trainer,
             debug=_bi,
-            # The current batch-invariant path requires full bf16 training. This
-            # diagnostic mode intentionally opts out of the fp32 master used by
-            # the normal 9B training recipe.
-            training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
             parallelism=dataclasses.replace(
                 config.trainer.parallelism, enable_sequence_parallel=False
             ),
@@ -512,11 +512,10 @@ def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
     much of the 9B GDN logprob drift is GDN-specific (chunk-parallel train vs
     recurrent decode) rather than generic batch/kernel nondeterminism.
 
-    This diagnostic intentionally uses full bf16 training instead of the 9B
-    recipe's fp32 master parameters because batch invariance currently requires a
-    bf16 trainer dtype. It also requires no sequence parallel and the reset (not
-    salt) prefix-cache policy; the 9B tmax base enables salt-KV, so it is turned
-    off here.
+    The trainer keeps the 9B recipe's fp32 master parameters and uses bf16 forward
+    parameters through FSDP mixed precision. It also requires no sequence parallel
+    and the reset (not salt) prefix-cache policy; the 9B tmax base enables salt-KV,
+    so it is turned off here.
     """
     _bi = DebugConfig(batch_invariant=True, deterministic=True)
     config = rl_grpo_qwen3_5_9b_tmax()
@@ -530,7 +529,6 @@ def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
     config.trainer = dataclasses.replace(
         config.trainer,
         debug=_bi,
-        training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
         parallelism=dataclasses.replace(
             config.trainer.parallelism, enable_sequence_parallel=False
         ),
@@ -557,7 +555,8 @@ def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
         config.async_loop = dataclasses.replace(
             config.async_loop,
             training_sample_builder=TrainingSampleBuilder.Config(
-                drop_zero_std_reward_groups=False
+                drop_zero_std_reward_groups=False,
+                drop_groups_with_untrainable_rollouts=False,
             ),
         )
     return config

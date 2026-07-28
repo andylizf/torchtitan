@@ -260,7 +260,9 @@ def rl_grpo_qwen3_5_4b_varlen_unified_cg() -> Controller.Config:
 def rl_grpo_qwen3_5_4b_varlen_unified_compile() -> Controller.Config:
     """Feasibility probe: unified GDN + per-layer torch.compile (aot_eager), no cudagraph."""
     cfg = rl_grpo_qwen3_5_4b_varlen_unified()
-    return dataclasses.replace(cfg, compile=CompileConfig(enable=True, backend="aot_eager"))
+    return dataclasses.replace(
+        cfg, compile=CompileConfig(enable=True, backend="aot_eager")
+    )
 
 
 def rl_grpo_qwen3_5_4b_varlen_unified_cg_compile() -> Controller.Config:
@@ -279,7 +281,9 @@ def rl_grpo_qwen3_5_4b_varlen_unified_cg_compile() -> Controller.Config:
 def rl_grpo_qwen3_5_4b_varlen_unified_inductor() -> Controller.Config:
     """Feasibility probe: unified GDN + torch.compile INDUCTOR (expected: GDN not compile-clean)."""
     cfg = rl_grpo_qwen3_5_4b_varlen_unified()
-    return dataclasses.replace(cfg, compile=CompileConfig(enable=True, backend="inductor"))
+    return dataclasses.replace(
+        cfg, compile=CompileConfig(enable=True, backend="inductor")
+    )
 
 
 def rl_grpo_qwen3_5_4b_varlen_unified_prefix() -> Controller.Config:

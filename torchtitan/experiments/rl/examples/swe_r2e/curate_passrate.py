@@ -298,7 +298,9 @@ def _dump_trace(
         "=" * 80,
     ]
     if captured:
-        first = tokenizer.decode(captured[0].prompt_token_ids, skip_special_tokens=False)
+        first = tokenizer.decode(
+            captured[0].prompt_token_ids, skip_special_tokens=False
+        )
         lines += ["TURN-0 PROMPT (system + first user):", first, "=" * 80]
     for i, t in enumerate(captured):
         comp = tokenizer.decode(t.completion_token_ids, skip_special_tokens=False)
@@ -402,7 +404,15 @@ async def grade_attempt(
         num_turns = len(captured)
         if dump_dir and tokenizer is not None:
             _dump_trace(
-                dump_dir, sample, k, captured, diff_text, tokenizer, status, solved, reward
+                dump_dir,
+                sample,
+                k,
+                captured,
+                diff_text,
+                tokenizer,
+                status,
+                solved,
+                reward,
             )
 
     _write_result(

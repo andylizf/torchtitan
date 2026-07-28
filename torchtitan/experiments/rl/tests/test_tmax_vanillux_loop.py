@@ -333,7 +333,7 @@ def test_sandbox_issue_metrics_count_events_and_affected_rollouts() -> None:
     }
 
 
-def test_infra_failed_sibling_drops_group_before_scoring() -> None:
+def test_infra_failed_sibling_is_scored_as_zero_reward() -> None:
     rollouter = object.__new__(TMaxRollouter)
     rollouter._ensure_adapter = AsyncMock(return_value=object())
 
@@ -362,8 +362,16 @@ def test_infra_failed_sibling_drops_group_before_scoring() -> None:
         )
 
     rollouter._run_agent_rollout = AsyncMock(side_effect=run_sibling)
-    rollouter.score_group = AsyncMock()
-    rollouter.advantage_estimator = Mock()
+
+    async def score_group(rollouts, sample):
+        del sample
+        return [
+            Mock(reward=1.0, reward_breakdown={}),
+            Mock(reward=0.0, reward_breakdown={}),
+        ]
+
+    rollouter.score_group = AsyncMock(side_effect=score_group)
+    rollouter.advantage_estimator = Mock(return_value=[0.5, -0.5])
     rollouter._maybe_annotate_zero_std = Mock()
 
     group = asyncio.run(
@@ -377,10 +385,11 @@ def test_infra_failed_sibling_drops_group_before_scoring() -> None:
         )
     )
 
-    assert group.rollouts == []
-    rollouter.score_group.assert_not_awaited()
-    rollouter.advantage_estimator.assert_not_called()
-    rollouter._maybe_annotate_zero_std.assert_not_called()
+    assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
+    assert [rollout.advantage for rollout in group.rollouts] == [0.5, -0.5]
+    rollouter.score_group.assert_awaited_once()
+    rollouter.advantage_estimator.assert_called_once()
+    rollouter._maybe_annotate_zero_std.assert_called_once()
     metric_values = {
         metric.key: metric.value.value
         for metric in group.metrics
@@ -388,7 +397,7 @@ def test_infra_failed_sibling_drops_group_before_scoring() -> None:
     }
     assert metric_values == {
         "rollout/infra_failed_frac": 0.5,
-        "rollout/infra_invalid_group_frac": 1.0,
+        "rollout/infra_failed_group_frac": 1.0,
     }
 
 

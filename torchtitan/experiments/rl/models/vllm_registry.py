@@ -27,9 +27,10 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
+
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from torchtitan.components.checkpoint import CheckpointManager

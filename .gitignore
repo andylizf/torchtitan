@@ -52,3 +52,11 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# Locally generated Qwen3.5 batch-invariant diagram
+/docs/qwen3_5_batch_invariant_mode.dot
+/docs/qwen3_5_batch_invariant_mode.svg
+/docs/qwen3_5_batch_invariant_mode.png
+
+# Locally generated RewardTMax training curve
+/rollout_reward_tmax_mean.png

@@ -6,9 +6,16 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
-from math_verify import LatexExtractionConfig, LatexNormalizationConfig, parse, verify
+from math_verify import (
+    ExprExtractionConfig,
+    LatexExtractionConfig,
+    LatexNormalizationConfig,
+    parse,
+    verify,
+)
 from math_verify.errors import TimeoutException
 
 from torchtitan.experiments.rl.examples.dapo_math.data import DapoMathSample
@@ -22,7 +29,8 @@ _FINAL_ANSWER_EXTRACTION = [
         normalization_config=LatexNormalizationConfig(units=True),
         boxed_match_priority=0,
         try_extract_without_anchor=False,
-    )
+    ),
+    ExprExtractionConfig(try_extract_without_anchor=False),
 ]
 
 
@@ -37,13 +45,17 @@ def score_math_response(response: str, ground_truth: str) -> float:
         score_math_response("work\nAnswer: $34$", "34")  # 1.0
     """
     try:
-        gold = parse(ground_truth)
+        # RolloutWorker endpoints execute outside the process main thread, where
+        # Math-Verify's signal-based timeout would make every parse return empty.
+        timeout = 5 if threading.current_thread() is threading.main_thread() else None
+        gold = parse(ground_truth, parsing_timeout=timeout)
         prediction = parse(
             response,
             extraction_config=_FINAL_ANSWER_EXTRACTION,
             extraction_mode="first_match",
+            parsing_timeout=timeout,
         )
-        return float(bool(gold) and verify(gold, prediction))
+        return float(bool(gold) and verify(gold, prediction, timeout_seconds=timeout))
     except (Exception, TimeoutException):
         # Model output is untrusted; malformed LaTeX is an incorrect answer, not a
         # training-loop failure. Math-Verify raises `TimeoutException` from BaseException.

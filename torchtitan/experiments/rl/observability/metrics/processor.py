@@ -163,6 +163,7 @@ class MetricsProcessor(Configurable):
         metrics: Iterable[Metric],
         *,
         is_validation: bool = False,
+        commit: bool | None = None,
     ) -> None:
         """Reduce metrics, prints to console, dispatch to backends.
 
@@ -176,6 +177,7 @@ class MetricsProcessor(Configurable):
             is_validation: When True, use `console_log_keys_validation`
                 and render the prefix "Validation | Step: ...".
                 If False, use `console_log_keys_train` and render "Train | Step: ...".
+            commit: Optional W&B transaction boundary. TensorBoard ignores it.
 
         Example:
             metrics_processor.log(step=step, metrics=train_metrics)
@@ -203,7 +205,10 @@ class MetricsProcessor(Configurable):
         # log to backends
         for backend in self._backends:
             try:
-                backend.log(reduced_metrics, step)
+                if commit is None:
+                    backend.log(reduced_metrics, step)
+                else:
+                    backend.log(reduced_metrics, step, commit=commit)
             except Exception:
                 logger.exception(
                     "metric backend %s failed at step %d",

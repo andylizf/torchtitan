@@ -108,9 +108,16 @@ def _rollout(response: str) -> Rollout:
 
 
 def test_math_verifier_requires_an_answer_marker() -> None:
+    assert score_math_response("work\nAnswer: 34", "34") == 1.0
     assert score_math_response("work\nAnswer: $34$", "34") == 1.0
     assert score_math_response(r"work\n\boxed{34}", "34") == 1.0
     assert score_math_response("work mentions 34", "34") == 0.0
+
+
+def test_math_verifier_runs_in_rollout_worker_thread() -> None:
+    assert (
+        asyncio.run(asyncio.to_thread(score_math_response, "Answer: 34", "34")) == 1.0
+    )
 
 
 def test_reward_handles_equivalent_latex_and_units() -> None:

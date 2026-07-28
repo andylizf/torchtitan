@@ -30,6 +30,24 @@ from torchtitan.models.common.nn_modules import Linear
 from torchtitan.protocols.model import ModelConfigConverter
 
 
+_cast_linear_inference_cache_enabled = False
+
+
+def set_cast_linear_inference_cache(enabled: bool) -> None:
+    """Enable a process-local compute-dtype weight cache for ``CastLinear``."""
+    global _cast_linear_inference_cache_enabled
+    _cast_linear_inference_cache_enabled = enabled
+
+
+def refresh_cast_linear_inference_caches(module: torch.nn.Module) -> None:
+    """Refresh initialized ``CastLinear`` caches after an inference weight sync."""
+    if not _cast_linear_inference_cache_enabled:
+        return
+    for child in module.modules():
+        if isinstance(child, CastLinear):
+            child.refresh_inference_weight_cache()
+
+
 class CastLinear(Linear):
     """``Linear`` whose forward matmul runs in ``compute_dtype``.
 
@@ -48,16 +66,32 @@ class CastLinear(Linear):
     def __init__(self, config: Config):
         super().__init__(config)
         self.compute_dtype = TORCH_DTYPE_MAP[config.compute_dtype]
+        self.register_buffer("_inference_weight_cache", None, persistent=False)
+
+    @torch.inference_mode()
+    def refresh_inference_weight_cache(self) -> None:
+        """Copy the current parameter into the stable inference cache."""
+        if self._inference_weight_cache is None:
+            self._inference_weight_cache = self.weight.to(self.compute_dtype)
+        else:
+            self._inference_weight_cache.copy_(self.weight)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # The weight is re-cast on every call. In training that is unavoidable:
-        # the optimizer updates the weight each step. TODO: for inference the
-        # weight is fixed between weight syncs, so the upcast copy could be
-        # cached to avoid repeating the cast on every forward.
+        if _cast_linear_inference_cache_enabled:
+            if self._inference_weight_cache is None:
+                if input.is_cuda and torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "CastLinear inference cache must be initialized before "
+                        "CUDA graph capture"
+                    )
+                self.refresh_inference_weight_cache()
+            weight = self._inference_weight_cache
+        else:
+            # Training updates the parameter every step, so it must cast the live
+            # parameter rather than reuse the generator-only inference cache.
+            weight = self.weight.to(self.compute_dtype)
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
-        return F.linear(
-            input.to(self.compute_dtype), self.weight.to(self.compute_dtype), bias
-        )
+        return F.linear(input.to(self.compute_dtype), weight, bias)
 
 
 class LMHeadCastConverter(ModelConfigConverter):

@@ -184,6 +184,16 @@ class ValidationConfig:
     add its own wall time to the step it runs on (one greedy validation rollout's latency)."""
 
 
+def _will_validate_after_step(
+    *, validation: ValidationConfig, step: int, num_training_steps: int
+) -> bool:
+    """Return whether a non-empty validation pass follows this training step."""
+    return validation.num_samples > 0 and (
+        step == num_training_steps
+        or (validation.interval > 0 and step % validation.interval == 0)
+    )
+
+
 @dataclass(kw_only=True, slots=True)
 class AsyncLoopConfig(Configurable.Config):
     num_training_steps: int = 10
@@ -425,12 +435,17 @@ class Controller(Configurable):
                     )
                 if not self.trainer.debug.deterministic:
                     raise ValueError("batch_invariant requires deterministic=True")
-                # TODO: Replace trainer dtype constraint to use mixed
-                #  training enabled by FSDP.
-                if self.trainer.training.dtype != "bfloat16":
+                training = self.trainer.training
+                # FSDP2 applies MixedPrecisionPolicy even on a singleton FSDP
+                # axis, so this field controls the forward parameter dtype
+                # independently of the master parameter dtype.
+                if training.mixed_precision_param != "bfloat16":
                     raise ValueError(
-                        f"batch_invariant requires bfloat16 training dtype, "
-                        f"got {self.trainer.training.dtype!r}"
+                        "batch_invariant requires bfloat16 forward parameters via "
+                        "training.mixed_precision_param='bfloat16'; got "
+                        f"training.dtype={training.dtype!r}, "
+                        "training.mixed_precision_param="
+                        f"{training.mixed_precision_param!r}"
                     )
                 if self.generator.model_dtype != "bfloat16":
                     raise ValueError(
@@ -1031,7 +1046,13 @@ class Controller(Configurable):
     async def _validate_and_log(self, *, step: int) -> dict[str, float]:
         """Run one validation pass, log it, and return its aggregated values for the pre/post delta."""
         metrics = await self.validate(step=step)
-        self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
+        if metrics:
+            self.metrics_processor.log(
+                step=step,
+                metrics=metrics,
+                is_validation=True,
+                commit=True,
+            )
         return m.MetricsProcessor._aggregate_metrics(metrics)
 
     def _log_reward_delta(self, pre: dict[str, float], post: dict[str, float]) -> None:
@@ -1401,9 +1422,16 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            validation = self.config.async_loop.validation
+            will_validate = _will_validate_after_step(
+                validation=validation,
+                step=step,
+                num_training_steps=num_training_steps,
+            )
             self.metrics_processor.log(
                 step=step,
                 is_validation=False,
+                commit=not will_validate,
                 metrics=[
                     *packed.metrics,
                     *[
@@ -1435,12 +1463,7 @@ class Controller(Configurable):
             # pass right after the loop. Runs on this step's just-pulled weights, overlapping
             # the background rollout collection (disjoint negative group ids), so the curve
             # tracks the live policy without a separate eval job or checkpoint download.
-            validation = self.config.async_loop.validation
-            if (
-                validation.interval > 0
-                and step % validation.interval == 0
-                and step != num_training_steps
-            ):
+            if will_validate and step != num_training_steps:
                 await self._validate_and_log(step=step)
 
     async def _take_reserved_training_batch(

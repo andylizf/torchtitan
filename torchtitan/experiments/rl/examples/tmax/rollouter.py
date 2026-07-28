@@ -32,7 +32,7 @@ last turn's ``env_rewards`` (key ``tmax_reward``) and read back by ``RewardTMax`
 
 Knobs read from env (the launcher sets these; see ``submit_swe_tmax_9b.sh``):
   ``SHIM_BIND_HOST`` / ``SHIM_PORT``  adapter bind address (default 127.0.0.1:18001)
-  ``SWE_TIME_BUDGET_SEC``             per-agent wallclock (default 1200)
+  ``SWE_TIME_BUDGET_SEC``             per-agent wallclock (default 2400)
   ``TMAX_EVAL_TIMEOUT_SEC``           verifier run timeout (default 900)
   ``SWE_MAX_CONTEXT_LEN``             model context budget for the adapter session
   ``SWE_ROLLOUT_CONCURRENCY``         concurrently-active rollouts (default 16)
@@ -328,9 +328,8 @@ class TMaxRollouter(Rollouter):
         rubric: Rubric.Config = field(
             default_factory=lambda: Rubric.Config(
                 reward_fns=[RewardTMax.Config(weight=1.0)],
-                # An errored / timed-out agent gets no learning signal.
-                error_reward=0.0,
-                truncation_reward=0.0,
+                # RewardTMax returns zero when no verifier reward is present. Run it
+                # for every status so failed rollouts remain in RewardTMax metrics.
             )
         )
         # Placeholder env (the agent loop runs in-sandbox; see env.py).
@@ -357,7 +356,7 @@ class TMaxRollouter(Rollouter):
         num_rollout_workers x this. Each completed sibling immediately releases its
         slot to the next waiting rollout."""
 
-        time_budget_sec: int = 1200
+        time_budget_sec: int = 2400
         """Per-rollout agent wall-clock budget (the vanillux loop stops after this)."""
 
         eval_timeout_sec: int = 600
@@ -447,7 +446,7 @@ class TMaxRollouter(Rollouter):
         )
         # How each sibling's loop ended (run_vanillux_loop finish_reason), as a
         # per-reason fraction of the group. Surfaces the stop-reason split on wandb:
-        # submit vs turn-cap vs 20min time-budget wall vs early-stop vs rollout error
+        # submit vs turn-cap vs 40min time-budget wall vs early-stop vs rollout error
         # (the "error" bucket covers timeout/exception paths where the loop never
         # returned). The five fracs sum to 1.0 per group; cudagraph should push
         # time_budget down and submit up.
@@ -465,32 +464,23 @@ class TMaxRollouter(Rollouter):
             m.Metric("rollout/format_error_frac", m.Mean(fmt_error_frac)),
             m.Metric("rollout/infra_failed_frac", m.Mean(infra_failed_frac)),
             m.Metric(
-                "rollout/infra_invalid_group_frac",
+                "rollout/infra_failed_group_frac",
                 m.Mean(1.0 if any(infra_failed_flags) else 0.0),
             ),
             *finish_metrics,
             *sandbox_metrics,
         ]
 
-        # Sibling rewards form one centered-advantage unit. A transport or rollout
-        # infrastructure failure in any sibling invalidates that whole unit: scoring
-        # the failed sibling as zero would manufacture a negative advantage and turn
-        # a nearly all-solved group into a false partial group. Empty RolloutGroups are
-        # already a first-class failed-generation result in TrainingSampleBuilder.
+        # Match Open-Instruct: after sandbox/reset retries are exhausted, keep the
+        # failed sibling in the group with reward zero. It participates in centered
+        # advantage estimation; an empty completion contributes no training tokens.
         if any(infra_failed_flags):
-            group_metrics.append(
-                m.Metric("rollout/num_groups_dropped_infra", m.Sum(1.0))
-            )
             logger.warning(
-                "[tmax] group=%d dropped after %d/%d infrastructure failures",
+                "[tmax] group=%d retaining %d/%d infrastructure failures as "
+                "zero-reward siblings",
                 group_id,
                 sum(infra_failed_flags),
                 len(infra_failed_flags),
-            )
-            return RolloutGroup(
-                group_id=group_id,
-                rollouts=[],
-                metrics=group_metrics,
             )
 
         # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
@@ -641,6 +631,7 @@ class TMaxRollouter(Rollouter):
                 status = RolloutStatus.COMPLETED
         except (TimeoutError, asyncio.TimeoutError):
             infra_failed = True
+            reward = 0.0
             status = RolloutStatus.ERROR_TIMEOUT
             if rollout_timeout is not None and rollout_timeout.expired():
                 logger.warning("[tmax] %s: wall-clock guard fired", rollout_id)
@@ -650,6 +641,7 @@ class TMaxRollouter(Rollouter):
                 error_msg = "sandbox_timeout"
         except Exception as e:
             infra_failed = True
+            reward = 0.0
             logger.exception("[tmax] %s: rollout failed", rollout_id)
             status = RolloutStatus.ERROR
             error_msg = f"{type(e).__name__}: {e}"

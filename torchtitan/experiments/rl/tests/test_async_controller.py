@@ -8,8 +8,10 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -21,13 +23,19 @@ from torchtitan.experiments.rl.components.work_buffer import (
 from torchtitan.experiments.rl.controller import (
     _should_drop_group_at_batcher,
     _split_rollout_concurrency,
+    _will_validate_after_step,
     AsyncLoopConfig,
     Controller,
+    ValidationConfig,
 )
 from torchtitan.experiments.rl.controller_metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     MetricsTimer,
+)
+
+from torchtitan.experiments.rl.examples.alphabet_sort.config_registry import (
+    rl_grpo_qwen3_0_6b_varlen,
 )
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout import (
@@ -41,6 +49,64 @@ from torchtitan.experiments.rl.types import (
     TrainingSample,
     TrainingSampleGroup,
 )
+
+
+def _tp2_batch_invariant_config(
+    *,
+    mixed_precision_param: Literal["bfloat16", "float32"],
+    training_dtype: Literal["bfloat16", "float32"] = "float32",
+) -> Controller.Config:
+    config = rl_grpo_qwen3_0_6b_varlen()
+    trainer_debug = dataclasses.replace(
+        config.trainer.debug, batch_invariant=True, deterministic=True
+    )
+    generator_debug = dataclasses.replace(
+        config.generator.debug, batch_invariant=True, deterministic=True
+    )
+    trainer = dataclasses.replace(
+        config.trainer,
+        debug=trainer_debug,
+        training=dataclasses.replace(
+            config.trainer.training,
+            dtype=training_dtype,
+            mixed_precision_param=mixed_precision_param,
+        ),
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism,
+            data_parallel_shard_degree=1,
+            tensor_parallel_degree=2,
+            enable_sequence_parallel=False,
+        ),
+    )
+    generator = dataclasses.replace(config.generator, debug=generator_debug)
+    return dataclasses.replace(config, trainer=trainer, generator=generator)
+
+
+def test_batch_invariant_accepts_singleton_fsdp_mixed_precision() -> None:
+    config = _tp2_batch_invariant_config(mixed_precision_param="bfloat16")
+
+    assert config.trainer.training.dtype == "float32"
+    assert config.trainer.parallelism.data_parallel_shard_degree == 1
+
+
+def test_batch_invariant_keeps_full_bfloat16_training_supported() -> None:
+    config = _tp2_batch_invariant_config(
+        training_dtype="bfloat16", mixed_precision_param="bfloat16"
+    )
+
+    assert config.trainer.training.dtype == "bfloat16"
+
+
+@pytest.mark.parametrize("training_dtype", ["bfloat16", "float32"])
+def test_batch_invariant_rejects_float32_forward_parameters(
+    training_dtype: Literal["bfloat16", "float32"],
+) -> None:
+    with pytest.raises(
+        ValueError, match="batch_invariant requires bfloat16 forward parameters"
+    ):
+        _tp2_batch_invariant_config(
+            training_dtype=training_dtype, mixed_precision_param="float32"
+        )
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
@@ -182,6 +248,56 @@ def test_zero_step_run_only_validates_once() -> None:
 
         controller._validate_and_log.assert_awaited_once_with(step=0)
         assert not hasattr(controller, "_group_buffer")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("num_samples", "interval", "step", "num_training_steps", "expected"),
+    [
+        (0, 10, 10, 200, False),
+        (30, 0, 10, 200, False),
+        (30, 10, 10, 200, True),
+        (30, 10, 11, 200, False),
+        (30, 10, 200, 200, True),
+        (30, 0, 200, 200, True),
+    ],
+)
+def test_will_validate_after_step(
+    num_samples: int,
+    interval: int,
+    step: int,
+    num_training_steps: int,
+    expected: bool,
+) -> None:
+    validation = ValidationConfig(num_samples=num_samples, interval=interval)
+
+    assert (
+        _will_validate_after_step(
+            validation=validation,
+            step=step,
+            num_training_steps=num_training_steps,
+        )
+        is expected
+    )
+
+
+def test_validate_and_log_commits_validation_metrics() -> None:
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        metrics = [m.Metric("validation/reward", m.NoReduce(0.5))]
+        controller.validate = AsyncMock(return_value=metrics)
+        controller.metrics_processor = MagicMock()
+
+        aggregated = await controller._validate_and_log(step=10)
+
+        assert aggregated == {"validation/reward": 0.5}
+        controller.metrics_processor.log.assert_called_once_with(
+            step=10,
+            metrics=metrics,
+            is_validation=True,
+            commit=True,
+        )
 
     asyncio.run(run())
 

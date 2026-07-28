@@ -12,7 +12,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from torchtitan.experiments.rl.models.cast_linear import CastLinear, LMHeadCastConverter
+from torchtitan.experiments.rl.models.cast_linear import (
+    CastLinear,
+    LMHeadCastConverter,
+    refresh_cast_linear_inference_caches,
+    set_cast_linear_inference_cache,
+)
 from torchtitan.models.common.nn_modules import Linear
 from torchtitan.models.qwen3 import qwen3_configs
 
@@ -113,6 +118,32 @@ def test_weight_tying_is_dtype_safe():
     assert out.dtype == torch.float32
     assert embedding.weight is lm_head.weight
     assert embedding.weight.dtype == torch.bfloat16
+
+
+def test_inference_cache_refreshes_in_place_after_weight_sync():
+    set_cast_linear_inference_cache(True)
+    try:
+        lm_head = CastLinear.Config(in_features=8, out_features=16).build()
+        lm_head = lm_head.to(torch.bfloat16)
+        x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+
+        # vLLM initializes the cache while profiling under inference_mode.
+        with torch.inference_mode():
+            initial = lm_head(x)
+        cache = lm_head._inference_weight_cache
+        assert cache is not None
+        assert cache.dtype == torch.float32
+        assert "_inference_weight_cache" not in lm_head.state_dict()
+
+        with torch.no_grad():
+            lm_head.weight.add_(1)
+        assert torch.equal(lm_head(x), initial)
+
+        refresh_cast_linear_inference_caches(lm_head)
+        assert lm_head._inference_weight_cache.data_ptr() == cache.data_ptr()
+        assert torch.equal(lm_head(x), F.linear(x.float(), lm_head.weight.float()))
+    finally:
+        set_cast_linear_inference_cache(False)
 
 
 def test_converter_raises_when_lm_head_absent():

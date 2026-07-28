@@ -296,14 +296,15 @@ def test_reset_running_requests_requires_prefix_cache_reset():
         )
 
 
-def test_salt_prefix_cache_conflicts_with_batch_invariant():
-    # Salt mode keeps old-weight KV, so it can't coexist with batch_invariant determinism.
-    with pytest.raises(ValueError, match="salt_prefix_cache_on_weight_sync"):
-        VLLMGenerator.Config(
-            parallelism=_PARALLELISM,
-            debug=DebugConfig(batch_invariant=True),
-            salt_prefix_cache_on_weight_sync=True,
-        )
+def test_salt_prefix_cache_accepted_with_batch_invariant():
+    config = VLLMGenerator.Config(
+        parallelism=_PARALLELISM,
+        debug=DebugConfig(batch_invariant=True),
+        salt_prefix_cache_on_weight_sync=True,
+        reset_prefix_cache_on_weight_sync=False,
+        reset_running_requests_on_weight_sync=False,
+    )
+    assert config.salt_prefix_cache_on_weight_sync
 
 
 def test_salt_prefix_cache_accepted_with_resets_off():

@@ -14,6 +14,7 @@ from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
 from torchtitan.experiments.rl.rollout import Rollout, RolloutStatus, RolloutTurn
+from torchtitan.experiments.rl.rollout.types import RolloutGroup
 from torchtitan.experiments.rl.types import RolloutTurnID
 
 _GROUP_ID = "step=1/group=0"
@@ -184,3 +185,31 @@ def test_empty_completion_on_first_turn_is_skipped() -> None:
         advantage=0.0,
     )
     assert rollout_to_training_samples(rollout) == []
+
+
+def test_builder_can_keep_scored_empty_sibling_without_training_its_tokens() -> None:
+    valid = _scored_rollout(
+        [_turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1)],
+        reward=1.0,
+        advantage=0.5,
+    )
+    empty = Rollout(
+        group_id=_GROUP_ID,
+        rollout_id=1,
+        status=RolloutStatus.ERROR,
+        reward=0.0,
+        advantage=-0.5,
+    )
+    builder = TrainingSampleBuilder.Config(
+        drop_groups_with_untrainable_rollouts=False
+    ).build()
+
+    result = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=[valid, empty])
+    )
+
+    assert len(result.training_samples) == 1
+    assert result.training_samples[0].token_ids == [1, 2, 4]
+    metric_by_key = {metric.key: metric for metric in result.metrics}
+    assert "training_sample_builder/num_groups_dropped_untrainable" not in metric_by_key
+    assert "training_sample_builder/num_untrainable_rollouts" in metric_by_key

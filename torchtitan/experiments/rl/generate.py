@@ -255,7 +255,7 @@ def generate() -> None:
                     print(f"Generated token count: {n_out}", flush=True)
                     print(
                         f"BENCH: gen_loop_wall={_dt:.3f}s steps={_nsteps} "
-                        f"tok/s={n_out/_dt:.1f} (batch=1)",
+                        f"tok/s={n_out / _dt:.1f} (batch=1)",
                         flush=True,
                     )
                     print(f"Generated text: {generated_text!r}\n", flush=True)

@@ -93,7 +93,7 @@ def _iter_seed_fixtures(tmax: dict, dest: str):
 
 
 def _parse_reward(text: str) -> float:
-    """Parse ``reward.txt`` contents into a float in [0, 1] (0.0 if unparseable)."""
+    """Parse ``reward.txt`` contents into a float in [0, 1] (0.0 if unparsable)."""
     try:
         val = float((text or "").strip().splitlines()[0])
     except (ValueError, IndexError):
@@ -142,7 +142,7 @@ async def grade_tmax(
     reads back ``reward_path`` (default ``/logs/verifier/reward.txt``). Agent-input
     seeds (environment/seeds/*) are NOT uploaded here -- they are seeded to
     /workspace before the rollout (see ``seed_workspace``). Returns a float in
-    [0, 1]; 0.0 when the reward file is missing or unparseable.
+    [0, 1]; 0.0 when the reward file is missing or unparsable.
     """
     timeout = timeout_sec if timeout_sec is not None else _eval_timeout_sec()
     test_sh = tmax.get("test_sh") or ""

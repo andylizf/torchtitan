@@ -191,8 +191,10 @@ The 180-second Daytona heartbeat prevents the provider's 10-minute idle timer
 from stopping a sandbox while the controller waits on an in-process model turn.
 `TT_DAYTONA_RPC_RETRIES=2` applies only to idempotent command-log reads, identical
 file uploads, and sandbox deletion. Agent command submission is never replayed.
-If a rollout still loses its sandbox or exhausts a transport RPC, its entire
-32-sibling group is discarded before reward scoring and advantage estimation.
+If a rollout still loses its sandbox or exhausts a transport RPC, it remains in
+its 32-sibling group with reward zero, matching Open-Instruct. The failed sibling
+participates in centered advantage estimation but contributes no training tokens
+when it has no model completion.
 
 Terminal sandbox failures emit immediate `[sandbox_issue]` JSON records in the
 controller log. Recovered polling and retry events are kept out of the hot log
@@ -212,8 +214,8 @@ rollout/sandbox_transport_issue_events_mean
 rollout/sandbox_provision_issue_frac
 rollout/sandbox_timeout_frac
 rollout/infra_failed_frac
-rollout/infra_invalid_group_frac
-rollout/num_groups_dropped_infra
+rollout/infra_failed_group_frac
+training_sample_builder/num_untrainable_rollouts
 ```
 
 The disk metrics distinguish a Daytona session-creation ENOSPC from an in-sandbox

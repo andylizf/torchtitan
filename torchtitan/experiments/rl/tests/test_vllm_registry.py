@@ -7,9 +7,7 @@
 import json
 from types import SimpleNamespace
 
-from torchtitan.experiments.rl.models.vllm_registry import (
-    model_spec_to_hf_config_dict,
-)
+from torchtitan.experiments.rl.models.vllm_registry import model_spec_to_hf_config_dict
 
 
 def _spec():

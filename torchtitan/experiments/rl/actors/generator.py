@@ -29,6 +29,10 @@ from torchtitan.experiments.rl.batch_invariance import (
     patch_bmm_for_batch_invariance,
     patch_matmul_for_small_m_batch_invariance,
 )
+from torchtitan.experiments.rl.models.cast_linear import (
+    refresh_cast_linear_inference_caches,
+    set_cast_linear_inference_cache,
+)
 from torchtitan.experiments.rl.models.vllm_registry import (
     InferenceParallelismConfig,
     register_to_vllm,
@@ -724,6 +728,9 @@ class VLLMGenerator(Actor, Configurable):
         model_dtype: str = "bfloat16"
         """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
 
+        cache_cast_linear_weights: bool = True
+        """Cache CastLinear weights in compute dtype between generator weight syncs."""
+
         mamba_cache_dtype: str = "auto"
         """Data type for vLLM's convolutional recurrent cache."""
 
@@ -882,6 +889,7 @@ class VLLMGenerator(Actor, Configurable):
 
         self._backend = config.backend
         native = config.backend == "vllm_native"
+        set_cast_linear_inference_cache(not native and config.cache_cast_linear_weights)
         inner_attn = None
         if native and os.environ.get("TT_GDN_UNIFIED_KERNEL") == "1":
             # Opt-in: run the vLLM-native GDN layer's recurrence on TorchTitan's
@@ -1509,7 +1517,9 @@ class VLLMGenerator(Actor, Configurable):
             # hook. Non-fused params share storage with model_sd, so reloading them
             # is a harmless self-copy; only the fused wqkv is actually rebuilt.
             # TODO: can we avoid the copy and properly load fused qkv weights?
-            self._get_model().model.load_state_dict(model_sd, strict=False)
+            model = self._get_model().model
+            model.load_state_dict(model_sd, strict=False)
+            refresh_cast_linear_inference_caches(model)
         self.policy_version = version
         if self.config.salt_prefix_cache_on_weight_sync:
             # Salt mode: keep BOTH in-flight KV and the prefix cache (no preempt, no

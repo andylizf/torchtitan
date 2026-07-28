@@ -168,9 +168,7 @@ def _collect_fixtures(task_dir: str) -> dict[str, str]:
     return fixtures
 
 
-def _to_row(
-    task_id: str, image: str, task_dir: str, image_prefix: str
-) -> dict | None:
+def _to_row(task_id: str, image: str, task_dir: str, image_prefix: str) -> dict | None:
     """Build one output row from a task's parquet entry + extracted dir."""
     instr_path = os.path.join(task_dir, "instruction.md")
     test_path = os.path.join(task_dir, "tests", "test.sh")
@@ -297,7 +295,10 @@ def main() -> None:
             if r is not None:
                 local_rows.append(r)
             else:
-                print(f"  [warn] no image.txt/instruction in {d}, skipped", file=sys.stderr)
+                print(
+                    f"  [warn] no image.txt/instruction in {d}, skipped",
+                    file=sys.stderr,
+                )
         smoke_rows = local_rows + rows[: max(0, args.smoke_size - len(local_rows))]
         _write_jsonl(smoke_rows, smoke_path)
         print(f"wrote {len(smoke_rows)} smoke tasks -> {smoke_path}")
