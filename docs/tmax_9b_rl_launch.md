@@ -176,6 +176,20 @@ distribution. Strict FIFO is also diagnostic: set
 `SWE_STRICT_FIFO=1`; this removes completion-order selection but reintroduces
 head-of-line straggler stalls.
 
+`SWE_INCLUDE_PROMPTS=/mnt/.../instance_ids.txt` restricts only the training
+split to an explicit curriculum whitelist. Keep `SWE_PROMPT_DATA` pointed at
+the original full JSONL: the dataset applies the fixed file-order holdout split
+before the whitelist, preserving the original validation cohort. The include
+file accepts one bare instance ID per line or JSONL rows with `instance_id`.
+Missing, empty, and out-of-split whitelists fail closed. `SWE_SKIP_PROMPTS`, if
+set, is applied after the whitelist.
+
+The default Open-Instruct geometry is 8 prompt groups with 32 siblings each.
+Set `SWE_NUM_GROUPS_PER_TRAIN_STEP=32` and `SWE_GROUP_SIZE=8` for the historical
+BS32/SPP8 schedule. `SWE_DROP_ZERO_STD=0` retains all-solved and all-failed
+groups in the attempted batch composition; their centered advantages remain
+zero.
+
 `SWE_VAL_SAMPLES=0` disables fixed held-out validation. To enable the recipe's
 held-out pass, set it to `32`; validation then runs at the start, end, and every
 20 steps and adds substantial Daytona wall time. Validation currently uses the

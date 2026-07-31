@@ -60,6 +60,10 @@ from torchtitan.experiments.rl.losses import DPPOLoss, GRPOLoss
 # Empty by default; TMaxDataset raises a clear error if it is not set.
 _DEFAULT_DATA = os.environ.get("SWE_PROMPT_DATA", "")
 
+# Optional train-only instance-ID whitelist. Validation deliberately remains on
+# the original holdout split so curriculum selection cannot contaminate eval.
+_INCLUDE_IDS = os.environ.get("SWE_INCLUDE_PROMPTS", "")
+
 # Optional zero-std skip source (SWE_ZERO_STD_DIR output from a prior run): every
 # instance_id in it is dropped at dataset load so all-pass / all-fail prompts (no
 # learning signal) are not sampled again. Empty = keep all rows.
@@ -102,6 +106,7 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
             shuffle=(os.environ.get("SWE_DISABLE_SHUFFLE", "0") != "1"),
             holdout_n=_TMAX_9B_HOLDOUT_N,
             split="train",
+            include_ids_path=_INCLUDE_IDS,
             skip_ids_path=_SKIP_IDS,
         ),
         validation_dataset=TMaxDataset.Config(
@@ -233,8 +238,10 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # clean match (every past turn stays in the current cycle). Trade-off: prompts
     # grow with retained thinking, so the 65536 context fills sooner.
     config.renderer = dataclasses.replace(config.renderer, preserve_all_thinking=True)
-    num_groups_per_train_step = 8
-    group_size = 32
+    num_groups_per_train_step = int(
+        os.environ.get("SWE_NUM_GROUPS_PER_TRAIN_STEP", "8")
+    )
+    group_size = int(os.environ.get("SWE_GROUP_SIZE", "32"))
     max_offpolicy_steps = int(os.environ.get("SWE_OFFPOLICY_STEPS", "4"))
     max_active_rollout_groups = int(os.environ.get("SWE_MAX_ACTIVE_GROUPS", "40"))
     num_groups_in_selection_window_env = os.environ.get("SWE_SELECTION_WINDOW_GROUPS")
@@ -326,7 +333,9 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             strict_fifo=os.environ.get("SWE_STRICT_FIFO", "0") == "1",
         ),
         training_sample_builder=TrainingSampleBuilder.Config(
-            drop_zero_std_reward_groups=True,
+            drop_zero_std_reward_groups=(
+                os.environ.get("SWE_DROP_ZERO_STD", "1") == "1"
+            ),
             # Open-Instruct keeps an exhausted sandbox/reset failure as a
             # zero-reward sibling. It participates in centered advantage while
             # its empty completion contributes no training tokens.
@@ -546,19 +555,6 @@ def rl_grpo_qwen3_4b_tmax() -> Controller.Config:
         reset_prefix_cache_on_weight_sync=True,
         reset_running_requests_on_weight_sync=True,
     )
-    # Diagnostic knob: this control run only measures logprob_diff (independent of
-    # reward), so SWE_DROP_ZERO_STD=0 accepts every finalized group -> step 1 assembles
-    # from the first 8 rollouts instead of waiting for 8 reward-mixed groups (much
-    # faster, since the small 4B yields mostly all-fail groups). Default 1 keeps the
-    # tmax recipe's reward filtering for a faithful training run.
-    if os.environ.get("SWE_DROP_ZERO_STD", "1") != "1":
-        config.async_loop = dataclasses.replace(
-            config.async_loop,
-            training_sample_builder=TrainingSampleBuilder.Config(
-                drop_zero_std_reward_groups=False,
-                drop_groups_with_untrainable_rollouts=False,
-            ),
-        )
     return config
 
 

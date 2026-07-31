@@ -86,6 +86,11 @@ class TMaxDataset(Configurable):
         """Which slice this instance serves: ``train`` (rows[:-holdout_n]) or ``validation``
         (rows[-holdout_n:]). Ignored when ``holdout_n == 0``."""
 
+        include_ids_path: str = ""
+        """Optional instance-ID whitelist. The file accepts JSONL rows containing
+        ``instance_id`` or one bare ID per line. Filtering preserves the canonical
+        seeded order within the selected split. Empty = keep all rows."""
+
         skip_ids_path: str = ""
         """Optional zero-std annotation source (``SWE_ZERO_STD_DIR`` output from a prior
         run): a directory of ``<instance_id>.json`` files, or a single JSONL/bare-id file.
@@ -153,8 +158,8 @@ class TMaxDataset(Configurable):
         # Held-out split: the last holdout_n rows (in file order) form the validation slice,
         # disjoint from the training slice, so periodic validation measures generalization
         # rather than training-set recall. Deterministic (file order), no separate file.
-        # Done BEFORE the skip filter so the train/val boundary is stable regardless of
-        # which ids get skipped (a skip run and the wash share the same split).
+        # Done BEFORE the ID filters so the train/val boundary is stable regardless of
+        # which IDs are selected or skipped.
         if config.holdout_n > 0:
             if config.holdout_n >= len(samples):
                 raise ValueError(
@@ -173,13 +178,44 @@ class TMaxDataset(Configurable):
         if self._shuffle:
             self._rng.shuffle(self._order)
 
+        # Apply an explicit curriculum whitelist AFTER the canonical shuffle. This
+        # retains the original seed-relative order instead of independently shuffling
+        # a shortened dataset. Unlike the optional zero-std skip source below, a bad
+        # include path is fatal: silently falling back to the full corpus would launch
+        # a materially different training run.
+        if config.include_ids_path:
+            include_ids = _load_instance_ids(config.include_ids_path, missing_ok=False)
+            if not include_ids:
+                raise ValueError(
+                    f"include_ids_path={config.include_ids_path} contains no instance IDs"
+                )
+            available_ids = {self._samples[i].instance_id for i in self._order}
+            unknown_ids = include_ids - available_ids
+            if unknown_ids:
+                example = sorted(unknown_ids)[0]
+                raise ValueError(
+                    f"include_ids_path={config.include_ids_path} contains "
+                    f"{len(unknown_ids)} ID(s) outside the {config.split} split; "
+                    f"example: {example}"
+                )
+            before = len(self._order)
+            self._order = [
+                i for i in self._order if self._samples[i].instance_id in include_ids
+            ]
+            logger.info(
+                "TMaxDataset: included %d/%d prompt(s) from %s",
+                len(self._order),
+                before,
+                config.include_ids_path,
+            )
+
         # Skip prompts annotated zero-std by a prior run (no learning signal). Applied
         # AFTER the shuffle as a lazy filter over the canonical (seed-fixed) order: a skip
         # run then walks the SAME prompt sequence as the wash that produced the
         # annotations, just with the dead prompts removed in place -- it inherits the
         # wash's ordering instead of getting an independent shuffle of a shorter list.
         if config.skip_ids_path:
-            skip_ids = _load_skip_ids(config.skip_ids_path)
+            skip_ids = _load_instance_ids(config.skip_ids_path, missing_ok=True)
             if skip_ids:
                 before = len(self._order)
                 self._order = [
@@ -234,13 +270,14 @@ class TMaxDataset(Configurable):
         self._pos = state_dict["pos"]
 
 
-def _load_skip_ids(path: str) -> set[str]:
-    """Read instance_ids to skip from a zero-std annotation source.
+def _load_instance_ids(path: str, *, missing_ok: bool) -> set[str]:
+    """Read instance IDs from a directory, JSONL file, or bare-ID file.
 
-    Accepts either a DIRECTORY (the ``SWE_ZERO_STD_DIR`` output: one
+    A directory follows the ``SWE_ZERO_STD_DIR`` format: one
     ``<instance_id>.json`` file per zero-std prompt, ``{"instance_id": ...}``) or a
     single FILE (JSONL rows ``{"instance_id": ...}`` or a bare ``instance_id`` per
-    line). Missing source = empty set (a first run has nothing to skip yet).
+    line). Optional skip sources may be missing on a first run; explicit include
+    sources fail closed.
     """
     ids: set[str] = set()
     if os.path.isdir(path):
@@ -268,7 +305,9 @@ def _load_skip_ids(path: str) -> set[str]:
                 else:
                     ids.add(line)
     except FileNotFoundError:
-        logger.warning(f"TMaxDataset: skip_ids_path {path} not found; skipping nothing")
+        if not missing_ok:
+            raise ValueError(f"instance ID source {path} not found") from None
+        logger.warning(f"TMaxDataset: ID source {path} not found; filtering nothing")
     return ids
 
 

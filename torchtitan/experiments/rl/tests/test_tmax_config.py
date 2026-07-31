@@ -8,6 +8,9 @@ import asyncio
 
 import pytest
 
+from torchtitan.experiments.rl.examples.tmax import (
+    config_registry as tmax_config_registry,
+)
 from torchtitan.experiments.rl.examples.tmax.config_registry import (
     rl_grpo_qwen3_4b_tmax,
     rl_grpo_qwen3_5_9b_tmax,
@@ -97,6 +100,38 @@ def test_tmax_time_budget(
     config = rl_grpo_qwen3_5_9b_tmax()
 
     assert config.rollouter.time_budget_sec == expected_time_budget
+
+
+def test_tmax_include_ids_only_filters_training_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    include_path = "/mnt/shared/tmax-medium-difficulty-ids.txt"
+    monkeypatch.setattr(tmax_config_registry, "_INCLUDE_IDS", include_path)
+
+    config = rl_grpo_qwen3_5_9b_tmax()
+
+    assert config.rollouter.train_dataset.include_ids_path == include_path
+    assert config.rollouter.validation_dataset.include_ids_path == ""
+
+
+def test_tmax_9b_configures_bs32_spp8_no_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SWE_NUM_GROUPS_PER_TRAIN_STEP", "32")
+    monkeypatch.setenv("SWE_GROUP_SIZE", "8")
+    monkeypatch.setenv("SWE_DROP_ZERO_STD", "0")
+    monkeypatch.setenv("SWE_ROLLOUT_CONCURRENCY", "512")
+    monkeypatch.setenv("SWE_NUM_ROLLOUT_WORKERS", "8")
+    monkeypatch.setenv("SWE_MAX_ACTIVE_GROUPS", "112")
+    monkeypatch.setenv("SWE_INITIAL_ACTIVE_GROUPS", "80")
+
+    async_loop = rl_grpo_qwen3_5_9b_tmax().async_loop
+
+    assert async_loop.num_groups_per_train_step == 32
+    assert async_loop.group_size == 8
+    assert not async_loop.training_sample_builder.drop_zero_std_reward_groups
+    assert async_loop.max_active_rollout_groups == 112
+    assert async_loop.initial_active_rollout_groups == 80
 
 
 def test_tmax_keeps_zero_reward_infra_siblings_for_oi_parity() -> None:
