@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import json
 import os
 import shlex
@@ -432,6 +434,7 @@ def test_rollout_dump_writes_machine_readable_sandbox_issues(
 
     rollouter._maybe_dump_trace(
         rollout_id="group=1/rollout=2",
+        group_id=1,
         sample=sample,
         captured=[],
         renderer=object(),
@@ -467,3 +470,132 @@ def test_rollout_dump_writes_machine_readable_sandbox_issues(
             "session_id": "session-def",
         }
     ]
+
+
+def test_validation_groups_skip_the_training_rollout_dump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Validation rollouts get the controller's per-pass report, not this dump."""
+    monkeypatch.setenv("SWE_ROLLOUT_DUMP_DIR", str(tmp_path))
+    rollouter = object.__new__(TMaxRollouter)
+
+    rollouter._maybe_dump_trace(
+        rollout_id="group=-1/rollout=0",
+        group_id=-1,
+        sample=TMaxSample(
+            instance_id="task-123",
+            image="example/image",
+            workdir="/workspace",
+            problem_statement="test",
+        ),
+        captured=[],
+        renderer=object(),
+        status="completed",
+        reward=0.0,
+        finish_reason="submit",
+        sandbox_diagnostics=_SandboxRolloutDiagnostics(
+            sandbox_id="sandbox-abc",
+            disk_gb=6,
+            issue_counts={},
+            issues=(),
+            num_dropped_details=0,
+        ),
+    )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "group_id, expect_annotation",
+    [(7, True), (-1, False)],
+)
+def test_zero_std_annotation_skips_validation_groups(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, group_id: int, expect_annotation: bool
+) -> None:
+    """Held-out / benchmark prompts must not land in the training skip list."""
+    monkeypatch.setenv("SWE_ZERO_STD_DIR", str(tmp_path))
+    rollouter = object.__new__(TMaxRollouter)
+    sample = TMaxSample(
+        instance_id="task-123",
+        image="example/image",
+        workdir="/workspace",
+        problem_statement="test",
+    )
+    rollouts = [
+        Rollout(
+            group_id=group_id,
+            rollout_id=idx,
+            status=RolloutStatus.COMPLETED,
+            reward=0.0,
+        )
+        for idx in range(2)
+    ]
+
+    rollouter._maybe_annotate_zero_std(sample, rollouts)
+
+    assert (tmp_path / "task-123.json").exists() is expect_annotation
+
+
+def test_rollout_carries_its_finish_reason_and_format_errors() -> None:
+    """The per-rollout loop outcome must ride on the Rollout: group metrics average it
+    away, so the eval trace report has no other source for 'why did THIS trial stop'."""
+    fields = {f.name for f in dataclasses.fields(Rollout)}
+    assert "diagnostics" in fields
+
+    rollout = Rollout(
+        group_id=-1,
+        rollout_id=0,
+        status=RolloutStatus.COMPLETED,
+        diagnostics={
+            "finish_reason": "stopped_early",
+            "format_errors": 1,
+            "submitted": False,
+            "infra_failed": False,
+        },
+    )
+
+    assert rollout.diagnostics["finish_reason"] == "stopped_early"
+    assert rollout.diagnostics["format_errors"] == 1
+    # The keys TMaxRollouter._run_agent_rollout populates.
+    source = inspect.getsource(TMaxRollouter._run_agent_rollout)
+    for key in ("finish_reason", "format_errors", "submitted", "infra_failed"):
+        assert f'"{key}"' in source, f"{key} no longer recorded on the Rollout"
+
+
+def test_worker_info_logging_reaches_a_handler_without_duplicating(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Worker INFO must be emitted exactly once, whether or not the process already
+    configured logging. Records fall through to logging.lastResort (WARNING-only)
+    otherwise, which silently hid every agent-loop stop reason."""
+    import logging
+
+    from torchtitan.experiments.rl.actors.rollout_worker import (
+        _enable_worker_info_logging,
+    )
+
+    titan = logging.getLogger("torchtitan")
+    root = logging.getLogger()
+    saved = (list(titan.handlers), titan.level, list(root.handlers), root.level)
+    try:
+        for handlers, root_level in (([], logging.WARNING), ([], logging.INFO)):
+            titan.handlers.clear()
+            titan.setLevel(logging.NOTSET)
+            root.handlers.clear()
+            root.setLevel(root_level)
+            if root_level == logging.INFO:
+                handler = logging.StreamHandler()
+                handler.setLevel(logging.INFO)
+                root.addHandler(handler)
+
+            _enable_worker_info_logging()
+            capsys.readouterr()
+            logging.getLogger("torchtitan.experiments.rl.demo").info("marker-line")
+            captured = capsys.readouterr()
+            emitted = (captured.out + captured.err).count("marker-line")
+            assert emitted == 1, f"root_level={root_level}: emitted {emitted} times"
+    finally:
+        titan.handlers[:] = saved[0]
+        titan.setLevel(saved[1])
+        root.handlers[:] = saved[2]
+        root.setLevel(saved[3])

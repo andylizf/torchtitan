@@ -518,6 +518,11 @@ class TMaxRollouter(Rollouter):
         dump_dir = os.environ.get("SWE_ZERO_STD_DIR", "")
         if not dump_dir:
             return
+        # Validation groups carry negative ids (see Controller). Their prompts are a
+        # held-out or benchmark set, never sampled for training, so annotating them
+        # would only pollute the skip list a later training run reads.
+        if rollouts and rollouts[0].group_id < 0:
+            return
         rewards = [r.reward for r in rollouts if r.reward is not None]
         if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
             return
@@ -739,6 +744,7 @@ class TMaxRollouter(Rollouter):
         )
         self._maybe_dump_trace(
             rollout_id=rollout_id,
+            group_id=group_id,
             sample=sample,
             captured=captured,
             renderer=renderer,
@@ -756,6 +762,16 @@ class TMaxRollouter(Rollouter):
                 rollout_id=rollout_idx,
                 status=status,
                 turns=turns,
+                # Keep the per-rollout loop outcome: the group metrics average these
+                # away, but a trace report needs to say why THIS rollout stopped
+                # (e.g. a turn truncated inside <think> that never emitted a
+                # tool_call is a format_errors=1 / stopped_early rollout).
+                diagnostics={
+                    "finish_reason": finish_reason,
+                    "format_errors": fmt_errors,
+                    "submitted": submitted,
+                    "infra_failed": diagnostics.infra_failed,
+                },
             ),
             submitted,
             fmt_errors,
@@ -767,6 +783,7 @@ class TMaxRollouter(Rollouter):
         self,
         *,
         rollout_id: str,
+        group_id: int,
         sample: TMaxSample,
         captured: list,
         renderer: Renderer,
@@ -788,6 +805,11 @@ class TMaxRollouter(Rollouter):
         recovers each turn's sandbox output). Best-effort; never raises."""
         dump_dir = os.environ.get("SWE_ROLLOUT_DUMP_DIR", "")
         if not dump_dir:
+            return
+        # Validation groups (negative ids) get the controller's per-pass trace
+        # report instead; dumping them here too would duplicate every transcript
+        # into the training dump dir.
+        if group_id < 0:
             return
         try:
             tokenizer = getattr(renderer, "tokenizer", None) or getattr(

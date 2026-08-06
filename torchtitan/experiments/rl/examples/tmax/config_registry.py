@@ -45,6 +45,7 @@ from torchtitan.experiments.rl.controller import (
     Controller,
     ValidationConfig,
 )
+from torchtitan.experiments.rl.eval_trace_recorder import ValidationTraceRecorder
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
     _CKPT_DIR,
     _qwen3_rl_model_registry,
@@ -76,6 +77,17 @@ _SKIP_IDS = os.environ.get("SWE_SKIP_PROMPTS", "")
 _TB2_DATA = os.environ.get("SWE_TB2_DATA", "")
 _TB2_CKPT = os.environ.get("SWE_TB2_CKPT", "")
 _TB2_NUM_TASKS = 89
+
+# Inline TB-2.0 validation (rl_grpo_qwen3_5_9b_tmax): point the TRAINING recipe's
+# validation_dataset at the TB-2.0 JSONL so the periodic pass reports the real
+# benchmark instead of a tmax holdout slice. Empty = keep the holdout split.
+_TB2_VAL_DATA = os.environ.get("SWE_TB2_VAL_DATA", "")
+# Sampling for the TB-2.0 pass. Matches the Harbor Vanillux2Agent defaults the
+# published avg@k numbers were produced with (temperature 0.7, top_p 0.95, k=5),
+# so the inline curve is comparable to the standalone MAST TB-2.0 job.
+_TB2_VAL_TEMPERATURE = float(os.environ.get("SWE_TB2_VAL_TEMPERATURE", "0.7"))
+_TB2_VAL_TOP_P = float(os.environ.get("SWE_TB2_VAL_TOP_P", "0.95"))
+_TB2_VAL_K = int(os.environ.get("SWE_TB2_VAL_K", "5"))
 
 # Full TMax-9B recipe context (open-instruct qwen35_9b.sh: response_length 65536)
 # and per-turn generation cap (per_turn_max_tokens 16384). The context is the
@@ -109,13 +121,22 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
             include_ids_path=_INCLUDE_IDS,
             skip_ids_path=_SKIP_IDS,
         ),
-        validation_dataset=TMaxDataset.Config(
-            data_path=_DEFAULT_DATA,
-            seed=99,
-            shuffle=False,
-            holdout_n=_TMAX_9B_HOLDOUT_N,
-            split="validation",
-            skip_ids_path=_SKIP_IDS,
+        # SWE_TB2_VAL_DATA swaps the held-out tmax slice for the whole TB-2.0 task
+        # set (holdout_n=0 -> the file IS the validation split), so the periodic
+        # pass reports the benchmark. Unset keeps the tmax holdout.
+        validation_dataset=(
+            TMaxDataset.Config(
+                data_path=_TB2_VAL_DATA, seed=99, shuffle=False, holdout_n=0
+            )
+            if _TB2_VAL_DATA
+            else TMaxDataset.Config(
+                data_path=_DEFAULT_DATA,
+                seed=99,
+                shuffle=False,
+                holdout_n=_TMAX_9B_HOLDOUT_N,
+                split="validation",
+                skip_ids_path=_SKIP_IDS,
+            )
         ),
         # Run knobs resolved from the launcher env ONCE, into config fields so they
         # land in the W&B run config (per-run differences are visible). Same env
@@ -125,6 +146,50 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
         time_budget_sec=int(os.environ.get("SWE_TIME_BUDGET_SEC", "2400")),
         eval_timeout_sec=int(os.environ.get("TMAX_EVAL_TIMEOUT_SEC", "600")),
         max_context_tokens=int(os.environ.get("SWE_MAX_CONTEXT_LEN", "32768")),
+    )
+
+
+def _tmax_9b_validation() -> ValidationConfig:
+    """Periodic held-out eval for the 9B recipe.
+
+    Two modes, selected by ``SWE_TB2_VAL_DATA``:
+
+    - unset: greedy pass@1 over 32 held-out tmax prompts (the historical behavior).
+      The trained-batch reward is pinned near ~0.5 by drop_zero_std and is NOT a
+      learning signal, so this is the real solve-rate curve.
+    - set: the full Terminal-Bench 2.0 task set at the Harbor Vanillux2Agent
+      sampling defaults (temperature 0.7, top_p 0.95, k=5), which makes the inline
+      ``validation/reward/mean`` directly comparable to the published avg@5 and
+      ``validation/pass_at_k`` to pass@5.
+
+    With ``SWE_NUM_EVAL_GENERATORS`` the pass runs on its own generator hosts and
+    ``run_async`` lets training continue through it. The eval generators pull only
+    on the steps they score, so a background pass measures a frozen policy version.
+    """
+    if _TB2_VAL_DATA:
+        num_samples = int(os.environ.get("SWE_VAL_SAMPLES", _TB2_NUM_TASKS))
+        group_size, temperature, top_p = (
+            _TB2_VAL_K,
+            _TB2_VAL_TEMPERATURE,
+            _TB2_VAL_TOP_P,
+        )
+    else:
+        # SWE_VAL_SAMPLES=0 skips the pre/periodic held-out validation entirely
+        # (e.g. a pure step-time / speedup run); defaults to the paper's 32.
+        num_samples = int(os.environ.get("SWE_VAL_SAMPLES", _TMAX_9B_VAL_SAMPLES))
+        group_size, temperature, top_p = 1, 0.0, 1.0
+    return ValidationConfig(
+        num_samples=num_samples,
+        interval=int(os.environ.get("SWE_VAL_INTERVAL", "20")),
+        group_size=group_size,
+        temperature=temperature,
+        top_p=top_p,
+        # Async needs somewhere else to run; without eval generators it would just
+        # contend with rollout collection for the training ones.
+        run_async=int(os.environ.get("SWE_NUM_EVAL_GENERATORS", "0")) > 0,
+        trace=ValidationTraceRecorder.Config(
+            enable=os.environ.get("SWE_VAL_TRACES", "1") == "1"
+        ),
     )
 
 
@@ -354,12 +419,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # The swe_r2e base sets num_samples=0 (off); we turn it on here. To eval the real
         # terminal-bench@2.0 benchmark instead, point the rollouter's validation_dataset at
         # TB-2.0 tasks in the tmax task format (see examples/tmax/data.py schema).
-        validation=ValidationConfig(
-            # SWE_VAL_SAMPLES=0 skips the pre/periodic held-out validation entirely
-            # (e.g. a pure step-time / speedup run); defaults to the paper's 32.
-            num_samples=int(os.environ.get("SWE_VAL_SAMPLES", _TMAX_9B_VAL_SAMPLES)),
-            interval=20,
-        ),
+        validation=_tmax_9b_validation(),
     )
     # RolloutWorker pool: run group rollouts across N CPU processes on the
     # controller host, off the controller GIL (the per-turn agent orchestration --
@@ -367,6 +427,23 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # throughput). SWE_NUM_ROLLOUT_WORKERS=0 keeps the in-process path; default 8.
     # The global SWE_ROLLOUT_CONCURRENCY is split across the pool.
     config.num_rollout_workers = num_rollout_workers
+    # Dedicated eval capacity: SWE_NUM_EVAL_GENERATORS=1 adds one generator host that
+    # only serves the periodic validation pass, so a full Terminal-Bench 2.0 sweep
+    # runs alongside training instead of stalling the step. Its rollouts get their own
+    # CPU worker processes for the same reason the training pool exists (the per-turn
+    # agent orchestration serializes on one GIL).
+    config.num_eval_generators = int(os.environ.get("SWE_NUM_EVAL_GENERATORS", "0"))
+    config.num_eval_rollout_workers = (
+        int(os.environ.get("SWE_NUM_EVAL_ROLLOUT_WORKERS", "4"))
+        if config.num_eval_generators
+        else 0
+    )
+    # Cap the eval sandbox burst. A k=5 sweep over 89 TB-2.0 tasks is 445 rollouts;
+    # admitting them all at once puts 445 sandbox creates on top of the training
+    # pool's, and Daytona rate-limits creation well below that.
+    config.eval_rollout_concurrency = int(
+        os.environ.get("SWE_EVAL_ROLLOUT_CONCURRENCY", "128")
+    )
     # Weight-sync KV policy. Default (SWE_SALT_KV=1): keep in-flight KV AND the prefix
     # cache (no preempt, no full re-prefill) and salt the prefix cache per GROUP (its n
     # samples share one namespace), so a NEW group recomputes its prefix under the new
@@ -596,7 +673,16 @@ def rl_grpo_qwen3_5_9b_tmax_tb2_eval() -> Controller.Config:
     config.async_loop = dataclasses.replace(
         config.async_loop,
         num_training_steps=0,
-        validation=ValidationConfig(num_samples=_TB2_NUM_TASKS, interval=0),
+        validation=dataclasses.replace(
+            _tmax_9b_validation(),
+            num_samples=int(os.environ.get("SWE_VAL_SAMPLES", _TB2_NUM_TASKS)),
+            interval=0,
+            # Nothing to overlap with at 0 training steps.
+            run_async=False,
+            group_size=_TB2_VAL_K,
+            temperature=_TB2_VAL_TEMPERATURE,
+            top_p=_TB2_VAL_TOP_P,
+        ),
     )
     if _TB2_CKPT:
         config.trainer = dataclasses.replace(
