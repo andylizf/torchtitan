@@ -5,12 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from unittest.mock import patch
 
 import spmd_types as spmd
 import torch
 import torch.nn as nn
+import tyro
 from expecttest import assert_expected_inline
 from torch.distributed.tensor import distribute_tensor, Shard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -262,6 +263,20 @@ class TestNnModuleWrappers(unittest.TestCase):
             sharding_config=ShardingConfig(),
         )
         self.assertIsInstance(cfg.sharding_config, ShardingConfig)
+
+    def test_config_cli_suppresses_runtime_sharding_config(self):
+        @dataclass
+        class RootConfig:
+            linear: Linear.Config = field(
+                default_factory=lambda: Linear.Config(
+                    in_features=4,
+                    out_features=8,
+                )
+            )
+
+        cfg = tyro.cli(RootConfig, args=[])
+        self.assertEqual(cfg.linear.in_features, 4)
+        self.assertIsNone(cfg.linear.sharding_config)
 
     def test_config_build_propagates_sharding(self):
         """Config.build propagates sharding_config to instance."""

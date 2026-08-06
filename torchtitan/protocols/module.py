@@ -10,11 +10,12 @@ import contextlib
 import inspect
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 import spmd_types as spmd
 import torch
 import torch.nn as nn
+import tyro
 from spmd_types.runtime import get_local_type, get_partition_spec, has_local_type
 from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor.experimental import local_map
@@ -56,7 +57,7 @@ class Module(nn.Module, Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         param_init: dict | None = None
-        sharding_config: ShardingConfig | None = None
+        sharding_config: Annotated[ShardingConfig | None, tyro.conf.Suppress] = None
 
         def build(self, **kwargs):
             # slots=True prevents super().build() from working; call explicitly.
