@@ -9,12 +9,9 @@ State dict adapter for Qwen3.5.
 
 Converts between HuggingFace Qwen3.5 checkpoint format and torchtitan format.
 
-MoE expert weights require two transformations:
-- **Transpose**: HF and TT use transposed layouts for grouped 3D expert weights.
-  E.g. HF down_proj [E, hidden, dim] <-> TT w2 [E, dim, hidden].
-- **Fuse/split gate_up_proj**: HF fuses gate_proj and up_proj into a single
-  gate_up_proj [E, dim, 2*hidden_dim]. TT stores them separately as
-  w1 [E, hidden_dim, dim] and w3 [E, hidden_dim, dim].
+MoE expert weights use the same grouped 3D linear layout in HF and TorchTitan:
+- HF gate_up_proj [E, 2*F, D] <-> TT w1/w3 [E, F, D], split on F.
+- HF down_proj [E, D, F] <-> TT w2 [E, D, F].
 
 Other notable conversions:
 - Conv3d patch embedding (HF) <-> Linear (TT) via weight reshape
@@ -134,7 +131,7 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                     hf_key = (
                         f"model.language_model.layers.{layer_num}.mlp.experts.down_proj"
                     )
-                    hf_state_dict[hf_key] = value.transpose(-2, -1)
+                    hf_state_dict[hf_key] = value
                     continue
 
                 if tt_abstract_key not in to_hf_map:
@@ -203,13 +200,13 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                     )
                 hf_state_dict[to_hf_map[tt_key]] = hf_value
 
-        # Fuse MoE w1 (gate) + w3 (up) → gate_up_proj
+        # Fuse MoE w1 (gate) + w3 (up) on the expert hidden dimension.
         for layer_num in moe_w1_by_layer:
-            w1 = moe_w1_by_layer[layer_num].transpose(-2, -1)
-            w3 = moe_w3_by_layer[layer_num].transpose(-2, -1)
             hf_state_dict[
                 f"model.language_model.layers.{layer_num}.mlp.experts.gate_up_proj"
-            ] = torch.cat([w1, w3], dim=-1)
+            ] = torch.cat(
+                [moe_w1_by_layer[layer_num], moe_w3_by_layer[layer_num]], dim=-2
+            )
 
         # Fuse vision wq/wk/wv → qkv
         for layer_num, parts in vision_qkv_by_layer.items():
@@ -260,28 +257,22 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                 # pyrefly: ignore [missing-attribute]
                 idx = re.search(r"\d+", hf_key).group(0)
 
-                # MoE gate_up_proj → split into w1 + w3 and transpose
+                # MoE gate_up_proj -> split into w1 + w3 on the F dimension.
                 if (
                     hf_abstract_key
                     == "model.language_model.layers.{}.mlp.experts.gate_up_proj"
                 ):
-                    w1_hf, w3_hf = value.chunk(2, dim=-1)
-                    tt_state_dict[f"layers.{idx}.moe.experts.w1_EFD"] = w1_hf.transpose(
-                        -2, -1
-                    )
-                    tt_state_dict[f"layers.{idx}.moe.experts.w3_EFD"] = w3_hf.transpose(
-                        -2, -1
-                    )
+                    w1_hf, w3_hf = value.chunk(2, dim=-2)
+                    tt_state_dict[f"layers.{idx}.moe.experts.w1_EFD"] = w1_hf
+                    tt_state_dict[f"layers.{idx}.moe.experts.w3_EFD"] = w3_hf
                     continue
 
-                # MoE down_proj → transpose
+                # MoE down_proj already has TT's [E, D, F] layout.
                 if (
                     hf_abstract_key
                     == "model.language_model.layers.{}.mlp.experts.down_proj"
                 ):
-                    tt_state_dict[f"layers.{idx}.moe.experts.w2_EDF"] = value.transpose(
-                        -2, -1
-                    )
+                    tt_state_dict[f"layers.{idx}.moe.experts.w2_EDF"] = value
                     continue
 
                 # GatedDeltaNet fused in_proj_qkv → split into q/k/v
