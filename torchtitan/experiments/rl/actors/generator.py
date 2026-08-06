@@ -57,6 +57,23 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_max_num_batched_tokens(
+    *,
+    max_model_len: int,
+    has_gdn_layers: bool,
+    prefix_caching_enabled: bool,
+    gdn_trainer_parity: bool,
+) -> int | None:
+    """Return the vLLM scheduler override required by hybrid GDN modes."""
+    if gdn_trainer_parity or (prefix_caching_enabled and has_gdn_layers):
+        # Parity needs unchunked prefill. Align-mode prefix caching also pads
+        # the Mamba page to 1056 tokens for Qwen3.5-35B-A3B, so retain vLLM's
+        # 2048-token default floor even when max_model_len is shorter.
+        return max(max_model_len, 2048)
+    return None
+
+
 # TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
 
 
@@ -1034,14 +1051,18 @@ class VLLMGenerator(Actor, Configurable):
         )
         engine_kwargs["max_model_len"] = model_spec.model.max_seq_len
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
-        if config.gdn_trainer_parity:
-            # Prefill bitwise parity needs each request prefilled as ONE contiguous
-            # fla chunk (matching the trainer). vLLM's default max_num_batched_tokens
-            # (2048) chunks longer prefills into continuation chunks that fall back to
-            # the vendored kernels (non-bitwise). Raise it to max_model_len so a fresh
-            # request is not chunked (the scheduler may still chunk to co-run with
-            # decodes; that residual falls back, still correct).
-            engine_kwargs["max_num_batched_tokens"] = model_spec.model.max_seq_len
+        has_gdn_layers = any(
+            getattr(layer, "delta_net", None) is not None
+            for layer in getattr(model_spec.model, "layers", ())
+        )
+        max_num_batched_tokens = _resolve_max_num_batched_tokens(
+            max_model_len=model_spec.model.max_seq_len,
+            has_gdn_layers=has_gdn_layers,
+            prefix_caching_enabled=config.enable_prefix_caching is True,
+            gdn_trainer_parity=config.gdn_trainer_parity,
+        )
+        if max_num_batched_tokens is not None:
+            engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
         # None -> vLLM default (OFF for hybrid GDN); True forces experimental
         # 'align'-mode prefix caching so multi-turn rollouts reuse the shared prefix.
         if config.enable_prefix_caching is not None:

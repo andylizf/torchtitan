@@ -23,6 +23,7 @@ from torchtitan.config import DebugConfig
 from torchtitan.experiments.rl.actors.generator import (
     _extract_request_metrics_inputs,
     _prepare_generation_request_metrics,
+    _resolve_max_num_batched_tokens,
     GenerationFuture,
     RequestDispatcher,
     SamplingConfig,
@@ -125,6 +126,34 @@ def _dispatcher(*, rank=0, dp_degree=1, tp_degree=1, dp_routing_strategy=None):
 
 
 # --- completion (token-out) ---
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "has_gdn_layers", "prefix_caching_enabled", "parity", "expected"),
+    [
+        (1024, True, True, False, 2048),
+        (8192, True, True, False, 8192),
+        (1024, False, True, False, None),
+        (1024, True, False, False, None),
+        (1024, True, False, True, 2048),
+    ],
+)
+def test_resolve_max_num_batched_tokens(
+    max_model_len,
+    has_gdn_layers,
+    prefix_caching_enabled,
+    parity,
+    expected,
+):
+    assert (
+        _resolve_max_num_batched_tokens(
+            max_model_len=max_model_len,
+            has_gdn_layers=has_gdn_layers,
+            prefix_caching_enabled=prefix_caching_enabled,
+            gdn_trainer_parity=parity,
+        )
+        == expected
+    )
 
 
 def test_process_finished_requests_resolves_future_with_completion():
