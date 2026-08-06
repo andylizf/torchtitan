@@ -12,7 +12,9 @@ from typing import Any
 import torch
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
+from torch.distributed.tensor import DTensor
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpoint_utils import canonical_fqn
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -42,6 +44,42 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
+
+
+def _cast_state_dict_parameters_for_transfer(
+    state_dict: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Cast floating parameters while preserving persistent buffer dtypes."""
+    buffer_names = {
+        canonical_fqn(name) for name, _ in model.named_buffers(remove_duplicate=False)
+    }
+    transferred: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        if canonical_fqn(name) in buffer_names or not tensor.is_floating_point():
+            transferred[name] = tensor
+            continue
+
+        if isinstance(tensor, DTensor) and tensor.to_local().numel() == 0:
+            local_tensor = tensor.to_local()
+            cast_local_tensor = torch.empty_strided(
+                local_tensor.shape,
+                local_tensor.stride(),
+                dtype=dtype,
+                device=local_tensor.device,
+            )
+            transferred[name] = DTensor.from_local(
+                cast_local_tensor,
+                tensor.device_mesh,
+                tensor.placements,
+                run_check=False,
+                shape=tensor.shape,
+                stride=tensor.stride(),
+            )
+        else:
+            transferred[name] = tensor.to(dtype)
+    return transferred
 
 
 class PolicyTrainer(Actor, Configurable):
@@ -535,14 +573,12 @@ class PolicyTrainer(Actor, Configurable):
         """
         state_dict = self.model.state_dict()
         if self._transfer_dtype is not None:
-            # torchstore only applies `transfer_dtype` on the RDMA path, so under direct_rdma=False
-            # cast to the generator dtype here (else the generator reads fp32 into its bf16 state dict).
-            # TODO(async-rl): remove this manual cast once torchstore applies transfer_dtype on the
-            #   CPU-staged path.
-            state_dict = {
-                name: tensor.to(self._transfer_dtype)
-                for name, tensor in state_dict.items()
-            }
+            # TorchStore's generic transfer_dtype cast cannot distinguish model
+            # parameters from buffers. Cast parameters here while preserving
+            # declared buffer dtypes such as Qwen3.5's FP32 expert_bias_E.
+            state_dict = _cast_state_dict_parameters_for_transfer(
+                state_dict, self.model, self._transfer_dtype
+            )
 
         await ts.put_state_dict(
             state_dict,
