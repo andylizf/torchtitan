@@ -235,11 +235,18 @@ def test_validation_group_ids_are_unique_across_passes() -> None:
     assert controller._allocate_validation_group_ids(2) == [-4, -5]
 
 
-def test_zero_step_run_only_validates_once() -> None:
+@pytest.mark.parametrize("run_async", [False, True])
+def test_zero_step_run_only_validates_once(run_async: bool) -> None:
+    """With no training steps there is nothing to overlap, so the eval-only path
+    stays blocking even when the pass is configured async."""
+
     async def run() -> None:
         controller = object.__new__(Controller)
         controller.config = SimpleNamespace(
-            async_loop=SimpleNamespace(num_training_steps=0)
+            async_loop=SimpleNamespace(
+                num_training_steps=0,
+                validation=ValidationConfig(run_async=run_async),
+            )
         )
         controller.start_step = 0
         controller._validate_and_log = AsyncMock(return_value={})
@@ -282,18 +289,33 @@ def test_will_validate_after_step(
     )
 
 
-def test_validate_and_log_commits_validation_metrics() -> None:
+@pytest.mark.parametrize(
+    "step, trainer_policy_version, expected_log_step",
+    [
+        # Blocking pass: the trainer sits on the step being validated.
+        (10, 10, 10),
+        # Background pass: the trainer has moved on, so the metrics land on the live
+        # step -- W&B drops anything logged behind the last committed one. The
+        # evaluated version travels in validation/policy_version instead.
+        (10, 17, 17),
+    ],
+)
+def test_validate_and_log_commits_validation_metrics(
+    step: int, trainer_policy_version: int, expected_log_step: int
+) -> None:
     async def run() -> None:
         controller = object.__new__(Controller)
+        controller._trainer_policy_version = trainer_policy_version
+        controller._validation_results = {}
         metrics = [m.Metric("validation/reward", m.NoReduce(0.5))]
         controller.validate = AsyncMock(return_value=metrics)
         controller.metrics_processor = MagicMock()
 
-        aggregated = await controller._validate_and_log(step=10)
+        aggregated = await controller._validate_and_log(step=step)
 
         assert aggregated == {"validation/reward": 0.5}
         controller.metrics_processor.log.assert_called_once_with(
-            step=10,
+            step=expected_log_step,
             metrics=metrics,
             is_validation=True,
             commit=True,
@@ -962,3 +984,100 @@ def test_compute_policy_age_metrics_raises_on_consume_time_staleness() -> None:
             min_policy_versions=[0],
             max_offpolicy_steps=3,
         )
+
+
+def test_async_validation_skips_while_a_pass_is_in_flight() -> None:
+    """A second pass must not start under the first: it would also mean pulling new
+    weights into the eval generators mid-pass, mislabelling the version scored."""
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller._validation_task = None
+        controller.metrics_processor = MagicMock()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_validate(*, step: int):
+            started.set()
+            await release.wait()
+            return []
+
+        controller._validate_and_log = _slow_validate
+
+        assert not controller._validation_pass_in_flight()
+        controller._start_async_validation(step=20)
+        await started.wait()
+        assert controller._validation_pass_in_flight()
+
+        first_task = controller._validation_task
+        controller._start_async_validation(step=40)
+        assert controller._validation_task is first_task
+        controller.metrics_processor.log.assert_called_once()
+        skipped = controller.metrics_processor.log.call_args.kwargs["metrics"]
+        assert [metric.key for metric in skipped] == ["validation/skipped"]
+
+        release.set()
+        await controller._await_pending_validation()
+        assert not controller._validation_pass_in_flight()
+
+    asyncio.run(run())
+
+
+def test_eval_generator_failure_does_not_end_training() -> None:
+    """Validation is observability: an eval-generator failure must disable the
+    evaluator, not propagate into the trainer loop."""
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller.eval_generator_router = MagicMock()
+        controller._eval_rollout_workers = [MagicMock()]
+
+        async def _boom():
+            raise RuntimeError("connection closed by peer")
+
+        ok = await controller._guard_eval_generators(_boom(), what="eval pull")
+
+        assert ok is False
+        assert controller.eval_generator_router is None
+        assert controller._eval_rollout_workers == []
+
+    asyncio.run(run())
+
+
+def test_training_pull_failure_still_propagates() -> None:
+    """The training generators are load-bearing; their failure must not be swallowed."""
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller.eval_generator_router = None
+
+        router = MagicMock()
+
+        async def _boom(**kwargs):
+            raise RuntimeError("trainer weight sync failed")
+
+        router.pull_model_state_dict = _boom
+        controller.generator_router = router
+
+        with pytest.raises(RuntimeError, match="trainer weight sync failed"):
+            await controller._pull_generator_weights(policy_version=7)
+
+    asyncio.run(run())
+
+
+def test_validate_skips_when_the_evaluator_is_disabled() -> None:
+    """After a disabling failure, a pass reports a skip instead of raising."""
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller.config = SimpleNamespace(
+            num_eval_generators=1,
+            async_loop=SimpleNamespace(validation=ValidationConfig(num_samples=89)),
+        )
+        controller.eval_generator_router = None
+
+        metrics = await controller.validate(step=20)
+
+        assert [metric.key for metric in metrics] == ["validation/skipped"]
+
+    asyncio.run(run())

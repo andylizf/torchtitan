@@ -159,6 +159,12 @@ class Rollout:
     advantage: float | None = None
     """Advantage for this sample."""
 
+    diagnostics: dict[str, object] = field(default_factory=dict)
+    """Per-rollout diagnostics a rollouter wants to keep with the rollout, for
+    inspection rather than training (e.g. why the agent loop stopped). Group metrics
+    aggregate these away, so a report that needs them per rollout reads here instead.
+    Free-form: consumers render whichever keys are present."""
+
 
 @dataclass(kw_only=True, slots=True)
 class RolloutGroup:

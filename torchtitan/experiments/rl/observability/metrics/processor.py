@@ -76,6 +76,11 @@ class MetricsProcessor(Configurable):
             default_factory=lambda: [
                 "validation_reward/_mean",
                 "validation_reward/_max",
+                # Present only when validation.group_size > 1: the avg@k companion
+                # (validation_reward/_mean is avg@k) and the version it scored,
+                # which for an async pass is not the step it is logged at.
+                "validation/pass_at_k/mean",
+                "validation/policy_version",
                 "validation/response_length/mean",
                 "timing/validate",
             ]

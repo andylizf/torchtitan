@@ -28,6 +28,7 @@ Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,30 @@ from torchtitan.observability import structured_logger as sl
 
 if TYPE_CHECKING:
     from torchtitan.experiments.rl.controller import Controller
+
+
+def _enable_worker_info_logging() -> None:
+    """Let this worker's INFO records reach the controller.
+
+    Monarch forwards a worker's output to the controller, but this process configures
+    no handler, so records fall through to ``logging.lastResort`` -- a stderr handler
+    pinned at WARNING. Every ``logger.info`` on the rollout path is dropped as a
+    result, including the agent loop's per-rollout "finished after N turns
+    (finish=...)" line, which is the only place a rollout's stop reason is stated.
+    (Confirmed from a run's log: worker WARNING/exception records appear, worker INFO
+    records never do, and the ones that appear carry no ``init_logger`` formatting.)
+
+    Scope the fix to the ``torchtitan`` logger rather than the root, so third-party
+    libraries stay muted, and only attach a handler when nothing upstream provides
+    one -- attaching unconditionally duplicates every line in a process that already
+    configured logging.
+    """
+    logger = logging.getLogger("torchtitan")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        logger.addHandler(handler)
 
 
 class RolloutWorker(Actor):
@@ -70,6 +95,7 @@ class RolloutWorker(Actor):
     def __init__(
         self, config: "Controller.Config", *, rollout_concurrency: int
     ) -> None:
+        _enable_worker_info_logging()
         self.config = config
         self.renderer = config.renderer.build(tokenizer_path=config.hf_assets_path)
         # Same sampling config the controller builds (seed + renderer stop tokens);
@@ -99,25 +125,54 @@ class RolloutWorker(Actor):
         )
 
     @endpoint
-    async def run_group(self, *, sample: object, group_id: int) -> RolloutGroup:
-        """Run + score one prompt group; return the finalized RolloutGroup."""
+    async def run_group(
+        self,
+        *,
+        sample: object,
+        group_id: int,
+        group_size: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        metrics_prefix: str | None = "rollout",
+    ) -> RolloutGroup:
+        """Run + score one prompt group; return the finalized RolloutGroup.
+
+        Args:
+            group_size: Sibling rollouts for this group. None uses the training
+                ``async_loop.group_size``; a validation pass passes its own k.
+            temperature: Sampling temperature override (None keeps the training value).
+            top_p: Nucleus sampling override (None keeps the training value).
+            metrics_prefix: Prefix for the standard computed rollout metrics. None
+                skips them, leaving only the rollouter's own group metrics -- the
+                validation path re-keys and aggregates those in the controller.
+        """
         if self._generator_router is None:
             raise RuntimeError("RolloutWorker.run_group called before setup()")
+        sampling = self._sampling
+        if temperature is not None:
+            sampling = replace(sampling, temperature=temperature)
+        if top_p is not None:
+            sampling = replace(sampling, top_p=top_p)
         with sl.log_trace_span("worker_run_group"):
             generate_fn = self._make_generate_fn()
             group = await self._rollouter.run_group_rollouts(
                 generate_fn=generate_fn,
                 sample=sample,
                 group_id=group_id,
-                group_size=self.config.async_loop.group_size,
-                sampling=self._sampling,
+                group_size=(
+                    self.config.async_loop.group_size
+                    if group_size is None
+                    else group_size
+                ),
+                sampling=sampling,
                 renderer=self.renderer,
             )
             # Preserve rollouter-set group metrics (e.g. tmax nonsubmit_frac /
             # format_errors); append the standard computed ones, don't overwrite.
-            group.metrics = compute_rollout_metrics(
-                prefix="rollout", rollouts=group.rollouts
-            ) + list(group.metrics)
+            if metrics_prefix is not None:
+                group.metrics = compute_rollout_metrics(
+                    prefix=metrics_prefix, rollouts=group.rollouts
+                ) + list(group.metrics)
         return group
 
     def _make_generate_fn(self) -> GenerateFn:

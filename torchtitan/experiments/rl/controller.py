@@ -121,6 +121,10 @@ from torchtitan.experiments.rl.controller_metrics import (
     compute_rollout_metrics,
     MetricsTimer,
 )
+from torchtitan.experiments.rl.eval_trace_recorder import (
+    EvalSummary,
+    ValidationTraceRecorder,
+)
 from torchtitan.experiments.rl.losses import GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
@@ -164,6 +168,17 @@ def _split_rollout_concurrency(
     return [base + (worker_id < remainder) for worker_id in range(num_active_workers)]
 
 
+def _task_id(sample: object, index: int) -> str:
+    """Name a validation prompt for the trace report.
+
+    Datasets that carry a stable task identity expose ``instance_id`` (the
+    convention across the coding-agent examples); anything else is named by its
+    position in the pass.
+    """
+    instance_id = getattr(sample, "instance_id", None)
+    return instance_id if isinstance(instance_id, str) else f"prompt_{index:04d}"
+
+
 def _should_drop_group_at_batcher(*, group_age: int, max_offpolicy_steps: int) -> bool:
     """Drop groups that are already past the configured policy-age limit."""
     return group_age > max_offpolicy_steps
@@ -175,13 +190,48 @@ class ValidationConfig:
     optionally every ``interval`` steps in between."""
 
     num_samples: int = 20
-    """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
+    """Held-out prompts scored per validation pass. 0 skips validation."""
 
     interval: int = 0
     """Run a mid-training validation pass every ``interval`` optimizer steps (in addition to
     the start/end passes). 0 = only start/end. The pass reuses idle generator capacity and
-    disjoint (negative) group ids, so it overlaps ongoing training-rollout collection; it does
-    add its own wall time to the step it runs on (one greedy validation rollout's latency)."""
+    disjoint (negative) group ids, so it overlaps ongoing training-rollout collection."""
+
+    group_size: int = 1
+    """Trials per held-out prompt. 1 = pass@1. k > 1 reports avg@k and pass@k, which is
+    far less noisy on sparse binary rewards -- at the cost of k times the environments."""
+
+    temperature: float = 0.0
+    """Sampling temperature. The default 0.0 is greedy; a benchmark whose published
+    number uses sampling (e.g. terminal-bench avg@k at 0.7) must match it here."""
+
+    top_p: float = 1.0
+    """Nucleus sampling cutoff, paired with ``temperature``."""
+
+    run_async: bool = False
+    """Run the pass as a background task instead of blocking the training step.
+
+    Off (default): the trainer awaits the pass, so its metrics land on the step that
+    produced them. On: training continues while the pass runs, and its metrics are
+    logged when it finishes, tagged with ``validation/policy_version``. A pass still
+    in flight when the next interval arrives is skipped, not queued. Meaningful with
+    ``num_eval_generators > 0``: otherwise the pass competes with rollout collection
+    for the training generators."""
+
+    trace: ValidationTraceRecorder.Config = field(
+        default_factory=ValidationTraceRecorder.Config
+    )
+    """Per-pass browsable trace report (off by default)."""
+
+    def __post_init__(self) -> None:
+        if self.group_size < 1:
+            raise ValueError(
+                f"validation.group_size must be positive, got {self.group_size}"
+            )
+        if self.num_samples < 0:
+            raise ValueError(
+                f"validation.num_samples must be non-negative, got {self.num_samples}"
+            )
 
 
 def _will_validate_after_step(
@@ -377,6 +427,34 @@ class Controller(Configurable):
         ``num_generators * generator_world_size``.
         """
 
+        num_eval_generators: int = 0
+        """Generator replicas reserved for validation, on their own proc meshes.
+
+        0 (default) runs validation through the training generators. N > 0 spawns N
+        more generators, each sized like a training one, that are kept out of the
+        training router and out of the RolloutWorker pool -- so a validation pass
+        never competes with rollout collection. They pull weights only on the steps
+        they evaluate, which freezes the policy under eval at that version while
+        training moves on (see ``ValidationConfig.run_async``).
+        """
+
+        num_eval_rollout_workers: int = 0
+        """CPU RolloutWorker processes dedicated to validation group rollouts.
+
+        0 runs validation in-process on the controller. Requires
+        ``num_eval_generators > 0``: these workers route only to the eval generators.
+        """
+
+        eval_rollout_concurrency: int = 0
+        """Concurrently-ACTIVE validation rollouts across the eval worker pool.
+
+        0 (default) admits the whole pass at once: fastest, but it bursts
+        ``num_samples * group_size`` environments. Set it lower when the environment
+        provider rate-limits creation, or when that burst would contend with the
+        training pool for the same quota. Only the admission rate changes -- the pass
+        still covers every prompt.
+        """
+
         num_rollout_workers: int = 0
         """CPU RolloutWorker processes to run group rollouts off the controller GIL.
 
@@ -387,6 +465,12 @@ class Controller(Configurable):
         claims the next group from the shared buffer; group id is not a permanent
         worker assignment. The global rollout concurrency is split across workers.
         """
+
+        torchstore_reset_interval: int = 0
+        """Compatibility field. Runtime TorchStore recycling is unsupported."""
+
+        torchstore_volume_placement: str = "trainer"
+        """Where TorchStore hosts StorageVolumes: trainer, controller, or controller_sharded."""
 
         generator_router: InterGeneratorRouter.Config = field(
             default_factory=InterGeneratorRouter.Config
@@ -402,6 +486,42 @@ class Controller(Configurable):
             if self.num_generators < 1:
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
+                )
+            if self.num_eval_generators < 0:
+                raise ValueError(
+                    "num_eval_generators must be non-negative, got "
+                    f"{self.num_eval_generators}"
+                )
+            if self.num_eval_rollout_workers < 0:
+                raise ValueError(
+                    "num_eval_rollout_workers must be non-negative, got "
+                    f"{self.num_eval_rollout_workers}"
+                )
+            if self.num_eval_rollout_workers > 0 and self.num_eval_generators == 0:
+                raise ValueError(
+                    "num_eval_rollout_workers requires num_eval_generators > 0: the "
+                    "eval workers route only to the dedicated eval generators."
+                )
+            if self.eval_rollout_concurrency < 0:
+                raise ValueError(
+                    "eval_rollout_concurrency must be non-negative, got "
+                    f"{self.eval_rollout_concurrency}"
+                )
+            if self.torchstore_reset_interval != 0:
+                raise ValueError(
+                    "torchstore_reset_interval must be 0. Recycling TorchStore's "
+                    "Gloo transport can asynchronously destroy a custom ProcessGroup "
+                    "and abort the trainer process."
+                )
+            if self.torchstore_volume_placement not in {
+                "trainer",
+                "controller",
+                "controller_sharded",
+            }:
+                raise ValueError(
+                    "torchstore_volume_placement must be 'trainer', 'controller', "
+                    "or 'controller_sharded', "
+                    f"got {self.torchstore_volume_placement!r}"
                 )
             if self.generator.checkpoint.enable:
                 raise ValueError(
@@ -491,6 +611,16 @@ class Controller(Configurable):
         self.config = config
         self.trainer: PolicyTrainer | None = None
         self.generator_router: InterGeneratorRouter | None = None
+        # Validation-only generators + workers (num_eval_generators > 0). Held out of
+        # the training router so a pass never steals rollout-collection capacity.
+        self.eval_generator_router: InterGeneratorRouter | None = None
+        self._eval_rollout_workers: list = []
+        # In-flight background validation pass (validation.run_async); None = idle.
+        self._validation_task: asyncio.Task | None = None
+        # Aggregated metrics of each completed pass, keyed by the policy version it
+        # scored. A background pass has no return value to the caller, so the
+        # pre/post reward summary reads the start-step entry from here.
+        self._validation_results: dict[int, dict[str, float]] = {}
         # CPU RolloutWorker actors (num_rollout_workers > 0); empty = in-process.
         self._rollout_workers: list = []
         # Validation shares the generator prefix cache with training. Never reuse a
@@ -499,6 +629,11 @@ class Controller(Configurable):
         self._next_validation_group_id = -1
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
+        # Live policy versions; re-seeded from start_step in run() and advanced by
+        # the trainer loop. Initialized here because a validation pass reads the
+        # trainer version to place its metrics, including the pre-training pass.
+        self._trainer_policy_version = 0
+        self._generator_policy_version = 0
         self._proc_meshes = []
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
@@ -522,10 +657,19 @@ class Controller(Configurable):
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
         )
+        self.validation_trace_recorder: ValidationTraceRecorder = (
+            config.async_loop.validation.trace.build(dump_dir=config.dump_folder)
+        )
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
+
+        # A crash can leave a background validation pass running against actors we
+        # are about to stop; drop it before touching them.
+        if self._validation_task is not None and not self._validation_task.done():
+            self._validation_task.cancel()
+            await asyncio.gather(self._validation_task, return_exceptions=True)
 
         if self.trainer is not None:
             try:
@@ -533,15 +677,16 @@ class Controller(Configurable):
             except Exception:
                 logger.exception("trainer.close failed")
 
-        if self.generator_router is not None:
-            close_results = await self.generator_router.fanout(
-                "close", return_exceptions=True
-            )
+        for role, router in (
+            ("generator", self.generator_router),
+            ("eval_generator", self.eval_generator_router),
+        ):
+            if router is None:
+                continue
+            close_results = await router.fanout("close", return_exceptions=True)
             for idx, result in enumerate(close_results):
                 if isinstance(result, BaseException):
-                    actor_name = (
-                        "generator" if len(close_results) == 1 else f"generator[{idx}]"
-                    )
+                    actor_name = role if len(close_results) == 1 else f"{role}[{idx}]"
                     logger.error(
                         "%s.close failed",
                         actor_name,
@@ -583,11 +728,22 @@ class Controller(Configurable):
         self._next_validation_group_id -= num_groups
         return group_ids
 
-    def _make_generate_fn(self, metrics_prefix: str) -> GenerateFn:
+    def _make_generate_fn(
+        self, metrics_prefix: str, *, use_eval_generators: bool = False
+    ) -> GenerateFn:
         """Build the rollouter's `GenerateFn`: route a completion via the generator router, namespacing
         generation metrics with `metrics_prefix` and pinning sticky routing on `routing_session_id` (a sample's
-        turns reuse one generator's prefix KV)."""
+        turns reuse one generator's prefix KV).
+
+        ``use_eval_generators`` routes to the validation-only generators when the run
+        has them; without them it falls back to the training router (today's behavior).
+        """
         # TODO: make this a pluggable config (a GenerateFn factory) so non-router generate backends can be swapped in.
+        router = (
+            self.eval_generator_router
+            if use_eval_generators and self.eval_generator_router is not None
+            else self.generator_router
+        )
 
         @sl.log_trace_span("generate")
         async def generate(
@@ -597,7 +753,7 @@ class Controller(Configurable):
             routing_session_id: str | None = None,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
-            result = await self.generator_router.route(
+            result = await router.route(
                 "generate",
                 prompt_token_ids,
                 request_id=request_id,
@@ -622,6 +778,7 @@ class Controller(Configurable):
         *,
         trainer_mesh: ProcMesh,
         generator_meshes: list[ProcMesh],
+        eval_generator_meshes: list[ProcMesh] | None = None,
     ):
         """Spawn Monarch actors on separate meshes and initialize weights.
 
@@ -638,16 +795,28 @@ class Controller(Configurable):
         Args:
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
+            eval_generator_meshes: ProcMesh objects for validation-only generators
+                (``num_eval_generators``). They get their own router, so training
+                rollouts are never routed to them.
         """
+        eval_generator_meshes = eval_generator_meshes or []
+        if len(eval_generator_meshes) != self.config.num_eval_generators:
+            raise ValueError(
+                f"expected {self.config.num_eval_generators} eval generator mesh(es), "
+                f"got {len(eval_generator_meshes)}"
+            )
         # Peak concurrent rollout sequences (buffer groups * group_size, or the
         # validation pass); sizes max_num_seqs below. Uses the resolved buffer size
         # (the max rollouts on the fly): max_num_seqs is a CEILING, not a KV
         # reservation -- vLLM pages KV on demand and admits fewer / preempts when KV
         # is tight, so a larger ceiling matches the run-ahead pool without OOM.
         async_loop = self.config.async_loop
+        validation = async_loop.validation
+        num_validation_rollouts = validation.num_samples * validation.group_size
         rollout_concurrency = max(
             async_loop.resolved_max_active_rollout_groups() * async_loop.group_size,
-            async_loop.validation.num_samples,
+            # A dedicated eval generator sizes itself off the validation pass alone.
+            0 if eval_generator_meshes else num_validation_rollouts,
         )
         # Renderer thread pool: render work is CPU-bound, so size to CPU count (decoupled from rollout concurrency).
         asyncio.get_running_loop().set_default_executor(
@@ -657,7 +826,6 @@ class Controller(Configurable):
         config = self.config
         if not generator_meshes:
             raise ValueError("setup_async requires at least one generator mesh")
-
         trainer_parallelism = config.trainer.parallelism
         dp_shard = max(trainer_parallelism.data_parallel_shard_degree, 1)
         self.trainer_dp_degree = (
@@ -687,10 +855,14 @@ class Controller(Configurable):
         # shrink this span to a single call.
         with sl.log_trace_span("mesh_spawn"):
             # Store proc meshes for cleanup
-            self._proc_meshes = [trainer_mesh, *generator_meshes]
+            self._proc_meshes = [
+                trainer_mesh,
+                *generator_meshes,
+                *eval_generator_meshes,
+            ]
 
             await setup_torch_elastic_env_async(trainer_mesh)
-            for generator_mesh in generator_meshes:
+            for generator_mesh in (*generator_meshes, *eval_generator_meshes):
                 await setup_torch_elastic_env_async(generator_mesh)
 
             # Spawn actors on their respective meshes
@@ -723,6 +895,39 @@ class Controller(Configurable):
                 )
                 generators.append(generator)
             self.generator_router = config.generator_router.build(generators=generators)
+
+            # Validation-only generators. Same engine config, sized for the
+            # validation pass instead of the rollout pool, on their own router.
+            eval_generators = []
+            for idx, eval_mesh in enumerate(eval_generator_meshes):
+                actor_name = (
+                    "eval_generator"
+                    if len(eval_generator_meshes) == 1
+                    else f"eval_generator_{idx}"
+                )
+                eval_generators.append(
+                    eval_mesh.spawn(
+                        actor_name,
+                        VLLMGenerator,
+                        config.generator,
+                        model_spec=config.model_spec,
+                        model_path=config.hf_assets_path,
+                        compile_config=config.compile,
+                        max_num_seqs=async_loop.generator_max_num_seqs
+                        or min(
+                            math.ceil(
+                                num_validation_rollouts
+                                / (len(eval_generator_meshes) * generator_dp_degree)
+                            ),
+                            512,
+                        ),
+                        output_dir=config.dump_folder,
+                    )
+                )
+            if eval_generators:
+                self.eval_generator_router = config.generator_router.build(
+                    generators=eval_generators
+                )
 
         # Spawn the CPU RolloutWorker pool on the controller host: each worker runs
         # group rollouts (agent orchestration + adapter + Daytona HTTP + grading) in
@@ -781,14 +986,69 @@ class Controller(Configurable):
                 global_conc,
             )
 
-        # Initialize TorchStore for weight sync between trainer and generator.
-        # StorageVolumes are spawned on the trainer mesh so they are colocated
-        # with the weight source for faster data access in the non-RDMA path.
-        # LocalRankStrategy: routes each process to a storage volume based on
-        #   LOCAL_RANK, so colocated processes share the same volume.
-        # https://github.com/meta-pytorch/torchstore
+        # Validation RolloutWorker pool: same shape as the training pool but routed
+        # only to the eval generators, so a pass never shares a GIL, a generator, or
+        # a rollout-concurrency budget with training. Each worker's cap is its share
+        # of the whole validation pass, since the pass runs its prompts at once.
+        if config.num_eval_rollout_workers > 0:
+            eval_concurrencies = _split_rollout_concurrency(
+                max(
+                    config.eval_rollout_concurrency or num_validation_rollouts,
+                    config.num_eval_rollout_workers,
+                ),
+                config.num_eval_rollout_workers,
+            )
+            with sl.log_trace_span("eval_rollout_worker_spawn"):
+                host = this_host()
+                for worker_id, worker_conc in enumerate(eval_concurrencies):
+                    worker_mesh = host.spawn_procs(per_host={"rollout_workers": 1})
+                    self._proc_meshes.append(worker_mesh)
+                    self._eval_rollout_workers.append(
+                        worker_mesh.spawn(
+                            f"eval_rollout_worker_{worker_id}",
+                            RolloutWorker,
+                            config,
+                            rollout_concurrency=worker_conc,
+                        )
+                    )
+                await asyncio.gather(
+                    *(w.setup.call(eval_generators) for w in self._eval_rollout_workers)
+                )
+            logger.info(
+                "Spawned %d eval RolloutWorker(s), concurrency by worker=%s "
+                "(validation pass = %d rollouts)",
+                len(eval_concurrencies),
+                eval_concurrencies,
+                num_validation_rollouts,
+            )
+
+        # Trainer placement is the fast path: one colocated volume per trainer
+        # rank. Controller placement keeps the volume outside detached worker
+        # proc meshes when long-lived child actors are unreliable. The sharded
+        # controller mode retains one volume per trainer rank so transfers do
+        # not serialize through the singleton controller volume.
         with sl.log_trace_span("torchstore_init"):
-            await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
+            if config.torchstore_volume_placement == "controller":
+                await ts.initialize()
+            elif config.torchstore_volume_placement == "controller_sharded":
+                num_storage_volumes = (
+                    trainer_parallelism.data_parallel_replicate_degree
+                    * dp_shard
+                    * trainer_parallelism.tensor_parallel_degree
+                    * trainer_parallelism.pipeline_parallel_degree
+                    * trainer_parallelism.context_parallel_degree
+                )
+                volume_mesh = this_host().spawn_procs(
+                    per_host={"torchstore_volumes": num_storage_volumes}
+                )
+                self._proc_meshes.append(volume_mesh)
+                await ts.initialize(
+                    num_storage_volumes=num_storage_volumes,
+                    mesh=volume_mesh,
+                    strategy=ts.LocalRankStrategy(),
+                )
+            else:
+                await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored policy_version
         # (0 if fresh) so the loop resumes at the right step and generators pull at that version.
@@ -805,42 +1065,139 @@ class Controller(Configurable):
         with sl.log_trace_span("trainer_push_model_state_dict"):
             await self.trainer.push_model_state_dict.call()
         with sl.log_trace_span("generator_pull_model_state_dict"):
-            await self.generator_router.pull_model_state_dict(
-                policy_version=self.start_step
+            await self._pull_generator_weights(policy_version=self.start_step)
+
+    async def _guard_eval_generators(self, awaitable, *, what: str) -> bool:
+        """Await an eval-generator call, converting a failure into a disabled evaluator.
+
+        Validation is observability: it must not be able to end a training run. On
+        failure this drops the eval router, so later steps skip validation entirely
+        and training continues with its own generators untouched.
+
+        Returns:
+            Whether the call succeeded.
+        """
+        try:
+            await awaitable
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "%s failed; disabling further validation for this run "
+                "(training continues)",
+                what,
             )
+            self.eval_generator_router = None
+            self._eval_rollout_workers = []
+            return False
+
+    async def _pull_generator_weights(
+        self, *, policy_version: int, include_eval: bool = True
+    ) -> None:
+        """Pull the just-pushed weights into the training generators, and into the
+        eval generators unless a validation pass is using their current weights.
+
+        The eval pull has to happen inside the trainer's weight-sync window, while
+        ``policy_version`` is still the version in TorchStore. Pulling on every idle
+        step (not only evaluated ones) keeps the eval generators' lifecycle identical
+        to a training generator's; once a pass starts, ``include_eval`` goes False so
+        it keeps scoring one frozen version while training moves on.
+        """
+        training_pull = self.generator_router.pull_model_state_dict(
+            policy_version=policy_version
+        )
+        if not (include_eval and self.eval_generator_router is not None):
+            await training_pull
+            return
+        # Concurrent: the eval pull must not add its latency to the training step.
+        await asyncio.gather(
+            training_pull,
+            self._guard_eval_generators(
+                self.eval_generator_router.pull_model_state_dict(
+                    policy_version=policy_version
+                ),
+                what=f"eval generator weight pull at version {policy_version}",
+            ),
+        )
 
     # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of 4 methods.
+    async def _run_validation_group(
+        self,
+        *,
+        sample: object,
+        group_id: int,
+        group_size: int,
+        sampling: SamplingConfig,
+        worker,
+    ) -> RolloutGroup:
+        """Run one validation prompt group, on an eval worker process when there is one."""
+        if worker is not None:
+            # metrics_prefix=None: the controller aggregates validation metrics from
+            # the returned rollouts, so the worker must not also emit "rollout/*".
+            return self._get_rank_0_value(
+                await worker.run_group.call(
+                    sample=sample,
+                    group_id=group_id,
+                    group_size=group_size,
+                    temperature=sampling.temperature,
+                    top_p=sampling.top_p,
+                    metrics_prefix=None,
+                )
+            )
+        return await self._rollouter.run_group_rollouts(
+            generate_fn=self._make_generate_fn(
+                metrics_prefix="validation_generator", use_eval_generators=True
+            ),
+            sample=sample,
+            group_id=group_id,
+            group_size=group_size,
+            sampling=sampling,
+            renderer=self.renderer,
+        )
+
     @sl.log_trace_span("_collect_validation_rollouts")
     async def _collect_validation_rollouts(
-        self, *, num_groups: int, sampling: SamplingConfig, step: int
-    ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
-        # TODO: group_size=1 (best-of-1) only. Support best-of-N.
-        generate = self._make_generate_fn(metrics_prefix="validation_generator")
+        self, *, num_groups: int, group_size: int, sampling: SamplingConfig, step: int
+    ) -> tuple[list[object], list[RolloutGroup], list[m.Metric]]:
+        """Run ``num_groups`` held-out prompts x ``group_size`` trials concurrently.
+
+        Returns the surviving prompts, their scored groups (index-aligned), and the
+        validation metrics.
+        """
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         samples = [self._rollouter.get_validation_sample() for _ in range(num_groups)]
+        # Negative, process-unique ids keep validation disjoint from training and
+        # from prior validation prefix-cache salts.
         group_ids = self._allocate_validation_group_ids(num_groups)
+        num_workers = len(self._eval_rollout_workers)
         group_results = await asyncio.gather(
             *(
-                self._rollouter.run_group_rollouts(
-                    generate_fn=generate,
+                self._run_validation_group(
                     sample=sample,
-                    # Negative, process-unique ids keep validation disjoint from
-                    # training and from prior validation prefix-cache salts.
                     group_id=group_id,
-                    group_size=1,
+                    group_size=group_size,
                     sampling=sampling,
-                    renderer=self.renderer,
+                    worker=(
+                        self._eval_rollout_workers[index % num_workers]
+                        if num_workers
+                        else None
+                    ),
                 )
-                for sample, group_id in zip(samples, group_ids, strict=True)
+                for index, (sample, group_id) in enumerate(
+                    zip(samples, group_ids, strict=True)
+                )
             ),
             return_exceptions=True,
         )
 
         # Keep the groups that succeeded; log + count the ones that raised.
+        kept_samples: list[object] = []
         rollout_groups: list[RolloutGroup] = []
         num_failed_groups = 0
-        for group_id, result in zip(group_ids, group_results, strict=True):
+        for sample, group_id, result in zip(
+            samples, group_ids, group_results, strict=True
+        ):
             if isinstance(result, BaseException):
                 logger.error(
                     f"validation group {group_id} (step={step}) failed; dropping",
@@ -848,49 +1205,111 @@ class Controller(Configurable):
                 )
                 num_failed_groups += 1
                 continue
+            kept_samples.append(sample)
             rollout_groups.append(result)
 
-        metrics = compute_rollout_metrics(
-            prefix="validation",
-            rollouts=[
-                rollout for group in rollout_groups for rollout in group.rollouts
-            ],
+        rollouts = [rollout for group in rollout_groups for rollout in group.rollouts]
+        metrics = compute_rollout_metrics(prefix="validation", rollouts=rollouts)
+        # Re-key the rollouter's own group metrics (e.g. tmax nonsubmit_frac,
+        # finish-reason split) into the validation namespace, so the eval curve
+        # carries the same diagnostics as the training curve without colliding.
+        metrics.extend(
+            replace(metric, key=metric.key.replace("rollout/", "validation/", 1))
+            for group in rollout_groups
+            for metric in group.metrics
+            if metric.key.startswith("rollout/")
         )
+        # pass@k: fraction of prompts solved by at least one trial. With
+        # group_size=1 this equals the mean reward; with k > 1 it is the headline
+        # benchmark number alongside validation/reward/mean (= avg@k).
+        if group_size > 1:
+            metrics.extend(
+                m.Metric(
+                    "validation/pass_at_k",
+                    m.Mean(
+                        1.0
+                        if any(
+                            rollout.reward is not None and rollout.reward > 0
+                            for rollout in group.rollouts
+                        )
+                        else 0.0
+                    ),
+                )
+                for group in rollout_groups
+            )
         metrics.append(
             m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
         )
-        return rollout_groups, metrics
+        return kept_samples, rollout_groups, metrics
 
     # TODO: we currently determine validation.num_samples
     # but what if i want to run the entire dataset?
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run one validation pass over held-out prompts.
 
         Args:
-            step: Training step this validation pass belongs to (0 for the
-                pre-training pass); tagged into logged rollout samples.
+            step: Policy version this pass scores (0 for the pre-training pass);
+                tagged into logged rollout samples and the trace report directory.
 
         Returns:
             Validation rollout metrics, generation metrics, and validation
             timing.
         """
-        # TODO: investigate using pass@k for validation.
         t_validate_start = time.perf_counter()
-        num_samples = self.config.async_loop.validation.num_samples
-        if num_samples == 0:  # skip validation (e.g. loss guard CI)
+        validation = self.config.async_loop.validation
+        if validation.num_samples == 0:  # skip validation (e.g. loss guard CI)
             return []
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        if self.config.num_eval_generators > 0 and self.eval_generator_router is None:
+            # An earlier eval-generator failure disabled the evaluator; training
+            # keeps running, but there is nothing left to score on.
+            logger.warning(f"step {step}: eval generators unavailable; skipping")
+            return [m.Metric("validation/skipped", m.Sum(1.0))]
+        sampling = replace(
+            self._sampling,
+            temperature=validation.temperature,
+            top_p=validation.top_p,
+        )
 
-        rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            num_groups=num_samples, sampling=greedy, step=step
+        samples, rollout_groups, metrics = await self._collect_validation_rollouts(
+            num_groups=validation.num_samples,
+            group_size=validation.group_size,
+            sampling=sampling,
+            step=step,
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
+        summary = self._record_validation_traces(
+            step=step, samples=samples, rollout_groups=rollout_groups
+        )
+        if summary is not None:
+            metrics.append(
+                m.Metric("validation/trace_pass_at_k", m.NoReduce(summary.pass_at_k))
+            )
 
+        metrics.append(m.Metric("validation/policy_version", m.NoReduce(float(step))))
         t_validate_s = time.perf_counter() - t_validate_start
-        validation_metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
-        return validation_metrics
+        metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
+        return metrics
+
+    def _record_validation_traces(
+        self, *, step: int, samples: list[object], rollout_groups: list[RolloutGroup]
+    ) -> EvalSummary | None:
+        """Write the browsable per-pass trace report; never fail the pass over it."""
+        if not self.validation_trace_recorder.enabled:
+            return None
+        try:
+            return self.validation_trace_recorder.record(
+                policy_version=step,
+                groups=rollout_groups,
+                task_ids=[
+                    _task_id(sample, index) for index, sample in enumerate(samples)
+                ],
+                decode=self.renderer._tokenizer.decode,
+            )
+        except Exception:
+            logger.exception("validation trace report failed at step %d", step)
+            return None
 
     async def run(self) -> None:
         """Start every async loop and run until training completes or a stage crashes.
@@ -906,14 +1325,25 @@ class Controller(Configurable):
         """
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
+        validation = async_loop.validation
+        # A blocking pre-training pass leaves the trainer and every training
+        # generator idle for its whole duration. That is fine for a short held-out
+        # pass, but a full benchmark sweep can take over an hour, and a generator
+        # mesh that receives no traffic that long gets reaped -- the next generate
+        # then fails with a gloo "connection closed by peer". So when the pass is
+        # async, start training first and run the pre-training pass alongside it,
+        # on the eval generators that already hold the start-step weights.
+        run_pre_validation_async = validation.run_async and num_training_steps > 0
         logger.info(
-            f"Running pre-training validation; then {num_training_steps} steps of async RL training"
+            f"Running pre-training validation ({'async' if run_pre_validation_async else 'blocking'}); "
+            f"then {num_training_steps} steps of async RL training"
         )
 
-        sl.log_trace_instant("validation_start")
-        pre_validation = await self._validate_and_log(step=self.start_step)
-        if num_training_steps == 0:
-            return
+        if not run_pre_validation_async:
+            sl.log_trace_instant("validation_start")
+            await self._validate_and_log(step=self.start_step)
+            if num_training_steps == 0:
+                return
         sl.log_trace_instant("training_start")
 
         # Two policy version pointers, seeded from the resumed step: the trainer advances at the
@@ -1007,6 +1437,13 @@ class Controller(Configurable):
             name="trainer",
         )
 
+        # Pre-training validation, now that the training loops own the training
+        # generators. The eval generators still hold the start-step weights from
+        # setup_async, so this pass scores the starting policy.
+        if run_pre_validation_async:
+            sl.log_trace_instant("validation_start")
+            self._start_async_validation(step=self.start_step)
+
         # run everything until trainer finishes its number of steps
         # or some other loop breaks
         background_tasks = [
@@ -1039,21 +1476,100 @@ class Controller(Configurable):
                 *background_tasks, trainer_task, return_exceptions=True
             )
 
-        # Post-training validation (held-out eval after the final step).
-        post_validation = await self._validate_and_log(step=num_training_steps)
-        self._log_reward_delta(pre_validation, post_validation)
+        # Drain any background pass first: it holds the eval generators, and its
+        # curve point would otherwise be lost when the controller exits.
+        await self._await_pending_validation()
+        # Post-training validation (held-out eval after the final step). Pull the
+        # eval generators here rather than relying on the last step's sync: that
+        # sync is skipped while a background pass is in flight, so the eval
+        # generators can still be holding an older version. TorchStore holds the
+        # final push, so this pull is the final policy either way.
+        if self.eval_generator_router is not None:
+            with sl.log_trace_span("eval_generator_pull_model_state_dict"):
+                await self.eval_generator_router.pull_model_state_dict(
+                    policy_version=self._trainer_policy_version
+                )
+        # Label the pass with the version actually reached, not the requested step
+        # count: the loop also exits early when the batcher drains.
+        post_validation = await self._validate_and_log(
+            step=self._trainer_policy_version
+        )
+        self._log_reward_delta(
+            self._validation_results.get(self.start_step, {}), post_validation
+        )
 
     async def _validate_and_log(self, *, step: int) -> dict[str, float]:
-        """Run one validation pass, log it, and return its aggregated values for the pre/post delta."""
+        """Run one validation pass, log it, and return its aggregated values for the pre/post delta.
+
+        Metrics are logged at ``self._trainer_policy_version`` (the live training
+        step), not at ``step``. For a blocking pass those are the same; for a
+        background pass the trainer has already moved on, and W&B drops anything
+        logged at an earlier step than the last committed one. The evaluated policy
+        version is carried in ``validation/policy_version`` and in the trace report's
+        directory name instead.
+        """
         metrics = await self.validate(step=step)
         if metrics:
             self.metrics_processor.log(
-                step=step,
+                step=max(step, self._trainer_policy_version),
                 metrics=metrics,
                 is_validation=True,
                 commit=True,
             )
-        return m.MetricsProcessor._aggregate_metrics(metrics)
+        aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+        self._validation_results[step] = aggregated
+        return aggregated
+
+    def _validation_pass_in_flight(self) -> bool:
+        """True while a background validation pass is still running.
+
+        Gates BOTH the eval-generator weight pull and the launch of the next pass:
+        pulling mid-pass would swap the weights underneath it, so the result would
+        no longer belong to the policy version it is labelled with.
+        """
+        return self._validation_task is not None and not self._validation_task.done()
+
+    def _start_async_validation(self, *, step: int) -> None:
+        """Launch a background validation pass over the weights just pulled at ``step``.
+
+        A pass still running when the next interval comes around is skipped rather
+        than queued: queueing would stack passes behind a slow benchmark forever, and
+        the newer policy version is the one worth measuring. The skip is counted so a
+        thin eval curve is visible rather than silent.
+        """
+        if self._validation_pass_in_flight():
+            logger.warning(
+                "step %d: previous validation pass still running; skipping this one. "
+                "Raise validation.interval or add eval capacity.",
+                step,
+            )
+            self.metrics_processor.log(
+                step=step,
+                metrics=[m.Metric("validation/skipped", m.Sum(1.0))],
+                is_validation=True,
+                commit=True,
+            )
+            return
+
+        async def _run() -> None:
+            try:
+                await self._validate_and_log(step=step)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("background validation at step %d failed", step)
+
+        self._validation_task = asyncio.create_task(
+            _run(), name=f"validation_step_{step}"
+        )
+
+    async def _await_pending_validation(self) -> None:
+        """Wait for an in-flight background validation pass before shutting down."""
+        task = self._validation_task
+        if task is None or task.done():
+            return
+        logger.info("Waiting for the in-flight background validation pass to finish")
+        await task
 
     def _log_reward_delta(self, pre: dict[str, float], post: dict[str, float]) -> None:
         """Console pre/post reward summary, visible without scrolling back through the loop."""
@@ -1307,8 +1823,12 @@ class Controller(Configurable):
             waits for:    a TrainingBatch in the queue
             unblocked by: _batcher_loop training_batch_queue.put()
         """
+        validation = self.config.async_loop.validation
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
+            will_validate = _will_validate_after_step(
+                validation=validation, step=step, num_training_steps=num_training_steps
+            )
             # Phase logging: the training step is otherwise a black box until its
             # end-of-step metrics flush, so a hang inside it is invisible. Log each
             # actor-call boundary so a stall is localized in the stdout timeline.
@@ -1316,6 +1836,16 @@ class Controller(Configurable):
             await self.trainer.sync_log_step.call(step)
             logger.info(f"[trainer_loop] step {step}: generator fanout sync_log_step")
             await self.generator_router.fanout("sync_log_step", step)
+            # The eval generators get the same per-step ping. They are otherwise
+            # idle between passes (tens of minutes at a realistic interval), and an
+            # idle generator mesh has been seen to lose its worker processes -- the
+            # next call then fails with a gloo "connection closed by peer". The
+            # training generators, which receive this every step, do not.
+            if self.eval_generator_router is not None:
+                await self._guard_eval_generators(
+                    self.eval_generator_router.fanout("sync_log_step", step),
+                    what=f"eval generator sync_log_step at step {step}",
+                )
             logger.info(f"[trainer_loop] step {step}: awaiting training batch")
             step_timer = MetricsTimer()
 
@@ -1396,11 +1926,19 @@ class Controller(Configurable):
                 ), step_timer.record("timing/step/push_model_state_dict"):
                     await self.trainer.push_model_state_dict.call()
                 logger.info(f"[trainer_loop] step {step}: weights pushed")
+                # The eval generators pull whenever they are idle, inside this
+                # weight-sync window (the only point where TorchStore still holds
+                # optim_result.policy_version). Pulling every idle step -- not only
+                # evaluated ones -- keeps them exercising the same path as a training
+                # generator instead of sitting untouched between passes. A pass in
+                # flight keeps its weights: pulling now would swap them mid-pass, and
+                # _start_async_validation skips this step anyway.
                 with sl.log_trace_span(
                     "generator_pull_model_state_dict"
                 ), step_timer.record("timing/step/pull_model_state_dict"):
-                    await self.generator_router.pull_model_state_dict(
-                        policy_version=optim_result.policy_version
+                    await self._pull_generator_weights(
+                        policy_version=optim_result.policy_version,
+                        include_eval=not self._validation_pass_in_flight(),
                     )
                 self._generator_policy_version = optim_result.policy_version
                 logger.info(f"[trainer_loop] step {step}: weights pulled (step done)")
@@ -1422,16 +1960,12 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
-            validation = self.config.async_loop.validation
-            will_validate = _will_validate_after_step(
-                validation=validation,
-                step=step,
-                num_training_steps=num_training_steps,
-            )
             self.metrics_processor.log(
                 step=step,
                 is_validation=False,
-                commit=not will_validate,
+                # An async pass logs at whatever step it finishes on, so it can never
+                # close this step's W&B transaction -- commit here instead.
+                commit=not (will_validate and not validation.run_async),
                 metrics=[
                     *packed.metrics,
                     *[
@@ -1464,7 +1998,10 @@ class Controller(Configurable):
             # the background rollout collection (disjoint negative group ids), so the curve
             # tracks the live policy without a separate eval job or checkpoint download.
             if will_validate and step != num_training_steps:
-                await self._validate_and_log(step=step)
+                if validation.run_async:
+                    self._start_async_validation(step=step)
+                else:
+                    await self._validate_and_log(step=step)
 
     async def _take_reserved_training_batch(
         self, training_batch_queue: "asyncio.Queue[TrainingBatch | None]"

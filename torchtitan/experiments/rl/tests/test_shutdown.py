@@ -26,12 +26,16 @@ class _FakeController:
         self.events = []
         self.setup_trainer_mesh = None
         self.setup_generator_meshes = None
+        self.setup_eval_generator_meshes = None
         self.instances.append(self)
 
-    async def setup_async(self, *, trainer_mesh=None, generator_meshes=None):
+    async def setup_async(
+        self, *, trainer_mesh=None, generator_meshes=None, eval_generator_meshes=None
+    ):
         self.events.append("setup")
         self.setup_trainer_mesh = trainer_mesh
         self.setup_generator_meshes = generator_meshes
+        self.setup_eval_generator_meshes = eval_generator_meshes
         if getattr(self.config, "fail_setup", False):
             raise RuntimeError("setup failed")
 
@@ -66,6 +70,7 @@ class _FakeConfig:
     # main() also reads config.generator.parallelism (same stubbing applies).
     generator = SimpleNamespace(parallelism=None)
     num_generators = 1
+    num_eval_generators = 0
 
     @property
     def __class__(self):
@@ -130,10 +135,12 @@ def stub_mesh_provisioning(monkeypatch):
     monkeypatch.setattr(train, "_compute_trainer_world_size", lambda p: 1)
     monkeypatch.setattr(train, "_compute_generator_world_size", lambda p: 1)
 
-    def _spawn_proc_mesh(*args, num_generators=1, **kwargs):
-        return "trainer_mesh", [
-            f"generator_mesh_{idx}" for idx in range(num_generators)
-        ]
+    def _spawn_proc_mesh(*args, num_generators=1, num_eval_generators=0, **kwargs):
+        return (
+            "trainer_mesh",
+            [f"generator_mesh_{idx}" for idx in range(num_generators)],
+            [f"eval_generator_mesh_{idx}" for idx in range(num_eval_generators)],
+        )
 
     monkeypatch.setattr(train, "spawn_proc_mesh", _spawn_proc_mesh)
 
@@ -149,6 +156,19 @@ def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
     assert trainer.events == ["setup", "train", "close"]
     assert trainer.setup_trainer_mesh == "trainer_mesh"
     assert trainer.setup_generator_meshes == ["generator_mesh_0"]
+    assert trainer.setup_eval_generator_meshes == []
+
+
+def test_main_passes_configured_eval_generators(monkeypatch, stub_mesh_provisioning):
+    _FakeConfigManager.config = _FakeConfig(num_eval_generators=1)
+    _FakeController.instances = []
+    monkeypatch.setattr(train, "ConfigManager", _FakeConfigManager)
+
+    asyncio.run(train.main())
+
+    trainer = _FakeController.instances[0]
+    assert trainer.setup_generator_meshes == ["generator_mesh_0"]
+    assert trainer.setup_eval_generator_meshes == ["eval_generator_mesh_0"]
 
 
 def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioning):
