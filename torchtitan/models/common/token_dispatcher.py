@@ -43,6 +43,21 @@ class AllToAllDispatchMetadata(LocalDispatchMetadata):
     output_splits: list[int]
 
 
+def _apply_router_scores(
+    routed_output_RD: torch.Tensor,
+    topk_scores_experts_sorted_N: torch.Tensor,
+) -> torch.Tensor:
+    """Apply router scores in FP32 without an inference-only FP32 output copy."""
+    scores_N1 = topk_scores_experts_sorted_N.reshape(-1, 1)
+    if not torch.is_grad_enabled():
+        # The expert output is dead after scoring during inference. TensorIterator
+        # promotes the multiply to FP32 and casts into the BF16 destination, matching
+        # the explicit cast/multiply/cast below without an R x D FP32 temporary.
+        return torch.mul(routed_output_RD, scores_N1, out=routed_output_RD)
+
+    return (routed_output_RD.to(torch.float32) * scores_N1).to(routed_output_RD.dtype)
+
+
 class LocalTokenDispatcher(Configurable):
     """Token dispatcher for EP=1. Handles local token reordering only.
 
@@ -165,10 +180,10 @@ class LocalTokenDispatcher(Configurable):
         del num_local_tokens_after_padding, local_seq_len_after_padding
         out_TD = torch.zeros_like(x_TD)
 
-        routed_output_RD = (
-            routed_output_RD.to(torch.float32)
-            * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
-        ).to(routed_output_RD.dtype)
+        routed_output_RD = _apply_router_scores(
+            routed_output_RD,
+            metadata.topk_scores_experts_sorted_N,
+        )
 
         dim = x_TD.shape[-1]
         out_TD = deterministic_scatter_add(

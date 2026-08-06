@@ -9,7 +9,36 @@ import unittest.mock
 
 import torch
 
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.token_dispatcher import (
+    _apply_router_scores,
+    AllToAllTokenDispatcher,
+)
+
+
+class TestApplyRouterScores(unittest.TestCase):
+    def test_inference_reuses_storage_and_matches_fp32_scaling(self):
+        routed_output = torch.randn(37, 11, dtype=torch.bfloat16)
+        scores = torch.randn(37, dtype=torch.float32)
+        expected = (routed_output.float() * scores[:, None]).bfloat16()
+        output_data_ptr = routed_output.data_ptr()
+
+        with torch.no_grad():
+            actual = _apply_router_scores(routed_output, scores)
+
+        self.assertEqual(actual.data_ptr(), output_data_ptr)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_training_preserves_autograd(self):
+        routed_output = torch.randn(37, 11, dtype=torch.bfloat16, requires_grad=True)
+        original = routed_output.detach().clone()
+        scores = torch.randn(37, dtype=torch.float32)
+
+        actual = _apply_router_scores(routed_output, scores)
+        actual.float().sum().backward()
+
+        torch.testing.assert_close(routed_output, original, rtol=0, atol=0)
+        self.assertIsNotNone(routed_output.grad)
+        self.assertTrue(torch.isfinite(routed_output.grad).all())
 
 
 class TestPermute(unittest.TestCase):
