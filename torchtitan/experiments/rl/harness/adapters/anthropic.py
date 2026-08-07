@@ -509,7 +509,11 @@ class AnthropicAdapter:
             session.last_completion_ids = list(completion.token_ids)
             session.req_count += 1
 
-            logger.info(
+            # DEBUG, not INFO: this fires once per TURN and a tmax episode averages
+            # ~40 turns, so at INFO it is ~120k lines a run -- enough to bury the
+            # per-rollout lines. It is the per-turn forensic record (did this turn hit
+            # the max_tokens cap?); reach it with TT_ROLLOUT_LOG_LEVEL=DEBUG.
+            logger.debug(
                 "[anthropic_adapter] %s turn=%d: prompt=%d max_tokens=%d out=%d finish=%s",
                 session.routing_session_id,
                 len(session.turns) - 1,

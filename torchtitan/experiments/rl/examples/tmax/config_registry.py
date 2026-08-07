@@ -88,6 +88,13 @@ _TB2_VAL_DATA = os.environ.get("SWE_TB2_VAL_DATA", "")
 _TB2_VAL_TEMPERATURE = float(os.environ.get("SWE_TB2_VAL_TEMPERATURE", "0.7"))
 _TB2_VAL_TOP_P = float(os.environ.get("SWE_TB2_VAL_TOP_P", "0.95"))
 _TB2_VAL_K = int(os.environ.get("SWE_TB2_VAL_K", "5"))
+# Per-turn generation cap for the pass. Unset inherits the training value (16384,
+# the Harbor Vanillux2Agent default). Raising it is a probe for turns that burn the
+# whole cap inside <think> and are cut off before emitting a tool call -- which this
+# recipe scores 0 (TMAX_FORMAT_ERROR_FEEDBACK=0 breaks on the first such turn).
+# It trades against turns-per-episode: preserve_all_thinking keeps every turn's
+# reasoning in later prompts, so longer turns fill the context sooner.
+_TB2_VAL_MAX_TOKENS = int(os.environ.get("SWE_TB2_VAL_MAX_TOKENS", "0")) or None
 
 # Full TMax-9B recipe context (open-instruct qwen35_9b.sh: response_length 65536)
 # and per-turn generation cap (per_turn_max_tokens 16384). The context is the
@@ -184,6 +191,7 @@ def _tmax_9b_validation() -> ValidationConfig:
         group_size=group_size,
         temperature=temperature,
         top_p=top_p,
+        max_tokens=_TB2_VAL_MAX_TOKENS if _TB2_VAL_DATA else None,
         # Async needs somewhere else to run; without eval generators it would just
         # contend with rollout collection for the training ones.
         run_async=int(os.environ.get("SWE_NUM_EVAL_GENERATORS", "0")) > 0,
@@ -682,6 +690,7 @@ def rl_grpo_qwen3_5_9b_tmax_tb2_eval() -> Controller.Config:
             group_size=_TB2_VAL_K,
             temperature=_TB2_VAL_TEMPERATURE,
             top_p=_TB2_VAL_TOP_P,
+            max_tokens=_TB2_VAL_MAX_TOKENS,
         ),
     )
     if _TB2_CKPT:

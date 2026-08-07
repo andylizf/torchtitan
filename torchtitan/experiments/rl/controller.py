@@ -208,6 +208,12 @@ class ValidationConfig:
     top_p: float = 1.0
     """Nucleus sampling cutoff, paired with ``temperature``."""
 
+    max_tokens: int | None = None
+    """Per-generation token cap for the pass. None inherits the generator's training
+    value. Worth raising for a multi-turn agent whose turns get truncated before they
+    emit a tool call -- but the cap competes with the number of turns that fit in the
+    context, so measure both."""
+
     run_async: bool = False
     """Run the pass as a background task instead of blocking the training step.
 
@@ -1142,6 +1148,7 @@ class Controller(Configurable):
                     group_size=group_size,
                     temperature=sampling.temperature,
                     top_p=sampling.top_p,
+                    max_tokens=sampling.max_tokens,
                     metrics_prefix=None,
                 )
             )
@@ -1269,6 +1276,11 @@ class Controller(Configurable):
             self._sampling,
             temperature=validation.temperature,
             top_p=validation.top_p,
+            **(
+                {}
+                if validation.max_tokens is None
+                else {"max_tokens": validation.max_tokens}
+            ),
         )
 
         samples, rollout_groups, metrics = await self._collect_validation_rollouts(

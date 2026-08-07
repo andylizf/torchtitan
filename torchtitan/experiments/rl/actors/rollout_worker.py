@@ -29,6 +29,7 @@ Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -64,12 +65,20 @@ def _enable_worker_info_logging() -> None:
     libraries stay muted, and only attach a handler when nothing upstream provides
     one -- attaching unconditionally duplicates every line in a process that already
     configured logging.
+
+    ``TT_ROLLOUT_LOG_LEVEL=DEBUG`` additionally turns on the per-turn records (prompt
+    length, the turn's max_tokens, output length, finish reason), which is how to tell
+    whether turns are hitting the per-turn generation cap. Default INFO keeps it to
+    one line per rollout.
     """
+    level = getattr(
+        logging, os.environ.get("TT_ROLLOUT_LOG_LEVEL", "INFO").upper(), logging.INFO
+    )
     logger = logging.getLogger("torchtitan")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     if not logger.hasHandlers():
         handler = logging.StreamHandler()
-        handler.setLevel(logging.INFO)
+        handler.setLevel(level)
         logger.addHandler(handler)
 
 
@@ -133,6 +142,7 @@ class RolloutWorker(Actor):
         group_size: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
+        max_tokens: int | None = None,
         metrics_prefix: str | None = "rollout",
     ) -> RolloutGroup:
         """Run + score one prompt group; return the finalized RolloutGroup.
@@ -142,6 +152,7 @@ class RolloutWorker(Actor):
                 ``async_loop.group_size``; a validation pass passes its own k.
             temperature: Sampling temperature override (None keeps the training value).
             top_p: Nucleus sampling override (None keeps the training value).
+            max_tokens: Per-generation token cap override (None keeps the training value).
             metrics_prefix: Prefix for the standard computed rollout metrics. None
                 skips them, leaving only the rollouter's own group metrics -- the
                 validation path re-keys and aggregates those in the controller.
@@ -153,6 +164,8 @@ class RolloutWorker(Actor):
             sampling = replace(sampling, temperature=temperature)
         if top_p is not None:
             sampling = replace(sampling, top_p=top_p)
+        if max_tokens is not None:
+            sampling = replace(sampling, max_tokens=max_tokens)
         with sl.log_trace_span("worker_run_group"):
             generate_fn = self._make_generate_fn()
             group = await self._rollouter.run_group_rollouts(

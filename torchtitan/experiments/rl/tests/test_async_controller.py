@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from torchtitan.experiments.rl.actors.generator import SamplingConfig
 from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWork,
@@ -1079,5 +1080,50 @@ def test_validate_skips_when_the_evaluator_is_disabled() -> None:
         metrics = await controller.validate(step=20)
 
         assert [metric.key for metric in metrics] == ["validation/skipped"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "override, expected",
+    [(None, 16384), (24576, 24576)],
+)
+def test_validation_max_tokens_override(override: int | None, expected: int) -> None:
+    """None must INHERIT the generator's per-turn cap, not blank it out."""
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller.config = SimpleNamespace(
+            num_eval_generators=0,
+            async_loop=SimpleNamespace(
+                validation=ValidationConfig(
+                    num_samples=2,
+                    group_size=5,
+                    temperature=0.7,
+                    top_p=0.95,
+                    max_tokens=override,
+                )
+            ),
+        )
+        controller.eval_generator_router = None
+        controller._sampling = SamplingConfig(
+            temperature=1.0, top_p=1.0, max_tokens=16384
+        )
+        seen = {}
+
+        async def _collect(*, num_groups, group_size, sampling, step):
+            seen["sampling"] = sampling
+            return [], [], []
+
+        controller._collect_validation_rollouts = _collect
+        controller.rollout_recorder = MagicMock()
+        controller.validation_trace_recorder = SimpleNamespace(enabled=False)
+        controller._trainer_policy_version = 0
+
+        await controller.validate(step=0)
+
+        assert seen["sampling"].max_tokens == expected
+        # The pass must still carry its own temperature / top_p.
+        assert (seen["sampling"].temperature, seen["sampling"].top_p) == (0.7, 0.95)
 
     asyncio.run(run())
