@@ -1,0 +1,200 @@
+# tmax terminal-agent RL (Qwen3.5-9B GDN)
+
+Post-train a Qwen model as a **terminal agent** on the AI2 tmax corpus: each task
+boots its own container, the policy drives a single-`bash`-tool agent loop until it
+submits, and the task's own verifier script produces a binary reward that feeds
+GRPO/DPPO.
+
+This is a faithful port of AI2's open-instruct tmax RL recipe
+(`scripts/tmax/RL/qwen35_9b.sh` + `SWERLVanilluxSandboxEnv`) onto TorchTitan's RL
+loop. It shares the sandbox / adapter / grading machinery with
+[`examples/swe_r2e`](../swe_r2e/README.md) -- read that README first for the
+harness architecture; this one covers what tmax changes and how to run it.
+
+## How a rollout works
+
+```
+Controller (one asyncio loop)
+  TMaxRollouter.run_group_rollouts(generate_fn, sample, group_size=32)
+    AnthropicAdapter  <- one HTTP server (127.0.0.1:SHIM_PORT) backed by generate_fn
+    per sibling (32), spread over SWE_NUM_ROLLOUT_WORKERS CPU processes:
+      boot sandbox from the task's public docker image (tests baked in), as root
+      run_vanillux_loop(adapter, sandbox)          <- host-side agent brain
+         one `bash` tool only; persistent shell (cd/export stick)
+         each action -> sb.exec in the sandbox; observation head/tail-truncated
+         agent submits by `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+      grade_tmax(...)  upload fixtures -> `bash /tests/test.sh` -> /logs/verifier/reward.txt
+  RewardTMax -> advantage (group-centered) -> one packed TITO episode -> DPPO backward
+```
+
+Two tmax-specific points:
+
+- **Scaffold fidelity matters.** The 9B is SFT'd under the Vanillux scaffold
+  (single `bash` tool, mini-swe-agent v2.2.x prompts, submit marker). Running it
+  under the swe_r2e Bash/Read/Write/Edit scaffold puts the policy off-distribution
+  and starves the solve rate, so `vanillux_loop.py` / `vanillux_prompts.py` are a
+  byte-faithful port -- do not "improve" the prompts.
+- **Grade in place, on submit only.** The verifier inspects the container's live
+  filesystem, so it runs inside the agent's own sandbox. A rollout that never
+  submits scores 0 (same as the reference env).
+
+## Layout
+
+- `prepare_tmax_data.py` -- build the training JSONL from `allenai/tmax-15k-open-instruct`
+- `prepare_tb2_data.py` -- build a Terminal-Bench 2.0 eval JSONL (89 tasks) in the same schema
+- `data.py` / `env.py` -- `TMaxDataset` (train/holdout split) and the token env
+- `vanillux_loop.py`, `vanillux_prompts.py` -- the agent loop and its verbatim prompts
+- `rollouter.py` -- sandbox boot, sibling scheduling, grading, reward stamping
+- `grading.py`, `rubric.py` -- `bash /tests/test.sh` -> `reward.txt` -> `RewardTMax`
+- `config_registry.py` -- the recipes (below)
+- `local_smoke.py` -- sandbox boot + grade path only, no training stack
+- `eval_external_model.py` -- score tasks with an external brain under the same scaffold
+  (tells "task is hard" apart from "our 9B is weak")
+- `hf_upload.py` -- convert one DCP checkpoint to HF format and upload it
+
+## Recipes
+
+| Config | What it is |
+| --- | --- |
+| `rl_grpo_qwen3_5_9b_tmax` | The main recipe: Qwen3.5-9B (GDN hybrid), trainer FSDP-8, vLLM-native GDN generator |
+| `rl_grpo_qwen3_5_27b_tmax` | 27B GDN variant (clones the 27B swe_r2e recipe) |
+| `rl_grpo_qwen3_4b_tmax` | Numerics control: dense Qwen3-4B in batch-invariant mode, so trainer/generator logprobs are bitwise-identical |
+| `rl_grpo_qwen3_5_9b_tmax_tb2_eval` | Eval only: score a checkpoint on all 89 Terminal-Bench 2.0 tasks |
+
+The 9B recipe as shipped: `group_size=32`, `num_groups_per_train_step=8`,
+`max_offpolicy_steps=4`, 65536 context, 16384 per-turn tokens, `drop_zero_std=True`
+(terminal tasks are sparse binary, so all-fail groups would zero the gradient),
+DPPO loss (unclipped `-A*ratio` + TV trust-region mask, delta 0.1) in 32 chunks,
+fp32 master params with bf16 FSDP compute, fused AdamW lr 1e-6 / betas (0.9, 0.999)
+/ eps 1e-8 / no weight decay, temperature 1.0, constant LR.
+
+## Prerequisites
+
+1. The RL env from [`../../README.md`](../../README.md) (Monarch, TorchStore,
+   renderers, vLLM, FA3).
+2. GDN kernels for the Qwen3.5 hybrid: `pip install av torchvision flash-linear-attention`.
+   The trainer's GDN backward needs a working `fla` build for your CUDA; if the
+   tilelang-backed kernels fail to load, generation still works but the backward
+   will not.
+3. A sandbox provider key exported as `DAYTONA_API_KEY` (`dtn_...`), and
+   `pip install daytona`.
+4. `HF_TOKEN` for the dataset pulls, and the model's HF weights on disk
+   (`--hf_assets_path`).
+
+## Data
+
+```bash
+# Training corpus (15K tasks). Writes a 5-task tmax_smoke.jsonl next to --out too.
+python -m torchtitan.experiments.rl.examples.tmax.prepare_tmax_data \
+    --out /path/to/tmax_train.jsonl
+
+# Terminal-Bench 2.0 eval set (89 tasks, same schema)
+python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_data \
+    --out /path/to/tb2_eval.jsonl
+```
+
+Each row is `{prompt, label, metadata{instance_id, image, workdir, tmax{test_sh,
+fixtures, reward_path}}}` -- see the module docstrings for the full contract.
+
+Sanity-check the sandbox and grading path before touching GPUs (no training stack
+needed):
+
+```bash
+DAYTONA_API_KEY=dtn_... python torchtitan/experiments/rl/examples/tmax/local_smoke.py \
+    --data torchtitan/experiments/rl/examples/tmax/tmax_smoke.jsonl --limit 2
+```
+
+## Run
+
+The trainer takes one 8-GPU host (FSDP-8). Each generator is a separate vLLM
+engine of `tensor_parallel_degree` GPUs, so the 9B recipe (generator TP-1) wants
+`--num-generators 8` on a second 8-GPU host -- data-parallel engines, since one
+engine's decode cannot keep hundreds of concurrent agents fed. Launching across
+hosts is your own job scheduler's problem; the process to start is:
+
+```bash
+export DAYTONA_API_KEY=dtn_...
+export SWE_PROMPT_DATA=/path/to/tmax_train.jsonl
+export SWE_MAX_CONTEXT_LEN=65536      # match the recipe context; default 32768 truncates
+export SWE_ROLLOUT_CONCURRENCY=512    # concurrently-active sandboxes (see limits below)
+export SWE_NUM_ROLLOUT_WORKERS=8      # CPU processes for agent orchestration, off the controller GIL
+
+python -m torchtitan.experiments.rl.train \
+    --module torchtitan.experiments.rl.examples.tmax \
+    --config rl_grpo_qwen3_5_9b_tmax \
+    --num-generators 8 \
+    --hf_assets_path /path/to/Qwen3.5-9B
+```
+
+Inline Terminal-Bench 2.0 as the periodic validation (instead of a tmax holdout
+slice), on its own generator so training does not stall:
+
+```bash
+export SWE_TB2_VAL_DATA=/path/to/tb2_eval.jsonl   # k=5, temperature 0.7, top_p 0.95
+export SWE_NUM_EVAL_GENERATORS=1                 # also flips validation to run_async
+export SWE_VAL_INTERVAL=25
+```
+
+Eval an existing checkpoint only:
+
+```bash
+SWE_TB2_DATA=/path/to/tb2_eval.jsonl SWE_TB2_CKPT=/path/to/dcp_checkpoint \
+python -m torchtitan.experiments.rl.train \
+    --module torchtitan.experiments.rl.examples.tmax \
+    --config rl_grpo_qwen3_5_9b_tmax_tb2_eval \
+    --hf_assets_path /path/to/Qwen3.5-9B
+```
+
+## Knobs worth knowing
+
+Everything below is read from the environment in `config_registry.py` /
+`rollouter.py`, so it lands in the W&B run config.
+
+| Variable | Default | Why you'd change it |
+| --- | --- | --- |
+| `SWE_PROMPT_DATA` | (required) | Training JSONL |
+| `SWE_MAX_CONTEXT_LEN` | 32768 | Adapter context budget; set 65536 for the full recipe |
+| `SWE_ROLLOUT_CONCURRENCY` | 16 | Active sandboxes. Above `(off+1) * groups * group_size = 1280` there is no schedulable work left |
+| `SWE_NUM_ROLLOUT_WORKERS` | 8 | 0 keeps everything in-process (GIL-bound) |
+| `TT_DAYTONA_CREATE_CONCURRENCY` | 16 | Per-worker sandbox-create parallelism; lower it if the provider rate-limits (429) |
+| `SWE_TRAIN_STEPS` | 100 | Optimizer steps |
+| `SWE_GROUP_SIZE` / `SWE_NUM_GROUPS_PER_TRAIN_STEP` / `SWE_OFFPOLICY_STEPS` | 32 / 8 / 4 | The async/GRPO shape |
+| `SWE_LOSS` | `dppo` | `dapo` or `grpo` for an A/B |
+| `SWE_DPPO_RATIO_CAP` | 0 (off) | Truncated-IS cap; 2 tames a residual GDN train/infer logprob tail |
+| `TMAX_CALL_LIMIT` | 64 | Max bash actions per episode (the reference run's `--max_steps`) |
+| `TMAX_EXEC_TIMEOUT_SEC` | 120 | Per-command timeout; a foreground server can otherwise burn the budget |
+| `TMAX_FORMAT_ERROR_FEEDBACK` | 0 | 0 = break on the first turn with no `bash` call (reference behavior) |
+| `SWE_VAL_SAMPLES` / `SWE_VAL_INTERVAL` | 32 / 20 | Held-out validation size and cadence; `SWE_VAL_SAMPLES=0` turns it off |
+| `SWE_ROLLOUT_DUMP_DIR` | unset | Per-rollout decoded completions + reward (what the model actually trained on) |
+| `SWE_ZERO_STD_DIR` | unset | Log all-pass / all-fail prompts, to feed back as `SWE_SKIP_PROMPTS` |
+| `TT_ROLLOUT_LOG_LEVEL` | INFO | `DEBUG` adds one line per agent turn (prompt len, max_tokens, finish reason) |
+
+## Reading the metrics
+
+- **`rollout_reward/avg_train_reward` is the learning curve.** With
+  `drop_zero_std=True` the trained batch is filtered to mixed-outcome groups, so
+  `rollout_reward/mean` (the one on stdout) is pinned near ~0.5 by construction and
+  is *not* a learning signal. This has burned us before.
+- `validation/reward/mean` is avg@k and `validation/pass_at_k` is pass@k over the
+  validation set; with `SWE_TB2_VAL_DATA` these are directly comparable to
+  published Terminal-Bench 2.0 numbers.
+- `bit_wise/logprob_diff/{abs_mean,max}` is generator-vs-trainer logprob drift.
+  It is exactly 0 on prefill but not on GDN decode (chunk-parallel training vs
+  recurrent decoding); a large `max` is what `SWE_DPPO_RATIO_CAP` guards against.
+
+## Gotchas
+
+- **Sandbox provider limits are the real throughput ceiling**, not GPUs. Creation
+  is rate-limited (order 10/s), and `SWE_NUM_ROLLOUT_WORKERS *
+  TT_DAYTONA_CREATE_CONCURRENCY` concurrent creates plus retries will trip it.
+  Also budget vCPU/memory/disk per sandbox against your account quota.
+- **Staleness kills rollouts at high concurrency.** A rollout whose policy version
+  falls more than `SWE_OFFPOLICY_STEPS` behind is dropped; long terminal episodes
+  plus create-throttling makes this the usual cause of a run stalling out.
+- **The generator needs the GDN-specific settings** the recipe already sets:
+  `gdn_prefill_backend=triton`, fp32 mamba SSM cache, and cudagraph
+  `FULL_DECODE_ONLY`. Full cudagraph capture over mixed prefill/decode batches
+  corrupts GDN output (gibberish, reward 0).
+- **Context is two knobs.** The generator's `max_model_len` and the trainer
+  batcher's packing width both move to 65536 together; raise one only and episodes
+  get truncated or dropped at packing time.
