@@ -20,9 +20,13 @@ Two seams make it work without vendoring the agent:
     Terminus-2 touches (measured, not guessed: ``exec`` / ``upload_file`` /
     ``download_file`` / ``is_dir`` / ``default_user`` plus
     ``trial_paths.agent_dir``).
-  - Terminus-2 reaches its model through LiteLLM, so it is pointed at the
-    adapter's Anthropic endpoint with the session id as the API key. Turns land in
-    the adapter's capture exactly as they do for the in-process harnesses.
+  - ``_AdapterLLM`` replaces Terminus-2's LiteLLM backend with a direct
+    ``adapter.complete`` call. The adapter deliberately does NOT run an HTTP
+    server on the tmax path (no loopback hop, no per-worker port), and rollout
+    workers are separate processes, so ``adapter.url`` resolves to nothing there --
+    pointing LiteLLM at it fails every rollout with "Cannot connect to host".
+    Calling in-process also keeps turn capture on the same path the other
+    harnesses use.
 
 CAVEAT: the model has to emit Terminus-2's XML (``<response><analysis><plan>
 <commands><keystrokes>``). A policy trained under a tool-calling scaffold is off
@@ -48,13 +52,67 @@ from torchtitan.experiments.rl.harness.agents.spec import (
 
 logger = logging.getLogger(__name__)
 
-# Terminus-2 asks LiteLLM for an Anthropic-provider call; the model name after the
-# prefix is arbitrary (the adapter serves whatever session the key names).
-_LITELLM_MODEL = os.environ.get("TMAX_TERMINUS_MODEL", "anthropic/titan-actor")
 _PARSER = os.environ.get("TMAX_TERMINUS_PARSER", "xml")
 # Terminus-2 batches commands per turn, so it needs far fewer than a one-command-
 # per-turn scaffold; this only bounds a runaway loop.
 _DEFAULT_MAX_TURNS = int(os.environ.get("TMAX_TERMINUS_MAX_TURNS", "64"))
+# Terminus-2 asks the backend for a context limit to decide when to summarize.
+_MAX_CONTEXT = int(os.environ.get("SWE_MAX_CONTEXT_LEN", "63488"))
+# Per-turn generation cap; the adapter clamps it to the remaining context budget.
+_TURN_MAX_TOKENS = int(os.environ.get("TMAX_TURN_MAX_TOKENS", "16384"))
+
+
+class _AdapterExhausted(RuntimeError):
+    """The adapter has no completion left for this session."""
+
+
+class _AdapterLLM:
+    """Terminus-2's LLM seam, backed by ``AnthropicAdapter.complete`` in-process.
+
+    Terminus-2 only ever does ``await llm.call(prompt=..., message_history=...)``
+    plus the two limit getters, so this is the whole surface. The adapter speaks
+    Anthropic messages, which is also what it captures for training.
+    """
+
+    def __init__(
+        self, adapter: Any, *, session_id: str, max_context: int, turn_max_tokens: int
+    ) -> None:
+        self._adapter = adapter
+        self._session_id = session_id
+        self._max_context = max_context
+        self._turn_max_tokens = turn_max_tokens
+
+    def get_model_context_limit(self) -> int:
+        return self._max_context
+
+    def get_model_output_limit(self) -> int | None:
+        return None
+
+    async def call(self, prompt: str, message_history=None, **_kwargs):
+        from harbor.llms.base import LLMResponse  # type: ignore
+
+        messages = list(message_history or [])
+        messages.append({"role": "user", "content": prompt})
+        reply = await self._adapter.complete(
+            self._session_id,
+            {
+                "messages": messages,
+                "max_tokens": self._turn_max_tokens,
+                "stream": False,
+            },
+        )
+        if reply is None:
+            # The session is closed or the generator yielded nothing; ending the
+            # trajectory is what the other harnesses do here too.
+            raise _AdapterExhausted(
+                f"adapter returned no completion for {self._session_id}"
+            )
+        text = "".join(
+            block.get("text", "")
+            for block in (reply.get("content") or [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        return LLMResponse(content=text)
 
 
 class _SandboxEnvironment:
@@ -124,11 +182,6 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
     from harbor.agents.terminus_2 import Terminus2  # type: ignore
     from harbor.models.agent.context import AgentContext  # type: ignore
 
-    # LiteLLM reads the Anthropic key from the environment; the adapter uses it to
-    # pick the session, so every rollout must scope it to its own id.
-    previous_key = os.environ.get("ANTHROPIC_API_KEY")
-    os.environ["ANTHROPIC_API_KEY"] = task.session_id
-
     submitted = False
     turns = 0
     finish_reason = "unknown"
@@ -138,12 +191,19 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
             max_episodes = task.max_turns or _DEFAULT_MAX_TURNS
             agent = Terminus2(
                 logs_dir=Path(logs_dir),
-                model_name=_LITELLM_MODEL,
-                api_base=task.adapter.url,
+                model_name="titan-actor",
                 parser_name=_PARSER,
                 record_terminal_session=False,
                 max_turns=max_episodes,
                 suppress_max_turns_warning=True,
+            )
+            # Swap the LiteLLM backend for the in-process adapter before setup;
+            # Terminus-2 only reads self._llm through ``call`` and the limit getters.
+            agent._llm = _AdapterLLM(
+                task.adapter,
+                session_id=task.session_id,
+                max_context=_MAX_CONTEXT,
+                turn_max_tokens=_TURN_MAX_TOKENS,
             )
             context = AgentContext()
             await agent.setup(env)
@@ -162,11 +222,6 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
                 str(e)[:200],
             )
             finish_reason = "error"
-        finally:
-            if previous_key is None:
-                os.environ.pop("ANTHROPIC_API_KEY", None)
-            else:
-                os.environ["ANTHROPIC_API_KEY"] = previous_key
 
     return AgentRun(turns=turns, submitted=submitted, finish_reason=finish_reason)
 
