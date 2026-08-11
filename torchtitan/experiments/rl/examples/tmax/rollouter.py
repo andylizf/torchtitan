@@ -59,10 +59,14 @@ from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset, TMaxSample
 from torchtitan.experiments.rl.examples.tmax.env import TMaxEnv
 from torchtitan.experiments.rl.examples.tmax.grading import grade_tmax, seed_workspace
 from torchtitan.experiments.rl.examples.tmax.rubric import RewardTMax, TMAX_REWARD_KEY
-from torchtitan.experiments.rl.examples.tmax.vanillux_loop import run_vanillux_loop
+from torchtitan.experiments.rl.examples.tmax.vanillux_loop import (  # noqa: F401 -- registers the default agent
+    vanillux_agent,
+)
 from torchtitan.experiments.rl.harness import (
+    AgentTask,
     AnthropicAdapter,
     boot_agent_sandbox,
+    get_agent,
     Sandbox,
     SandboxIssue,
     SandboxIssueTracker,
@@ -367,6 +371,14 @@ class TMaxRollouter(Rollouter):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
+        # Which agent scaffold drives the rollout. Defaults to the vanillux loop the
+        # tmax models are SFT'd under; TMAX_AGENT=terminus swaps in Terminus-2 (a
+        # different output format -- see harness/agents/terminus.py).
+        self._agent_name = os.environ.get("TMAX_AGENT", "vanillux")
+        if self._agent_name != "vanillux":
+            # Import for the side effect of registering; only the default is wired
+            # in by the tmax module itself.
+            import torchtitan.experiments.rl.harness.agents.terminus  # noqa: F401
         self._time_budget_sec = config.time_budget_sec
         self._eval_timeout_sec = config.eval_timeout_sec
         self._max_context_tokens = config.max_context_tokens
@@ -611,21 +623,27 @@ class TMaxRollouter(Rollouter):
                     # seed-bearing tasks are unsolvable (inputs absent during rollout).
                     # Grading fixtures (tests/*) are uploaded later by grade_tmax.
                     await seed_workspace(root_sb, sample.tmax)
-                    (
-                        _turns,
-                        submitted,
-                        fmt_errors,
-                        finish_reason,
-                    ) = await run_vanillux_loop(
-                        root_sb,
-                        task=sample.problem_statement,
-                        session_id=rollout_id,
-                        adapter=adapter,
-                        time_budget_sec=self._time_budget_sec,
+                    agent_run = await get_agent(self._agent_name)(
+                        AgentTask(
+                            sandbox=root_sb,
+                            instruction=sample.problem_statement,
+                            session_id=rollout_id,
+                            adapter=adapter,
+                            time_budget_sec=self._time_budget_sec,
+                            workdir=sample.workdir,
+                        )
                     )
+                    # None = the harness has no submit signal at all; grade anyway
+                    # (see AgentRun.submitted) and report it as submitted for the
+                    # trace, since a graded rollout is what the reward reflects.
+                    submitted = agent_run.submitted is not False
+                    fmt_errors = agent_run.format_errors
+                    finish_reason = agent_run.finish_reason
                     # tmax runs the verifier only on the submit marker; a rollout that
                     # never submits scores 0 (matches SWERLVanilluxSandboxEnv). No
-                    # git_diff: grade the agent's OWN sandbox in place.
+                    # git_diff: grade the agent's OWN sandbox in place. ``None`` means
+                    # the harness has no submit signal -- grade anyway rather than
+                    # scoring every rollout 0 (see AgentRun.submitted).
                     if submitted:
                         reward = await grade_tmax(
                             sandbox,

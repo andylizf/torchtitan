@@ -34,6 +34,11 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from torchtitan.experiments.rl.harness.agents.spec import (
+    AgentRun,
+    AgentTask,
+    register_agent,
+)
 from torchtitan.experiments.rl.harness.sandbox import (
     DaytonaSandbox,
     make_sandbox,
@@ -410,3 +415,26 @@ async def git_diff(
     )
     _, out, _ = await sb.exec(cmd, user=user, timeout=120)
     return out
+
+
+async def claude_code_agent(task: AgentTask) -> AgentRun:
+    """``run_claude_code`` behind the AgentTask/AgentRun contract."""
+    turns = await run_claude_code(
+        task.sandbox,
+        workdir=task.workdir,
+        session_id=task.session_id,
+        adapter_url=task.adapter.url,
+        time_budget_sec=task.time_budget_sec,
+        problem_statement=task.instruction,
+        pre_commands=task.pre_commands,
+    )
+    # The CLI reports no submit signal; see AgentRun.submitted on why that is None
+    # rather than False.
+    return AgentRun(
+        turns=max(turns, 0),
+        submitted=None,
+        finish_reason="error" if turns < 0 else "unknown",
+    )
+
+
+register_agent("claude_code", claude_code_agent)

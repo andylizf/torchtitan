@@ -31,6 +31,14 @@ from torchtitan.experiments.rl.harness.agents import (
     run_claude_code,
     run_host_loop,
 )
+from torchtitan.experiments.rl.harness.agents.spec import (
+    AgentFn,
+    AgentRun,
+    AgentTask,
+    get_agent,
+    register_agent,
+    registered_agents,
+)
 from torchtitan.experiments.rl.harness.sandbox import (
     DaytonaSandbox,
     make_sandbox,
@@ -41,6 +49,9 @@ from torchtitan.experiments.rl.harness.sandbox import (
 )
 
 __all__ = [
+    "AgentFn",
+    "AgentRun",
+    "AgentTask",
     "AnthropicAdapter",
     "CapturedTurn",
     "DaytonaSandbox",
@@ -50,8 +61,11 @@ __all__ = [
     "SandboxLogContext",
     "apply_pre_commands",
     "boot_agent_sandbox",
+    "get_agent",
     "git_diff",
     "make_sandbox",
+    "register_agent",
+    "registered_agents",
     "run_claude_code",
     "run_host_loop",
 ]

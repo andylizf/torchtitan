@@ -50,6 +50,11 @@ from torchtitan.experiments.rl.examples.tmax.vanillux_prompts import (
     OBS_TOO_LONG_HINT,
     SYSTEM_TEMPLATE,
 )
+from torchtitan.experiments.rl.harness.agents.spec import (
+    AgentRun,
+    AgentTask,
+    register_agent,
+)
 from torchtitan.experiments.rl.harness.sandbox import Sandbox
 
 if TYPE_CHECKING:
@@ -417,3 +422,31 @@ async def run_vanillux_loop(
         elapsed,
     )
     return turns, submitted, total_format_errors, finish_reason
+
+
+async def vanillux_agent(task: AgentTask) -> AgentRun:
+    """``run_vanillux_loop`` behind the AgentTask/AgentRun contract.
+
+    This is the tmax default: the 9B is SFT'd under these prompts, so the recipe
+    must keep resolving to it unless a run asks for something else.
+    """
+    turns, submitted, format_errors, finish_reason = await run_vanillux_loop(
+        task.sandbox,
+        task=task.instruction,
+        session_id=task.session_id,
+        adapter=task.adapter,
+        time_budget_sec=task.time_budget_sec,
+        **({"max_turns": task.max_turns} if task.max_turns is not None else {}),
+        **(
+            {"exec_timeout": task.exec_timeout} if task.exec_timeout is not None else {}
+        ),
+    )
+    return AgentRun(
+        turns=turns,
+        submitted=submitted,
+        format_errors=format_errors,
+        finish_reason=finish_reason,
+    )
+
+
+register_agent("vanillux", vanillux_agent)

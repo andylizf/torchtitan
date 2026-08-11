@@ -43,6 +43,11 @@ from torchtitan.experiments.rl.harness.agents.claude_code import (
     apply_pre_commands,
     ensure_agent_user,
 )
+from torchtitan.experiments.rl.harness.agents.spec import (
+    AgentRun,
+    AgentTask,
+    register_agent,
+)
 from torchtitan.experiments.rl.harness.sandbox import Sandbox
 
 logger = logging.getLogger(__name__)
@@ -435,3 +440,30 @@ async def run_host_loop(
 
     logger.info("[host_loop] %s: finished after %d turns", session_id, turns)
     return turns
+
+
+async def host_loop_agent(task: AgentTask) -> AgentRun:
+    """``run_host_loop`` behind the AgentTask/AgentRun contract."""
+    turns = await run_host_loop(
+        task.sandbox,
+        workdir=task.workdir,
+        session_id=task.session_id,
+        adapter_url=task.adapter.url,
+        time_budget_sec=task.time_budget_sec,
+        problem_statement=task.instruction,
+        pre_commands=task.pre_commands,
+        **({"max_turns": task.max_turns} if task.max_turns is not None else {}),
+        **(
+            {"exec_timeout": task.exec_timeout} if task.exec_timeout is not None else {}
+        ),
+    )
+    # No submit marker in this scaffold, so the caller must grade unconditionally;
+    # run_host_loop signals a setup failure with a negative turn count.
+    return AgentRun(
+        turns=max(turns, 0),
+        submitted=None,
+        finish_reason="error" if turns < 0 else "unknown",
+    )
+
+
+register_agent("host_loop", host_loop_agent)
