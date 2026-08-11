@@ -42,6 +42,8 @@ Two tmax-specific points:
 
 - `prepare_tmax_data.py` -- build the training JSONL from `allenai/tmax-15k-open-instruct`
 - `prepare_tb2_data.py` -- build a Terminal-Bench 2.0 eval JSONL (89 tasks) in the same schema
+- `prepare_rts_data.py` -- build a JSONL from the Recursive-Task-Synthesis corpus
+  (ships a Dockerfile per task instead of an image; records `oracle_commands`)
 - `data.py` / `env.py` -- `TMaxDataset` (train/holdout split) and the token env
 - `vanillux_loop.py`, `vanillux_prompts.py` -- the agent loop and its verbatim prompts
 - `rollouter.py` -- sandbox boot, sibling scheduling, grading, reward stamping
@@ -95,6 +97,68 @@ python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_data \
 
 Each row is `{prompt, label, metadata{instance_id, image, workdir, tmax{test_sh,
 fixtures, reward_path}}}` -- see the module docstrings for the full contract.
+
+### Recursive-Task-Synthesis (RTS)
+
+[`Zhongzhi1228/Recursive-Task-Synthesis`](https://huggingface.co/datasets/Zhongzhi1228/Recursive-Task-Synthesis)
+(arXiv:2608.05466) is a 37,484-task synthetic terminal-agent corpus in the same
+Harbor layout as TB-2.0, so the same verifier contract and `grading.py` apply. Two
+things differ from the tmax corpus and drive the whole pipeline:
+
+1. **It publishes no docker image** -- only 198 of 37,484 `task.toml` carry
+   `docker_image`. Each row therefore carries its `dockerfile` text (plus
+   `build_context` when the Dockerfile copies local files in) and Daytona builds it
+   server-side. Daytona caches the result, so only the first sandbox per distinct
+   Dockerfile pays for it: measured ~20-40s cold, ~1-2s warm.
+2. **The `difficulty` field is useless** -- it is inherited from the synthesis seed
+   and still reads `easy` for round-15 tasks. Use `oracle_commands` (the command
+   count of the task's own `solution/solve.sh`), which the adapter records per row.
+
+```bash
+# The corpus ships as 8 tars of task trees plus a metadata parquet. Download and
+# extract the shards you want (shard index == recursion round == difficulty).
+for i in 0 1 2 3 4 5 6 7; do
+    curl -sL -O "https://huggingface.co/datasets/Zhongzhi1228/Recursive-Task-Synthesis/resolve/main/data/tasks-0000$i.tar"
+    mkdir -p s$i && tar xf tasks-0000$i.tar -C s$i &
+done; wait
+
+# One JSONL from every shard (~1 min). 36,130 of 37,484 tasks survive the filters.
+python -m torchtitan.experiments.rl.examples.tmax.prepare_rts_data \
+    $(for i in 0 1 2 3 4 5 6 7; do echo -n " --tasks-root s$i/tasks"; done) \
+    --out /path/to/rts_train.jsonl
+```
+
+Rejected tasks, all measured rather than guessed: `needs_privileged` (692 -- an
+init system as PID 1, the docker socket, or `--privileged`), `copy_source_missing`
+(549 -- the corpus references a file it does not ship), `build_context_too_large`
+(112 -- over 1 MiB of COPY sources), `verifier_writes_no_reward` (1).
+
+**Pick the pool to match the turn budget.** A rollout capped at `SWE_MAX_TURNS`
+turns cannot solve a task whose oracle needs more commands than that, and such
+tasks are dead weight: they fail every sibling, so `drop_zero_std` discards the
+group and the rollouts are spent for nothing. On the full corpus 47% of tasks need
+more than 128 commands, which showed up as `group_all_failed_frac` pinned at 0.81.
+
+```bash
+# Only tasks whose oracle fits a 128-turn budget with 2x exploration headroom.
+python -m torchtitan.experiments.rl.examples.tmax.prepare_rts_data \
+    --tasks-root s0/tasks ... --max-oracle-commands 96 \
+    --out /path/to/rts_oc96.jsonl
+```
+
+| `--max-oracle-commands` | tasks | share of corpus |
+| --- | --- | --- |
+| (none) | 36,130 | 96% |
+| 128 | 19,107 | 53% |
+| 96 | 14,593 | 40% |
+| 64 | 9,453 | 26% |
+
+**Optional: pre-warm the build cache.** Without it the first sandbox per distinct
+Dockerfile pays a ~25s build, and with `group_size` siblings starting at once a
+cold step is slow. Touching each task once beforehand (create + delete) populates
+Daytona's cache; measured ~6900 tasks/hour at 32-way concurrency. Warm in the
+order the dataset will consume (`random.Random(seed).shuffle` over the training
+slice) so the warmed prefix is the one used first.
 
 Sanity-check the sandbox and grading path before touching GPUs (no training stack
 needed):
@@ -198,3 +262,20 @@ Everything below is read from the environment in `config_registry.py` /
 - **Context is two knobs.** The generator's `max_model_len` and the trainer
   batcher's packing width both move to 65536 together; raise one only and episodes
   get truncated or dropped at packing time.
+- **The turn cap binds long before the context does.** At the shipped 64 turns,
+  21% of RTS rollouts died on the cap with reward *exactly* 0, while mean context
+  use was 25% of the budget and `truncation_rate` was 0. Raising it to 128 cut
+  cap-deaths to ~4% and lifted the submit rate from 77% to 91%. Size the cap from
+  the measured tokens/turn (~450 here: 128 x 450 = 57K, under the 63488 session
+  budget) -- not from the context limit, and not from the paper's turn counts,
+  which come from a different scaffold (see below).
+- **Our scaffold is one bash command per turn.** The Vanillux prompts require
+  "EXACTLY ONE bash command" per response, so turns track the reference solution's
+  command count -- measured 52 mean turns where the RTS paper's Terminus-2 harness
+  reports 19-20. Do not read the paper's turn numbers, or its per-task difficulty,
+  as directly comparable.
+- **A single eval-generator RPC failure used to cost the whole eval curve.** An
+  eval generator idle between validation passes answers its next call with a gloo
+  "connection closed by peer"; the guard now retries and only disables validation
+  after repeated failures. Keep `validation.interval` small enough that the eval
+  mesh is not idle past the Monarch mesh idle timeouts.

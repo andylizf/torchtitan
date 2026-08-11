@@ -597,6 +597,8 @@ class TMaxRollouter(Rollouter):
                 # images have no curl, which would otherwise fail every boot).
                 async with boot_agent_sandbox(
                     sample.image,
+                    dockerfile=sample.dockerfile,
+                    build_context=sample.build_context,
                     install_claude=False,
                     disk_gb=sample.daytona_disk_gb,
                     issue_tracker=issue_tracker,

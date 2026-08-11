@@ -22,6 +22,7 @@ from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWorkBuffer,
 )
 from torchtitan.experiments.rl.controller import (
+    _EVAL_GUARD_MAX_FAILURES,
     _should_drop_group_at_batcher,
     _split_rollout_concurrency,
     _will_validate_after_step,
@@ -1024,21 +1025,37 @@ def test_async_validation_skips_while_a_pass_is_in_flight() -> None:
     asyncio.run(run())
 
 
-def test_eval_generator_failure_does_not_end_training() -> None:
-    """Validation is observability: an eval-generator failure must disable the
-    evaluator, not propagate into the trainer loop."""
+def test_eval_generator_failure_does_not_end_training(monkeypatch) -> None:
+    """Validation is observability: a failing eval generator reports failure instead
+    of propagating into the trainer loop.
+
+    It must not cost the whole eval curve either -- the evaluator survives a single
+    bad window and is dropped only after repeated ones. See
+    ``test_eval_generator_guard.py`` for the full retry/streak contract.
+    """
+    real_sleep = asyncio.sleep
+
+    async def instant(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", instant)
 
     async def run() -> None:
         controller = object.__new__(Controller)
         controller.eval_generator_router = MagicMock()
         controller._eval_rollout_workers = [MagicMock()]
+        controller._eval_guard_failures = 0
 
         async def _boom():
             raise RuntimeError("connection closed by peer")
 
-        ok = await controller._guard_eval_generators(_boom(), what="eval pull")
+        ok = await controller._guard_eval_generators(_boom, what="eval pull")
 
         assert ok is False
+        assert controller.eval_generator_router is not None, "one blip is not fatal"
+
+        for _ in range(_EVAL_GUARD_MAX_FAILURES - 1):
+            await controller._guard_eval_generators(_boom, what="eval pull")
         assert controller.eval_generator_router is None
         assert controller._eval_rollout_workers == []
 

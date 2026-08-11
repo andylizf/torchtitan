@@ -48,7 +48,16 @@ class TMaxSample:
     """Stable task id (e.g. ``task_000000_c19dda5b``)."""
 
     image: str
-    """Public docker image the task runs in (e.g. ``docker.io/hamishi740/...``)."""
+    """Public docker image the task runs in (e.g. ``docker.io/hamishi740/...``).
+    Empty when the task ships a ``dockerfile`` for the backend to build instead."""
+
+    dockerfile: str | None = None
+    """Dockerfile text, for corpora that publish no image (e.g. RTS). The sandbox
+    backend builds it and caches the result; see DaytonaSandbox._declarative_image."""
+
+    build_context: dict[str, str] | None = None
+    """That Dockerfile's COPY sources as {relpath: base64}, materialized next to
+    the Dockerfile at build time. None when the Dockerfile needs no context."""
 
     daytona_disk_gb: int | None = None
     """Optional per-task Daytona root-disk allocation in GiB."""
@@ -126,10 +135,12 @@ class TMaxDataset(Configurable):
                     or "unknown"
                 )
                 image = md.get("image")
+                dockerfile = md.get("dockerfile")
+                build_context = md.get("build_context")
                 tmax = md.get("tmax") or {}
-                if not image or not tmax:
+                if not (image or dockerfile) or not tmax:
                     raise ValueError(
-                        f"row {instance_id!r} missing image/tmax in metadata"
+                        f"row {instance_id!r} missing image/dockerfile/tmax in metadata"
                     )
                 daytona_disk_gb = md.get("daytona_disk_gb")
                 if daytona_disk_gb is not None and (
@@ -144,7 +155,9 @@ class TMaxDataset(Configurable):
                 samples.append(
                     TMaxSample(
                         instance_id=instance_id,
-                        image=image,
+                        image=image or "",
+                        dockerfile=dockerfile,
+                        build_context=build_context,
                         daytona_disk_gb=daytona_disk_gb,
                         workdir=md.get("workdir") or "/workspace",
                         problem_statement=md.get("problem_statement")

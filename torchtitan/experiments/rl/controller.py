@@ -92,6 +92,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
@@ -238,6 +239,16 @@ class ValidationConfig:
             raise ValueError(
                 f"validation.num_samples must be non-negative, got {self.num_samples}"
             )
+
+
+# An eval generator idle between passes answers its next RPC with a gloo
+# "connection closed by peer" and works on the retry, so a failure is retried
+# before it counts, and the evaluator is only dropped after this many CONSECUTIVE
+# calls exhaust their retries. Before this, one such blip disabled validation for
+# the rest of the run.
+_EVAL_GUARD_ATTEMPTS = 3
+_EVAL_GUARD_RETRY_SEC = 5.0
+_EVAL_GUARD_MAX_FAILURES = 3
 
 
 def _will_validate_after_step(
@@ -621,6 +632,9 @@ class Controller(Configurable):
         # the training router so a pass never steals rollout-collection capacity.
         self.eval_generator_router: InterGeneratorRouter | None = None
         self._eval_rollout_workers: list = []
+        # Consecutive eval-generator calls that exhausted their retries; reset by
+        # any success. See _guard_eval_generators.
+        self._eval_guard_failures = 0
         # In-flight background validation pass (validation.run_async); None = idle.
         self._validation_task: asyncio.Task | None = None
         # Aggregated metrics of each completed pass, keyed by the policy version it
@@ -1073,30 +1087,62 @@ class Controller(Configurable):
         with sl.log_trace_span("generator_pull_model_state_dict"):
             await self._pull_generator_weights(policy_version=self.start_step)
 
-    async def _guard_eval_generators(self, awaitable, *, what: str) -> bool:
-        """Await an eval-generator call, converting a failure into a disabled evaluator.
+    async def _guard_eval_generators(
+        self, make_awaitable: Callable[[], Awaitable[object]], *, what: str
+    ) -> bool:
+        """Retry an eval-generator call; disable the evaluator only if it keeps failing.
 
-        Validation is observability: it must not be able to end a training run. On
-        failure this drops the eval router, so later steps skip validation entirely
-        and training continues with its own generators untouched.
+        Validation is observability: it must not be able to end a training run. But a
+        single failed RPC is not a dead evaluator. An eval generator that sat idle
+        between passes answers its next call with a gloo "connection closed by peer"
+        and is fine on the retry, so ``make_awaitable`` is a factory (a coroutine can
+        only be awaited once) and only ``_EVAL_GUARD_MAX_FAILURES`` *consecutive*
+        failed calls drop the router. Any success resets the count.
 
         Returns:
             Whether the call succeeded.
         """
-        try:
-            await awaitable
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "%s failed; disabling further validation for this run "
-                "(training continues)",
+        for attempt in range(1, _EVAL_GUARD_ATTEMPTS + 1):
+            try:
+                await make_awaitable()
+                self._eval_guard_failures = 0
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                last = attempt == _EVAL_GUARD_ATTEMPTS
+                logger.warning(
+                    "%s failed (attempt %d/%d)%s",
+                    what,
+                    attempt,
+                    _EVAL_GUARD_ATTEMPTS,
+                    "" if last else "; retrying",
+                    exc_info=True,
+                )
+                if not last:
+                    await asyncio.sleep(_EVAL_GUARD_RETRY_SEC * attempt)
+
+        self._eval_guard_failures += 1
+        if self._eval_guard_failures < _EVAL_GUARD_MAX_FAILURES:
+            # Keep the router: the next step's pull gets another chance, so one bad
+            # window costs a single validation point instead of the whole curve.
+            logger.warning(
+                "%s exhausted retries (%d/%d consecutive failures); "
+                "keeping the evaluator for the next attempt",
                 what,
+                self._eval_guard_failures,
+                _EVAL_GUARD_MAX_FAILURES,
             )
-            self.eval_generator_router = None
-            self._eval_rollout_workers = []
             return False
+        logger.error(
+            "%s failed %d times in a row; disabling further validation for this run "
+            "(training continues)",
+            what,
+            self._eval_guard_failures,
+        )
+        self.eval_generator_router = None
+        self._eval_rollout_workers = []
+        return False
 
     async def _pull_generator_weights(
         self, *, policy_version: int, include_eval: bool = True
@@ -1120,7 +1166,7 @@ class Controller(Configurable):
         await asyncio.gather(
             training_pull,
             self._guard_eval_generators(
-                self.eval_generator_router.pull_model_state_dict(
+                lambda: self.eval_generator_router.pull_model_state_dict(
                     policy_version=policy_version
                 ),
                 what=f"eval generator weight pull at version {policy_version}",
@@ -1855,7 +1901,7 @@ class Controller(Configurable):
             # training generators, which receive this every step, do not.
             if self.eval_generator_router is not None:
                 await self._guard_eval_generators(
-                    self.eval_generator_router.fanout("sync_log_step", step),
+                    lambda: self.eval_generator_router.fanout("sync_log_step", step),
                     what=f"eval generator sync_log_step at step {step}",
                 )
             logger.info(f"[trainer_loop] step {step}: awaiting training batch")

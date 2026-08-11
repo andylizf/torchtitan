@@ -297,6 +297,52 @@ def _is_missing_file_error(error: BaseException) -> bool:
     )
 
 
+_PROXY_ENV_NAMES = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+_proxy_patch_done = False
+
+
+def _keep_proxy_for_context_upload() -> None:
+    """Let a task's build context reach Daytona's object store through the proxy.
+
+    The SDK uploads COPY sources to S3 with an obstore client that it constructs
+    inside ``isolated_env()`` -- a helper that clears ``os.environ`` wholesale, so
+    ``https_proxy`` never reaches it. On a host whose only egress is an HTTP
+    proxy, every context upload then dies with "Generic S3 error: Error performing
+    HEAD https://s3...". Re-inject just the proxy variables. No-op when no proxy is
+    configured (direct egress).
+    """
+    global _proxy_patch_done
+    if _proxy_patch_done:
+        return
+    proxy = {n: _getenv(n) for n in _PROXY_ENV_NAMES if _getenv(n)}
+    if not proxy:
+        _proxy_patch_done = True
+        return
+    try:
+        from daytona._sync import object_storage as sync_store  # type: ignore
+        from daytona._utils import environment as env_mod  # type: ignore
+    except ImportError:
+        return
+    original = env_mod.isolated_env
+
+    def isolated_env(temp_env=None):
+        merged = dict(temp_env or {})
+        merged.update(proxy)
+        return original(merged)
+
+    env_mod.isolated_env = isolated_env
+    # object_storage imported the symbol by value, so rebind it there as well.
+    sync_store.isolated_env = isolated_env
+    try:
+        from daytona._async import object_storage as async_store  # type: ignore
+
+        async_store.isolated_env = isolated_env
+    except ImportError:
+        pass
+    _proxy_patch_done = True
+    logger.info("[daytona] proxy re-injected for build-context upload")
+
+
 def _eager_rebuild_daytona_models() -> None:
     """Make the Daytona SDK's Pydantic models resolvable in OUR import context.
 
@@ -431,6 +477,8 @@ class DaytonaSandbox:
         self,
         image: str,
         *,
+        dockerfile: str | None = None,
+        build_context: dict[str, str] | None = None,
         timeout: int | None = None,
         disk_gb: int | None = None,
         issue_tracker: SandboxIssueTracker | None = None,
@@ -442,7 +490,13 @@ class DaytonaSandbox:
             raise ValueError(
                 f"daytona disk_gb must be a positive integer, got {disk_gb!r}"
             )
+        if not image and not dockerfile:
+            raise ValueError("daytona sandbox needs either an image or a dockerfile")
+        if build_context and not dockerfile:
+            raise ValueError("build_context is only meaningful with a dockerfile")
         self.image = image
+        self.dockerfile = dockerfile
+        self.build_context = build_context
         self.timeout = timeout
         self.disk_gb = disk_gb
         self.allocated_disk_gb: int | None = None
@@ -451,6 +505,7 @@ class DaytonaSandbox:
         # available for static annotations in this module.
         self._client: Any = None
         self._sb: Any = None
+        self._dockerfile_dir: Any = None
         self.sandbox_id = ""
         self._heartbeat_task: Any = None
         self._lost_error: BaseException | None = None
@@ -609,6 +664,39 @@ class DaytonaSandbox:
         """Underlying ``daytona.AsyncSandbox`` (for the fs-relay bridge)."""
         return self._sb
 
+    def _declarative_image(self):
+        """Build a Daytona ``Image`` from this task's Dockerfile text.
+
+        Tasks that ship a Dockerfile instead of a published image (e.g. the
+        Recursive-Task-Synthesis corpus) are built server-side by Daytona, which
+        caches the result -- so only the first sandbox per distinct Dockerfile
+        pays the build. ``Image.from_dockerfile`` wants a path and resolves COPY
+        sources relative to it, so the build context (when the task has one) is
+        materialized next to the Dockerfile first.
+        """
+        import base64
+        import tempfile
+
+        from daytona import Image  # type: ignore
+
+        assert self.dockerfile is not None, "only called on the dockerfile path"
+        _keep_proxy_for_context_upload()
+        # Kept for the sandbox's lifetime: the SDK reads these paths when it
+        # serializes the create request, which happens after this returns.
+        self._dockerfile_dir = tempfile.TemporaryDirectory(prefix="tt-dockerfile-")
+        root = Path(self._dockerfile_dir.name)
+        for rel, b64 in (self.build_context or {}).items():
+            # Relative paths only: a COPY source outside the context dir would
+            # escape the temp tree and pick up an unrelated host file.
+            dest = root / rel
+            if not dest.resolve().is_relative_to(root.resolve()):
+                raise ValueError(f"build_context path escapes the context dir: {rel}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(base64.b64decode(b64))
+        path = root / "Dockerfile"
+        path.write_text(self.dockerfile)
+        return Image.from_dockerfile(path)
+
     async def __aenter__(self) -> DaytonaSandbox:
         import asyncio
         import random
@@ -650,7 +738,7 @@ class DaytonaSandbox:
         if int(_getenv("TT_DAYTONA_RPC_RETRIES", default="2")) < 0:
             raise ValueError("TT_DAYTONA_RPC_RETRIES must be non-negative")
         params = CreateSandboxFromImageParams(
-            image=self.image,
+            image=self._declarative_image() if self.dockerfile else self.image,
             resources=Resources(cpu=cpu, memory=mem, disk=disk),
             labels=HARNESS_LABELS,
             auto_stop_interval=auto_stop,

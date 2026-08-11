@@ -80,6 +80,8 @@ _BOOT_SEM: asyncio.Semaphore | None = None
 async def boot_agent_sandbox(
     image: str,
     *,
+    dockerfile: str | None = None,
+    build_context: dict[str, str] | None = None,
     install_claude: bool = True,
     disk_gb: int | None = None,
     issue_tracker: SandboxIssueTracker | None = None,
@@ -94,6 +96,10 @@ async def boot_agent_sandbox(
     the sandbox. host_loop agents drive the sandbox with bash directly and never
     invoke the CLI, so they pass ``install_claude=False`` -- this skips the curl
     download, which fails on images without curl (e.g. the tmax task images).
+
+    ``dockerfile`` carries a task's Dockerfile text for corpora that ship no
+    published image; the backend builds it instead of pulling ``image``.
+    ``build_context`` carries that Dockerfile's COPY sources as {relpath: base64}.
     """
     global _BOOT_SEM
     if _BOOT_SEM is None:
@@ -103,7 +109,13 @@ async def boot_agent_sandbox(
     sb = None
     last_err: Exception | None = None
     for attempt in range(SWE_BOOT_RETRIES):
-        cand = make_sandbox(image, disk_gb=disk_gb, issue_tracker=tracker)
+        cand = make_sandbox(
+            image,
+            dockerfile=dockerfile,
+            build_context=build_context,
+            disk_gb=disk_gb,
+            issue_tracker=tracker,
+        )
         num_issues_before = tracker.num_events
         try:
             async with _BOOT_SEM:
