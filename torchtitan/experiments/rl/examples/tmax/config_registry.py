@@ -153,6 +153,15 @@ def _tmax_rollouter() -> TMaxRollouter.Config:
         time_budget_sec=int(os.environ.get("SWE_TIME_BUDGET_SEC", "2400")),
         eval_timeout_sec=int(os.environ.get("TMAX_EVAL_TIMEOUT_SEC", "600")),
         max_context_tokens=int(os.environ.get("SWE_MAX_CONTEXT_LEN", "32768")),
+        # SWE_REWARD_DENSE=1 trains on the verifier's per-test pass fraction instead
+        # of its binary reward (see TMaxRollouter.Config.reward_mode). Same env name
+        # as the swe_r2e knob (grading.py) since it is the same concept -- there, the
+        # fraction comes from junit-xml; here, from the verifier's CTRF report. The
+        # default keeps the sparse tmax/RTS contract; validation stays binary either
+        # way so its solve rate remains comparable across runs.
+        reward_mode=(
+            "dense" if os.environ.get("SWE_REWARD_DENSE", "0") == "1" else "sparse"
+        ),
     )
 
 

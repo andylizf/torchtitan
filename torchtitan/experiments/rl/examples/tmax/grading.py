@@ -26,6 +26,7 @@ Two entry points, both driving the same steps:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import posixpath
@@ -45,6 +46,9 @@ _TESTS_DIR = "/tests"
 _TEST_SH = "/tests/test.sh"
 _VERIFIER_DIR = "/logs/verifier"
 _DEFAULT_REWARD_PATH = "/logs/verifier/reward.txt"
+# Second verifier output: the harbor contract runs pytest with `--ctrf`, so the
+# per-test breakdown behind the binary reward lands here. Diagnostics only.
+_DEFAULT_CTRF_PATH = "/logs/verifier/ctrf.json"
 
 # Two fixture classes with OPPOSITE timing (see seed_workspace / grade_tmax):
 #   environment/seeds/<rel> -- agent-facing INPUT files (the task's initial
@@ -99,6 +103,39 @@ def _parse_reward(text: str) -> float:
     except (ValueError, IndexError):
         return 0.0
     return max(0.0, min(1.0, val))
+
+
+def parse_ctrf(text: str) -> dict | None:
+    """Summarize a CTRF report into ``{tests, passed, failed}`` (failed = names).
+
+    The report is dataset-authored and only ~94% of the tmax/RTS corpus writes it,
+    so an absent or malformed one yields None rather than raising. Reward does NOT
+    read this -- it exists to say WHICH checks failed behind a binary reward of 0.
+    """
+    try:
+        results = json.loads(text)["results"]
+        summary = results["summary"]
+        num_tests = int(summary["tests"])
+        num_passed = int(summary["passed"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    failed = [
+        test.get("name", "")
+        for test in results.get("tests", [])
+        if test.get("status") == "failed"
+    ]
+    return {"tests": num_tests, "passed": num_passed, "failed": failed}
+
+
+def ctrf_pass_fraction(report: dict | None) -> float | None:
+    """Fraction of the verifier's tests that passed, or None without a usable report.
+
+    This is the dense counterpart to reward.txt's all-or-nothing 1: a 3-of-4 report
+    yields 0.75. Clamped to [0, 1] because the counts are dataset-authored.
+    """
+    if not report or not report["tests"]:
+        return None
+    return max(0.0, min(1.0, report["passed"] / report["tests"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -176,6 +213,17 @@ async def grade_tmax(
     reward = _parse_reward(reward_txt)
     logger.info("[tmax] graded reward=%.2f (reward_path=%s)", reward, reward_path)
     return reward
+
+
+async def read_ctrf_report(
+    sb: Sandbox, *, path: str = _DEFAULT_CTRF_PATH
+) -> dict | None:
+    """Read the verifier's CTRF report from ``sb`` after ``grade_tmax`` ran.
+
+    Diagnostics only; the reward stays whatever reward.txt said. Costs one sandbox
+    file read (an exec round trip on Daytona), so callers gate this behind a knob.
+    """
+    return parse_ctrf(await sb.read_file(path, user="root"))
 
 
 # --------------------------------------------------------------------------- #

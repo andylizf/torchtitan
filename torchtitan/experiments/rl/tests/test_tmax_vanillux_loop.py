@@ -338,6 +338,8 @@ def test_sandbox_issue_metrics_count_events_and_affected_rollouts() -> None:
 def test_infra_failed_sibling_is_scored_as_zero_reward() -> None:
     rollouter = object.__new__(TMaxRollouter)
     rollouter._ensure_adapter = AsyncMock(return_value=object())
+    rollouter._read_ctrf = False
+    rollouter._reward_mode = "sparse"
 
     async def run_sibling(**kwargs):
         rollout_idx = kwargs["rollout_idx"]

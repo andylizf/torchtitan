@@ -37,6 +37,15 @@ Knobs read from env (the launcher sets these; see ``submit_swe_tmax_9b.sh``):
   ``SWE_MAX_CONTEXT_LEN``             model context budget for the adapter session
   ``SWE_ROLLOUT_CONCURRENCY``         concurrently-active rollouts (default 16)
   ``TMAX_CALL_LIMIT`` / ``TMAX_TURN_MAX_TOKENS``  Vanillux step + per-turn caps
+  ``TMAX_CTRF_DIAGNOSTICS``           read the verifier's per-test CTRF report for
+                                      metrics ONLY (default off; costs one extra
+                                      sandbox read per graded rollout and never
+                                      moves reward)
+  ``SWE_REWARD_DENSE``                NOT read here: config_registry maps =1 to
+                                      ``Config.reward_mode="dense"``, which reads
+                                      that same report AS the reward. It travels as
+                                      a config field so a run records what its
+                                      reward meant.
 """
 
 from __future__ import annotations
@@ -57,7 +66,12 @@ from renderers import Renderer
 from torchtitan.experiments.rl.environment import TokenEnv
 from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset, TMaxSample
 from torchtitan.experiments.rl.examples.tmax.env import TMaxEnv
-from torchtitan.experiments.rl.examples.tmax.grading import grade_tmax, seed_workspace
+from torchtitan.experiments.rl.examples.tmax.grading import (
+    ctrf_pass_fraction,
+    grade_tmax,
+    read_ctrf_report,
+    seed_workspace,
+)
 from torchtitan.experiments.rl.examples.tmax.rubric import RewardTMax, TMAX_REWARD_KEY
 from torchtitan.experiments.rl.examples.tmax.vanillux_loop import (  # noqa: F401 -- registers the default agent
     vanillux_agent,
@@ -98,6 +112,21 @@ _FINISH_REASONS = (
     "hit_time_budget",
     "stopped_early",
     "error",
+)
+
+# See TMaxRollouter.Config.reward_mode.
+_REWARD_MODES = frozenset({"sparse", "dense"})
+
+# Canonical RTS check names (``test_check_01_required_evidence`` and its shorter
+# variants), matched as substrings of the CTRF test names. They separate "wrong
+# answer" (final_semantics) from "right answer via a shortcut" (no_shortcut), which
+# the binary reward cannot. Corpora that do not use this template (e.g. TB-2.0)
+# simply match nothing and the per-check metrics drop out.
+_CTRF_CHECK_KEYS = (
+    "required_evidence",
+    "intermediate_artifact",
+    "final_semantics",
+    "no_shortcut",
 )
 
 _DISK_ISSUE_KINDS = {
@@ -222,6 +251,44 @@ def _finish_reason_metrics(finish_reasons: list[str]) -> list[m.Metric]:
         )
         for reason in _FINISH_REASONS
     ]
+
+
+def _ctrf_metrics(reports: list[dict | None]) -> list[m.Metric]:
+    """Summarize the verifier's per-test CTRF reports for one sibling group.
+
+    The reward is binary (all tests pass), so these say WHY a zero happened: the
+    test-level pass fraction plus which canonical check failed. Fractions are over
+    the siblings that produced a report; with none, the empty means are NaN and the
+    metrics aggregator drops them.
+    """
+    assert reports, "a TMax rollout group must contain at least one sibling"
+    present = [report for report in reports if report]
+    metrics = [
+        m.Metric("rollout/ctrf_report_frac", m.Mean(len(present) / len(reports))),
+        m.Metric(
+            "rollout/ctrf_test_pass_frac",
+            m.Mean.from_list(
+                [
+                    fraction
+                    for fraction in (ctrf_pass_fraction(report) for report in present)
+                    if fraction is not None
+                ]
+            ),
+        ),
+    ]
+    metrics += [
+        m.Metric(
+            f"rollout/ctrf_check_{key}_fail_frac",
+            m.Mean.from_list(
+                [
+                    float(any(key in name for name in report["failed"]))
+                    for report in present
+                ]
+            ),
+        )
+        for key in _CTRF_CHECK_KEYS
+    ]
+    return metrics
 
 
 class _RootSandbox:
@@ -366,10 +433,32 @@ class TMaxRollouter(Rollouter):
         eval_timeout_sec: int = 600
         """Verifier (test.sh) run timeout."""
 
+        reward_mode: str = "sparse"
+        """Where a submitted rollout's reward comes from.
+
+        ``sparse`` is the tmax/RTS verifier contract: the binary reward.txt, which is
+        1 only when EVERY test passed. ``dense`` uses the same verifier run's CTRF
+        per-test pass fraction instead, so a 3-of-4 rollout scores 0.75; tasks whose
+        verifier writes no CTRF report keep their sparse value (counted in
+        ``rollout/dense_fallback_frac``). Either way an unsubmitted rollout scores 0.
+
+        Dense is not a free relabel. RTS partial credit is reachable without solving
+        the task (``check_01`` only asserts an artifact exists), and it makes far
+        fewer groups zero-std, so ``drop_zero_std_reward_groups`` keeps a different
+        (larger) set of prompts -- a training-dynamics change, not just a rescale.
+        """
+
         max_context_tokens: int = 32768
         """Model context budget for the adapter session."""
 
     def __init__(self, config: Config) -> None:
+        # Before super(), which builds the datasets: a typo in a knob that changes
+        # what reward means should fail on the spot, not behind a data error.
+        if config.reward_mode not in _REWARD_MODES:
+            raise ValueError(
+                f"reward_mode must be one of {sorted(_REWARD_MODES)}, got "
+                f"{config.reward_mode!r}"
+            )
         super().__init__(config)
         # Which agent scaffold drives the rollout. Defaults to the vanillux loop the
         # tmax models are SFT'd under; TMAX_AGENT=terminus swaps in Terminus-2 (a
@@ -382,6 +471,14 @@ class TMaxRollouter(Rollouter):
         self._time_budget_sec = config.time_budget_sec
         self._eval_timeout_sec = config.eval_timeout_sec
         self._max_context_tokens = config.max_context_tokens
+        self._reward_mode = config.reward_mode
+        # The CTRF read is one extra sandbox exec per graded rollout, and the Daytona
+        # API rate limit is the throughput ceiling at high rollout concurrency -- so
+        # it is opt-in for metrics, and mandatory when it feeds the reward.
+        self._read_ctrf = (
+            self._reward_mode == "dense"
+            or os.environ.get("TMAX_CTRF_DIAGNOSTICS", "0") == "1"
+        )
         # Whole-rollout wall-clock guard: agent budget + eval + boot buffer.
         self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300
         # Per-worker rollout-issue gate (one rollouter per worker proc). Each sibling
@@ -482,6 +579,31 @@ class TMaxRollouter(Rollouter):
             *finish_metrics,
             *sandbox_metrics,
         ]
+        if self._read_ctrf:
+            group_metrics += _ctrf_metrics(
+                [rollout.diagnostics.get("ctrf") for rollout in rollouts]
+            )
+        if self._reward_mode == "dense":
+            # Keep the binary reward visible while dense drives training, so the two
+            # curves are comparable within one run, and surface how often the CTRF
+            # report was missing (those rollouts silently keep the sparse value).
+            group_metrics += [
+                m.Metric(
+                    "rollout/sparse_reward_mean",
+                    m.Mean.from_list(
+                        [rollout.diagnostics["sparse_reward"] for rollout in rollouts]
+                    ),
+                ),
+                m.Metric(
+                    "rollout/dense_fallback_frac",
+                    m.Mean.from_list(
+                        [
+                            float(rollout.diagnostics["dense_fallback"])
+                            for rollout in rollouts
+                        ]
+                    ),
+                ),
+            ]
 
         # Match Open-Instruct: after sandbox/reset retries are exhausted, keep the
         # failed sibling in the group with reward zero. It participates in centered
@@ -584,6 +706,13 @@ class TMaxRollouter(Rollouter):
         # returned (it sets its own reason on the normal path).
         finish_reason = "error"
         infra_failed = False
+        # Per-test verifier breakdown; stays None unless the rollout was graded with
+        # the CTRF read enabled and the task wrote a parsable report.
+        ctrf: dict | None = None
+        # reward.txt's value, kept alongside a dense reward so both curves are
+        # comparable on one run, and whether dense had to fall back to it.
+        sparse_reward = 0.0
+        dense_fallback = False
         issue_tracker = SandboxIssueTracker(
             SandboxLogContext(
                 instance_id=sample.instance_id,
@@ -651,6 +780,31 @@ class TMaxRollouter(Rollouter):
                             workdir=sample.workdir,
                             timeout_sec=self._eval_timeout_sec,
                         )
+                        sparse_reward = reward
+                        # Read the verifier's second output (the per-test CTRF
+                        # report) while the sandbox is still up. Swallow its
+                        # failures: `sandbox.exec` raises when the sandbox is gone
+                        # or the API errors, and the enclosing handler would
+                        # otherwise turn that into reward=0 + infra_failed for an
+                        # already-graded rollout. In dense mode a failed read is a
+                        # fallback to the sparse reward, never a lost rollout.
+                        if self._read_ctrf:
+                            try:
+                                ctrf = await read_ctrf_report(sandbox)
+                            except Exception as e:
+                                logger.warning(
+                                    f"[tmax] {rollout_id}: ctrf read failed "
+                                    f"({type(e).__name__}: {e})"
+                                )
+                        # Training only. Validation groups carry negative ids (see
+                        # Controller) and MUST stay on the binary verdict: TB-2.0
+                        # avg@k / pass@k are defined on all-tests-pass, so a dense
+                        # validation reward would silently stop being a solve rate
+                        # and stop being comparable to the published numbers.
+                        if self._reward_mode == "dense" and group_id >= 0:
+                            dense = ctrf_pass_fraction(ctrf)
+                            dense_fallback = dense is None
+                            reward = sparse_reward if dense is None else dense
                     else:
                         reward = 0.0
                 status = RolloutStatus.COMPLETED
@@ -791,6 +945,9 @@ class TMaxRollouter(Rollouter):
                     "format_errors": fmt_errors,
                     "submitted": submitted,
                     "infra_failed": diagnostics.infra_failed,
+                    "ctrf": ctrf,
+                    "sparse_reward": sparse_reward,
+                    "dense_fallback": dense_fallback,
                 },
             ),
             submitted,
