@@ -124,6 +124,13 @@ def _is_transient_rpc_error(error: BaseException) -> bool:
             "timed out",
             "timeout",
             "too many requests",
+            # The provider reports its own 5xx as prose, not a status code, so the
+            # numeric checks above miss it. Seen on session create under a wide
+            # rollout fanout ("internal server error: failed to create session
+            # config directory"), where retrying with a fresh id does succeed.
+            "internal server error",
+            "service unavailable",
+            "bad gateway",
             "status code 429",
             "status code 500",
             "status code 502",

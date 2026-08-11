@@ -155,3 +155,49 @@ def test_host_loop_passes_the_adapter_url_not_the_object(monkeypatch):
 
     assert seen["adapter_url"] == "http://127.0.0.1:9999/"
     assert seen["problem_statement"] == "do the thing"
+
+
+def _terminus_env(sandbox):
+    from torchtitan.experiments.rl.harness.agents.terminus import _SandboxEnvironment
+
+    return _SandboxEnvironment(sandbox, agent_dir=__import__("pathlib").Path("/tmp"))
+
+
+def test_terminus_env_reports_the_failing_command(caplog):
+    """harbor turns a tmux failure into "Error: <stderr>", which is empty when the
+    provider returns non-zero with no stderr -- so the shim has to log the command."""
+    import logging
+
+    from torchtitan.experiments.rl.harness.agents import terminus
+
+    sandbox = MagicMock()
+
+    async def failing_exec(cmd, **_kwargs):
+        return 1, "", ""
+
+    sandbox.exec = failing_exec
+    env = _terminus_env(sandbox)
+    with caplog.at_level(logging.WARNING, logger=terminus.logger.name):
+        result = asyncio.run(env.exec("tmux new-session -d -s x"))
+
+    assert result.return_code == 1
+    assert "tmux new-session" in caplog.text
+    assert "exit=1" in caplog.text
+
+
+def test_terminus_env_prefixes_cwd_and_defaults_user():
+    seen = {}
+
+    async def rec(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen.update(kwargs)
+        return 0, "out", ""
+
+    sandbox = MagicMock()
+    sandbox.exec = rec
+    env = _terminus_env(sandbox)
+    asyncio.run(env.exec("ls", cwd="/app/sub dir"))
+
+    # Our Sandbox.exec has no cwd parameter, so it has to be folded into the command.
+    assert seen["cmd"] == "cd '/app/sub dir' && ls"
+    assert seen["user"] == "root"

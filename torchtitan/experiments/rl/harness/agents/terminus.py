@@ -60,9 +60,6 @@ _DEFAULT_MAX_TURNS = int(os.environ.get("TMAX_TERMINUS_MAX_TURNS", "64"))
 _MAX_CONTEXT = int(os.environ.get("SWE_MAX_CONTEXT_LEN", "63488"))
 # Per-turn generation cap; the adapter clamps it to the remaining context budget.
 _TURN_MAX_TOKENS = int(os.environ.get("TMAX_TURN_MAX_TOKENS", "16384"))
-# Where Terminus-2 pipes the tmux pane inside the sandbox; mirrors harbor's
-# EnvironmentPaths.agent_dir, which its own runner would have created.
-_IN_SANDBOX_AGENT_DIR = "/logs/agent"
 
 
 class _AdapterExhausted(RuntimeError):
@@ -150,6 +147,18 @@ class _SandboxEnvironment:
             check=False,
             **({"timeout": timeout_sec} if timeout_sec else {}),
         )
+        if exit_code != 0:
+            # Terminus-2 surfaces a tmux failure as "Failed to start tmux session.
+            # Error: <stderr>", which says nothing when the provider returns
+            # non-zero with an empty stderr. Log what actually ran so the failure
+            # can be attributed instead of guessed at.
+            logger.warning(
+                "[terminus] exec exit=%d cmd=%r stdout=%r stderr=%r",
+                exit_code,
+                command[:400],
+                (stdout or "")[-400:],
+                (stderr or "")[-400:],
+            )
         return ExecResult(stdout=stdout, stderr=stderr, return_code=exit_code)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -208,18 +217,9 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
                 max_context=_MAX_CONTEXT,
                 turn_max_tokens=_TURN_MAX_TOKENS,
             )
-            # Terminus-2 pipes the tmux pane to a fixed IN-SANDBOX path
-            # (EnvironmentPaths.agent_dir), which harbor's own runner creates as
-            # part of trial setup. Without it the whole "new-session ... pipe-pane"
-            # command fails, and with an empty stderr, so it surfaces only as
-            # "Failed to start tmux session. Error: ".
-            await task.sandbox.exec(
-                f"mkdir -p {shlex.quote(_IN_SANDBOX_AGENT_DIR)}",
-                user="root",
-                check=False,
-                timeout=60,
-            )
             context = AgentContext()
+            # tmux bring-up rides on DaytonaSandbox's own session-create retry;
+            # no retry loop here.
             await agent.setup(env)
             await agent.run(task.instruction, env, context)
             turns = int(getattr(agent, "_n_episodes", 0) or 0)
