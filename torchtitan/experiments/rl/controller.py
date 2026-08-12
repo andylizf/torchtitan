@@ -250,6 +250,15 @@ _EVAL_GUARD_ATTEMPTS = 3
 _EVAL_GUARD_RETRY_SEC = 5.0
 _EVAL_GUARD_MAX_FAILURES = 3
 
+# Every actor call the trainer loop blocks on needs a deadline, because the failure
+# that matters is not an exception -- it is silence. Observed: an eval generator's
+# gloo pair dropped, which killed its engine loop AND failed its weight pull in 6 ms;
+# the retry above then addressed a dead actor and never returned. The controller sat
+# in that await for 8.7 hours holding 15 hosts, with MAST still reporting RUNNING
+# because the process was alive and heartbeating. A weight pull takes 25-62 s here,
+# so this is ~10x the worst observed and only fires on a hang.
+_WEIGHT_PULL_TIMEOUT_SEC = float(os.environ.get("SWE_WEIGHT_PULL_TIMEOUT_SEC", "600"))
+
 
 def _will_validate_after_step(
     *, validation: ValidationConfig, step: int, num_training_steps: int
@@ -1104,7 +1113,11 @@ class Controller(Configurable):
         """
         for attempt in range(1, _EVAL_GUARD_ATTEMPTS + 1):
             try:
-                await make_awaitable()
+                # A dead eval actor does not raise, it stops answering. Without this
+                # deadline the retry below hangs the whole trainer loop (see
+                # _WEIGHT_PULL_TIMEOUT_SEC); with it, a hang is just another failed
+                # attempt and the evaluator is dropped on schedule.
+                await asyncio.wait_for(make_awaitable(), _WEIGHT_PULL_TIMEOUT_SEC)
                 self._eval_guard_failures = 0
                 return True
             except asyncio.CancelledError:
@@ -1156,8 +1169,14 @@ class Controller(Configurable):
         to a training generator's; once a pass starts, ``include_eval`` goes False so
         it keeps scoring one frozen version while training moves on.
         """
-        training_pull = self.generator_router.pull_model_state_dict(
-            policy_version=policy_version
+        # Unlike the eval pull, a training generator that misses the new weights is
+        # not an observability problem: it would keep sampling from a stale policy
+        # while the trainer treats the rollouts as on-policy. Deadline it and raise,
+        # so the run dies visibly (and MAST reschedules) instead of hanging or
+        # quietly going off-policy.
+        training_pull = asyncio.wait_for(
+            self.generator_router.pull_model_state_dict(policy_version=policy_version),
+            _WEIGHT_PULL_TIMEOUT_SEC,
         )
         if not (include_eval and self.eval_generator_router is not None):
             await training_pull

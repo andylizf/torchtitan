@@ -4,13 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""``_guard_eval_generators``: a transient eval-generator RPC failure must not
-disable validation for the rest of the run.
+"""``_guard_eval_generators``: an eval-generator failure must not disable
+validation for the rest of the run -- and must not hang it either.
 
 An eval generator idle between passes answers its next call with a gloo
 "connection closed by peer" and is fine on the retry. The guard used to drop the
 router on the first exception, which cost a whole TB-2.0 eval curve: a single
 blip at step 20 left only the step-0 point for the rest of a 100-step run.
+
+The retry that fixed it then caused the opposite failure. A dropped gloo pair
+killed an eval generator's engine loop AND failed its weight pull in 6 ms; the
+retry 5 s later addressed a dead actor, which does not raise -- it stops
+answering. With no deadline the controller sat in that await for 8.7 hours
+holding 15 hosts, while MAST still reported RUNNING because the process was alive.
+So the retry is only safe with a timeout, and a hang has to count as a failure.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ import asyncio
 
 import pytest
 
+from torchtitan.experiments.rl import controller as controller_mod
 from torchtitan.experiments.rl.controller import (
     _EVAL_GUARD_ATTEMPTS,
     _EVAL_GUARD_MAX_FAILURES,
@@ -112,6 +120,57 @@ def test_success_resets_the_failure_streak():
     for _ in range(_EVAL_GUARD_MAX_FAILURES - 1):
         asyncio.run(g.guard(failing, what="pull"))
     assert not g.disabled
+
+
+@pytest.fixture
+def _short_timeout(monkeypatch):
+    """Make the weight-pull deadline fire fast enough to test."""
+    monkeypatch.setattr(controller_mod, "_WEIGHT_PULL_TIMEOUT_SEC", 0.05)
+
+
+def _hanging():
+    """A call factory whose RPC never answers -- a dead actor, not a raising one."""
+    state = {"calls": 0}
+
+    async def make():
+        state["calls"] += 1
+        await asyncio.Event().wait()
+
+    return make, state
+
+
+def test_a_hanging_call_is_a_failed_attempt_not_a_hang(_short_timeout):
+    """The regression: this used to block the trainer loop forever."""
+    g = _Guard()
+    make, state = _hanging()
+
+    async def run():
+        return await asyncio.wait_for(g.guard(make, what="pull"), timeout=10)
+
+    assert asyncio.run(run()) is False
+    assert state["calls"] == _EVAL_GUARD_ATTEMPTS, "a hang must still be retried"
+    assert not g.disabled, "one bad window costs a validation point, not the curve"
+    assert g._eval_guard_failures == 1
+
+
+def test_a_hang_then_a_recovery_still_counts_as_success(_short_timeout):
+    """The real sequence: the pull raises, and the retry finds a dead actor."""
+    g = _Guard()
+    state = {"calls": 0}
+
+    async def make():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise RuntimeError("gloo: Connection closed by peer")
+        if state["calls"] == 2:
+            await asyncio.Event().wait()  # the actor is gone
+
+    async def run():
+        return await asyncio.wait_for(g.guard(make, what="pull"), timeout=10)
+
+    assert asyncio.run(run()) is True, "the third attempt succeeds"
+    assert state["calls"] == 3
+    assert g._eval_guard_failures == 0
 
 
 def test_cancellation_propagates_and_never_disables():
