@@ -49,11 +49,13 @@ class _FakeTerminus2:
         pending_completion: bool,
         raises=None,
         parse_results=(),
+        subagent_calls=0,
         **kwargs,
     ):
         self._episodes = episodes
         self._pending_completion = pending_completion
         self._raises = raises
+        self._subagent_calls = subagent_calls
         self._n_episodes = 0
         self._llm = None
         # The real Terminus2 builds one in __init__; terminus.py wraps it to count
@@ -63,6 +65,11 @@ class _FakeTerminus2:
         # Record what terminus.py asked for, so a test can assert on the config it
         # passes upstream (summarization in particular).
         self.init_kwargs = kwargs
+
+    async def _run_subagent(self, **_kwargs):
+        """Terminus-2 routes its summarization subagents through here, and through
+        the same self._llm, which is why terminus.py wraps it to count them."""
+        return MagicMock(), MagicMock()
 
     async def setup(self, _env) -> None:
         return None
@@ -75,6 +82,8 @@ class _FakeTerminus2:
         # sees the same call pattern.
         for _ in range(len(self._parse_results)):
             self._parser.parse_response("<response/>")
+        for _ in range(self._subagent_calls):
+            await self._run_subagent()
         if self._raises is not None:
             raise self._raises
 
@@ -299,6 +308,40 @@ def test_format_errors_survive_a_crash(monkeypatch):
     assert (run.finish_reason, run.format_errors) == ("error", 2)
 
 
+def test_captured_subagent_calls_are_reported(monkeypatch, caplog):
+    """A counter nothing reads is the same defect as format_errors was. With
+    summarization on, those calls are prose in the training data and a run has to be
+    able to see how many it took."""
+    import logging
+
+    import torchtitan.experiments.rl.harness.agents.terminus as terminus
+
+    monkeypatch.setattr(terminus, "_SUMMARIZE", True)
+    built: list = []
+    with caplog.at_level(logging.WARNING, logger=terminus.logger.name):
+        _run(
+            monkeypatch,
+            max_turns=150,
+            episodes=1,
+            pending_completion=False,
+            built=built,
+            subagent_calls=3,
+        )
+
+    assert "3 summarization subagent call(s)" in caplog.text
+
+
+def test_no_subagent_calls_stays_quiet(monkeypatch, caplog):
+    import logging
+
+    import torchtitan.experiments.rl.harness.agents.terminus as terminus
+
+    with caplog.at_level(logging.WARNING, logger=terminus.logger.name):
+        _run(monkeypatch, max_turns=150, episodes=1, pending_completion=False)
+
+    assert "subagent call" not in caplog.text
+
+
 def test_the_counting_parser_delegates_everything_else():
     """Terminus-2 feature-detects salvage_truncated_response on the parser, so the
     wrapper has to be transparent."""
@@ -478,6 +521,25 @@ def test_a_clamped_turn_is_the_context_wall_not_a_truncation():
         }
     )
     with pytest.raises(ContextLengthExceededError):
+        asyncio.run(llm.call(prompt="go"))
+
+
+def test_with_no_context_budget_a_stop_is_the_per_turn_cap():
+    """The adapter only clamps when a context budget is configured, so with none
+    there is no wall to hit and "max_tokens" can only be the generation cap. Sending
+    it down the context branch would end every truncated rollout instead."""
+    from harbor.llms.base import OutputLengthExceededError
+
+    llm = _adapter_llm(
+        {
+            "content": [{"type": "text", "text": "<response><commands>"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 999999, "output_tokens": 4096},
+        }
+    )
+    llm._max_context = 0
+
+    with pytest.raises(OutputLengthExceededError):
         asyncio.run(llm.call(prompt="go"))
 
 

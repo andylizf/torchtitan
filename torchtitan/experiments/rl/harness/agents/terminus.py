@@ -187,14 +187,14 @@ class _AdapterLLM:
         # hundred tokens of headroom stops at "max_tokens" after a few hundred tokens
         # and looks exactly like a capped generation. Compare the whole turn against
         # the context budget instead -- on the wall, prompt + completion is the
-        # budget.
+        # budget. With no context budget configured the adapter does not clamp at
+        # all, so there is no wall to hit and a stop can only be the per-turn cap.
         if reply.get("stop_reason") in ("max_tokens", "length"):
             usage = reply.get("usage") or {}
             in_tok = int(usage.get("input_tokens") or 0)
             out_tok = int(usage.get("output_tokens") or 0)
-            at_context_wall = (
+            at_context_wall = self._max_context > 0 and (
                 out_tok == 0
-                or self._max_context <= 0
                 or in_tok + out_tok >= self._max_context - _CONTEXT_TAIL_MARGIN
             )
             if not at_context_wall:
@@ -351,6 +351,7 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
     finish_reason = "unknown"
     agent = None
     parser: _CountingParser | None = None
+    llm: _AdapterLLM | None = None
     # Same contract the vanillux loop honors: stop at a turn boundary once the
     # rollout's wall clock is spent. Without it Terminus-2 runs until the
     # rollouter's outer guard kills it, which lands as an infra failure and a
@@ -438,6 +439,16 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
         finally:
             if parser is not None:
                 format_errors = parser.format_errors
+            if llm is not None and llm.subagent_calls:
+                # Summarization is off by default, so this is 0 on the normal path.
+                # Nonzero means that many of the captured turns are a subagent being
+                # asked for prose (a summary, a list of questions) rather than the
+                # agent acting, and they are trained on all the same.
+                logger.warning(
+                    f"[terminus] session={task.session_id}: "
+                    f"{llm.subagent_calls} summarization subagent call(s) captured "
+                    f"into the trajectory"
+                )
 
     return AgentRun(
         turns=turns,
