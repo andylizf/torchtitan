@@ -150,16 +150,46 @@ def test_report_layout_and_index(tmp_path):
         assert (step_dir / row["path"]).exists()
 
 
-def test_transcript_rebuilds_the_interleaved_conversation(tmp_path):
+def test_transcript_is_sectioned_per_turn_without_repeating_the_prefix(tmp_path):
+    """One section per turn, each showing only what that turn added.
+
+    The fixture's turn 2 prompt is turn 1's prompt+completion plus the env output, so
+    a reader must see the env delta alone under turn 2 -- not the shared prefix again.
+    Emitting the whole session as one undivided block is what made a real 138 KB
+    trace unreadable.
+    """
     _, summary = _record(tmp_path, [_group(-1, [1.0])], ["task-a"])
     trace = (tmp_path / "validation_traces" / "step-20" / "traces" / "task-a").glob(
         "*.md"
     )
     text = next(trace).read_text()
-    # Turn 1 prompt + completion, then only turn 2's delta (the env output), then
-    # turn 2's completion -- the shared prefix must not be repeated.
-    assert "<sys> task <think> ls <out> done" in text
     assert "| State | PASS |" in text
+    assert "### Turn 1" in text and "### Turn 2" in text
+    assert "**Task**" in text and "<sys> task" in text
+    assert "**Assistant**" in text and "<think> ls" in text
+    turn2 = text.split("### Turn 2", 1)[1]
+    assert "**Environment**" in turn2 and "<out>" in turn2 and "done" in turn2
+    assert "<sys>" not in turn2, "turn 2 must not repeat the shared prefix"
+    assert "History rewritten" not in text
+
+
+def test_transcript_keeps_both_sides_of_a_history_rewrite(tmp_path):
+    """A rewritten history gets flagged, not silently dropped.
+
+    Concatenating only the final prefix loses every turn before the rewrite, which is
+    how a summarized Terminus-2 session produced a trace that appeared to begin
+    mid-task with no indication why.
+    """
+    rollout = _rollout(group_id=-1, rollout_id=0, reward=1.0)
+    # Turn 2's prompt no longer extends turn 1's: the history was rewritten.
+    rollout.turns[1].prompt_token_ids = [5, 6]
+    _record(tmp_path, [RolloutGroup(group_id=-1, rollouts=[rollout])], ["task-a"])
+    text = next(
+        (tmp_path / "validation_traces" / "step-20" / "traces" / "task-a").glob("*.md")
+    ).read_text()
+    assert "History rewritten before this turn" in text
+    assert "<sys> task" in text, "the pre-rewrite turns must survive"
+    assert "<out> done" in text, "the post-rewrite prompt must be shown in full"
 
 
 def test_task_without_reward_counts_as_fail(tmp_path):

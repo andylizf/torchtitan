@@ -189,6 +189,11 @@ class _TrialPaths:
     agent_dir: Path
 
 
+def _episodes(agent: Any) -> int:
+    """Episodes Terminus-2 entered, 0 before its loop starts or if it never ran."""
+    return int(getattr(agent, "_n_episodes", 0) or 0)
+
+
 async def terminus_agent(task: AgentTask) -> AgentRun:
     """Drive Terminus-2 against the task's sandbox and the adapter's policy."""
     from harbor.agents.terminus_2 import Terminus2  # type: ignore
@@ -197,6 +202,7 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
     submitted = False
     turns = 0
     finish_reason = "unknown"
+    agent = None
     with tempfile.TemporaryDirectory(prefix="tt-terminus-") as logs_dir:
         env = _SandboxEnvironment(task.sandbox, agent_dir=Path(logs_dir))
         try:
@@ -222,12 +228,21 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
             # no retry loop here.
             await agent.setup(env)
             await agent.run(task.instruction, env, context)
-            turns = int(getattr(agent, "_n_episodes", 0) or 0)
-            # Terminus-2 returns early only once <task_complete>true</task_complete>
-            # has been confirmed on a second consecutive turn; otherwise it runs the
-            # loop out. So "ended before the cap" IS the submit signal.
-            submitted = 0 < turns < max_episodes
-            finish_reason = "submit" if submitted else "hit_max_turns"
+            turns = _episodes(agent)
+            # Terminus-2's loop has THREE exits, and only one of them is a submit:
+            # it runs the episodes out; it returns early on a confirmed
+            # <task_complete>true</task_complete> (the second consecutive one, at
+            # which point ``_pending_completion`` is still set); or it returns early
+            # because ``is_session_alive()`` went false, i.e. the tmux session died
+            # under it. Reading "ended before the cap" as the submit signal folds that
+            # third case into "submit" and scores a dead session as a real attempt.
+            if turns >= max_episodes:
+                finish_reason = "hit_max_turns"
+            elif getattr(agent, "_pending_completion", False):
+                finish_reason = "submit"
+            else:
+                finish_reason = "stopped_early"
+            submitted = finish_reason == "submit"
         except Exception as e:
             logger.warning(
                 "[terminus] session=%s failed: %s: %s",
@@ -235,6 +250,9 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
                 type(e).__name__,
                 str(e)[:200],
             )
+            # Keep the episodes the agent did get through; the turns it captured are
+            # still trained on, so reporting 0 here misattributes them.
+            turns = _episodes(agent)
             finish_reason = "error"
 
     return AgentRun(turns=turns, submitted=submitted, finish_reason=finish_reason)

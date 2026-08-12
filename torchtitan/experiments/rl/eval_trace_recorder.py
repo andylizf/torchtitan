@@ -195,41 +195,67 @@ class ValidationTraceRecorder(Configurable):
                 "",
                 "## Conversation",
                 "",
-                "```text",
             ]
         )
         body = self._decode_transcript(rollout.turns, decode)
         path = step_dir / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{header}\n{body}\n```\n")
+        path.write_text(f"{header}\n{body}\n")
         return row
 
     def _decode_transcript(self, turns: list[RolloutTurn], decode) -> str:
-        """Rebuild the full interleaved conversation from the per-turn token ids.
+        """Render the conversation turn by turn from the per-turn token ids.
 
         Token-in/token-out invariant: turn N+1's prompt extends turn N's
-        prompt+completion with the new environment output, so appending each
-        completion and then the next prompt's delta recovers the whole
-        conversation. A turn whose prompt does not extend the running prefix (a
-        history rewrite, e.g. compaction) restarts from that turn's own prompt.
+        prompt+completion with the new environment output. So each turn contributes
+        two readable pieces -- the delta its prompt added (the task on turn 1, the
+        environment's reply after that) and the model's completion -- and decoding
+        them separately gives one section per turn instead of a single undivided
+        blob of the whole session.
+
+        A turn whose prompt does NOT extend the running prefix is a history rewrite
+        (Terminus-2 summarizing a long session, say). Concatenating only the final
+        prefix would silently drop everything before the rewrite and leave a
+        transcript that appears to begin mid-task, so the break gets its own marker
+        and the turns on both sides are kept. Those segments are also what training
+        sees as separate samples.
         """
         if not turns:
             return "(no turns)"
-        token_ids: list[int] = list(turns[0].prompt_token_ids)
-        for index, turn in enumerate(turns):
-            token_ids += list(turn.completion_token_ids)
-            if index + 1 == len(turns):
-                break
-            next_prompt = list(turns[index + 1].prompt_token_ids)
-            if next_prompt[: len(token_ids)] == token_ids:
-                token_ids += next_prompt[len(token_ids) :]
-            else:
-                token_ids = next_prompt
-        text = decode(token_ids)
-        if len(text) > self._max_chars:
-            omitted = len(text) - self._max_chars
-            text = f"{text[: self._max_chars]}\n... [{omitted} characters omitted]"
-        return text
+        # Per-turn (prompt delta, completion, rewrite?) before any truncation.
+        pieces: list[tuple[list[int], list[int], bool]] = []
+        prefix: list[int] = []
+        for turn in turns:
+            prompt = list(turn.prompt_token_ids)
+            extends = prompt[: len(prefix)] == prefix
+            delta = prompt[len(prefix) :] if extends else prompt
+            completion = list(turn.completion_token_ids)
+            pieces.append((delta, completion, not extends and bool(prefix)))
+            prefix = prompt + completion
+
+        # Spread the budget over turns so a long early turn cannot hide the ending.
+        budget = max(self._max_chars // len(pieces), 1)
+
+        def block(label: str, token_ids: list[int]) -> str:
+            if not token_ids:
+                return ""
+            text = decode(token_ids)
+            if len(text) > budget:
+                text = f"{text[:budget]}\n... [{len(text) - budget} characters omitted]"
+            return f"**{label}**\n\n```text\n{text}\n```\n\n"
+
+        parts: list[str] = []
+        for index, (delta, completion, rewritten) in enumerate(pieces):
+            if rewritten:
+                parts.append(
+                    f"> **History rewritten before this turn.** Everything above is "
+                    f"no longer in the model's context; turn {index + 1} starts from "
+                    f"the prompt below (a fresh training sample too).\n\n"
+                )
+            parts.append(f"### Turn {index + 1}\n\n")
+            parts.append(block("Task" if index == 0 else "Environment", delta))
+            parts.append(block("Assistant", completion))
+        return "".join(parts).rstrip("\n")
 
     @staticmethod
     def _summarize(
