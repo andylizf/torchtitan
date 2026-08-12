@@ -300,6 +300,9 @@ def test_finish_reason_metrics_are_exhaustive_fractions() -> None:
         "rollout/finish_submit_frac": 0.4,
         "rollout/finish_hit_max_turns_frac": 0.0,
         "rollout/finish_hit_time_budget_frac": 0.2,
+        # Terminus-2 only; the vanillux loop trims its own history and never
+        # reports it, so the fraction is present and zero rather than absent.
+        "rollout/finish_hit_context_limit_frac": 0.0,
         "rollout/finish_stopped_early_frac": 0.2,
         "rollout/finish_error_frac": 0.2,
     }

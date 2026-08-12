@@ -110,6 +110,9 @@ _FINISH_REASONS = (
     "submit",
     "hit_max_turns",
     "hit_time_budget",
+    # The history filled the model's context before the agent was done. Distinct
+    # from hit_max_turns (it had episodes left) and from error (nothing broke).
+    "hit_context_limit",
     "stopped_early",
     "error",
 )

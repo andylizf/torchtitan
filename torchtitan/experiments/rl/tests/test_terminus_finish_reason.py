@@ -29,15 +29,40 @@ from unittest.mock import MagicMock
 import pytest
 
 
+class _FakeParser:
+    """The one method Terminus-2 reaches its parser through."""
+
+    def __init__(self, results=()):
+        self._results = list(results)
+
+    def parse_response(self, _content):
+        return self._results.pop(0) if self._results else MagicMock()
+
+
 class _FakeTerminus2:
     """Stands in for harbor's Terminus2, replaying one of the three exits."""
 
-    def __init__(self, *, episodes: int, pending_completion: bool, raises=None, **_):
+    def __init__(
+        self,
+        *,
+        episodes: int,
+        pending_completion: bool,
+        raises=None,
+        parse_results=(),
+        **kwargs,
+    ):
         self._episodes = episodes
         self._pending_completion = pending_completion
         self._raises = raises
         self._n_episodes = 0
         self._llm = None
+        # The real Terminus2 builds one in __init__; terminus.py wraps it to count
+        # the turns it could not turn into an action.
+        self._parser = _FakeParser(parse_results)
+        self._parse_results = list(parse_results)
+        # Record what terminus.py asked for, so a test can assert on the config it
+        # passes upstream (summarization in particular).
+        self.init_kwargs = kwargs
 
     async def setup(self, _env) -> None:
         return None
@@ -46,20 +71,40 @@ class _FakeTerminus2:
         # The real loop assigns _n_episodes at the top of each iteration, so the
         # count survives an exception raised mid-episode.
         self._n_episodes = self._episodes
+        # Terminus-2 parses one response per episode; replay that so the wrapper
+        # sees the same call pattern.
+        for _ in range(len(self._parse_results)):
+            self._parser.parse_response("<response/>")
         if self._raises is not None:
             raise self._raises
 
 
-def _install_fake_harbor(monkeypatch, **agent_kwargs) -> None:
-    """Import terminus.py against a stub harbor (the real one needs a sandbox)."""
+def _install_fake_harbor(monkeypatch, built: list, **agent_kwargs) -> None:
+    """Import terminus.py against a stub harbor (the real one needs a sandbox).
+
+    ``built`` collects the fake agents that get constructed, so a test can assert on
+    the configuration terminus.py passed upstream.
+    """
+    # The real exception types: terminus.py branches on them, so substituting
+    # look-alikes would let a wrong branch pass.
+    from harbor.llms.base import ContextLengthExceededError
+
     for name in ("harbor", "harbor.agents", "harbor.agents.terminus_2"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    def _build(**kwargs):
+        agent = _FakeTerminus2(**agent_kwargs, **kwargs)
+        built.append(agent)
+        return agent
+
     monkeypatch.setattr(
-        sys.modules["harbor.agents.terminus_2"],
-        "Terminus2",
-        lambda **kwargs: _FakeTerminus2(**agent_kwargs, **kwargs),
-        raising=False,
+        sys.modules["harbor.agents.terminus_2"], "Terminus2", _build, raising=False
     )
+    llms_base = types.ModuleType("harbor.llms.base")
+    llms_base.ContextLengthExceededError = ContextLengthExceededError  # pyrefly: ignore
+    for name in ("harbor.llms",):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "harbor.llms.base", llms_base)
     context_mod = types.ModuleType("harbor.models.agent.context")
     context_mod.AgentContext = MagicMock  # pyrefly: ignore
     for name in ("harbor.models", "harbor.models.agent"):
@@ -67,11 +112,13 @@ def _install_fake_harbor(monkeypatch, **agent_kwargs) -> None:
     monkeypatch.setitem(sys.modules, "harbor.models.agent.context", context_mod)
 
 
-def _run(monkeypatch, *, max_turns: int, **agent_kwargs):
+def _run(monkeypatch, *, max_turns: int, built: list | None = None, **agent_kwargs):
     from torchtitan.experiments.rl.harness.agents.spec import AgentTask
     from torchtitan.experiments.rl.harness.agents.terminus import terminus_agent
 
-    _install_fake_harbor(monkeypatch, **agent_kwargs)
+    _install_fake_harbor(
+        monkeypatch, built if built is not None else [], **agent_kwargs
+    )
     sandbox = MagicMock()
 
     async def _exec(*_args, **_kwargs):
@@ -129,13 +176,198 @@ def test_an_error_keeps_the_episodes_it_got_through(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "reason", ["submit", "stopped_early", "hit_max_turns", "error"]
+    "reason",
+    [
+        "submit",
+        "stopped_early",
+        "hit_max_turns",
+        "hit_time_budget",
+        "hit_context_limit",
+        "error",
+    ],
 )
 def test_every_reported_reason_is_one_the_rollouter_accepts(reason):
     """The rollouter validates finish_reason; an unknown one would fail a rollout."""
     from torchtitan.experiments.rl.examples.tmax.rollouter import _FINISH_REASONS
 
     assert reason in _FINISH_REASONS
+
+
+def test_a_full_context_is_its_own_ending_not_an_error(monkeypatch):
+    """With summarization off, running out of context is the ordinary way a
+    trajectory ends. Pooling it into "error" hides how often the context, rather
+    than the task, is what stopped the agent."""
+    from harbor.llms.base import ContextLengthExceededError
+
+    run = _run(
+        monkeypatch,
+        max_turns=150,
+        episodes=23,
+        pending_completion=False,
+        raises=ContextLengthExceededError("full"),
+    )
+    assert (run.finish_reason, run.submitted, run.turns) == (
+        "hit_context_limit",
+        False,
+        23,
+    )
+
+
+def test_summarization_is_off_unless_asked_for(monkeypatch):
+    """Upstream defaults it on, where it fires below 8k free context and runs a
+    three-subagent prompt chain through our adapter. Measured on a 9B, every trial
+    that summarized scored zero."""
+    built: list = []
+    _run(monkeypatch, max_turns=150, episodes=1, pending_completion=False, built=built)
+
+    assert built[0].init_kwargs["enable_summarize"] is False
+    # Belt and braces: the proactive path is thresholded separately, and 0 disables
+    # it, so an upstream default flipping would not quietly re-enable it.
+    assert built[0].init_kwargs["proactive_summarization_threshold"] == 0
+
+
+def test_the_summarize_flag_restores_upstream_behavior(monkeypatch):
+    """Kept switchable so fidelity against published numbers can be A/B'd."""
+    import torchtitan.experiments.rl.harness.agents.terminus as terminus
+
+    monkeypatch.setattr(terminus, "_SUMMARIZE", True)
+    monkeypatch.setattr(terminus, "_PROACTIVE_SUMMARIZE_THRESHOLD", 8192)
+    built: list = []
+    _run(monkeypatch, max_turns=150, episodes=1, pending_completion=False, built=built)
+
+    assert built[0].init_kwargs["enable_summarize"] is True
+    assert built[0].init_kwargs["proactive_summarization_threshold"] == 8192
+
+
+# --------------------------------------------------------------------------
+# format_errors. Nothing was ever filling this in -- every rollout reported 0,
+# which reads as "the policy speaks the XML fine" but meant "never measured".
+# Over a 9B Terminal-Bench 2.0 pass, 9.4% of turns emitted no keystrokes at all.
+# --------------------------------------------------------------------------
+
+
+def _parse_result(*, commands=(), is_task_complete=False):
+    result = MagicMock()
+    result.commands = list(commands)
+    result.is_task_complete = is_task_complete
+    return result
+
+
+def test_turns_that_moved_the_terminal_are_not_format_errors(monkeypatch):
+    run = _run(
+        monkeypatch,
+        max_turns=150,
+        episodes=3,
+        pending_completion=True,
+        parse_results=[
+            _parse_result(commands=["ls"]),
+            _parse_result(commands=["cd /app", "make"]),
+            _parse_result(is_task_complete=True),
+        ],
+    )
+    assert run.format_errors == 0
+
+
+def test_a_turn_with_no_parsable_action_is_counted(monkeypatch):
+    """Neither a command nor a completion signal: whatever the model emitted, the
+    terminal did not move."""
+    run = _run(
+        monkeypatch,
+        max_turns=150,
+        episodes=3,
+        pending_completion=False,
+        parse_results=[
+            _parse_result(commands=["ls"]),
+            _parse_result(),
+            _parse_result(),
+        ],
+    )
+    assert run.format_errors == 2
+
+
+def test_format_errors_survive_a_crash(monkeypatch):
+    """They describe turns already captured for training, so an exception later in
+    the trajectory must not discard them."""
+    run = _run(
+        monkeypatch,
+        max_turns=150,
+        episodes=2,
+        pending_completion=False,
+        parse_results=[_parse_result(), _parse_result()],
+        raises=RuntimeError("boom"),
+    )
+    assert (run.finish_reason, run.format_errors) == ("error", 2)
+
+
+def test_the_counting_parser_delegates_everything_else():
+    """Terminus-2 feature-detects salvage_truncated_response on the parser, so the
+    wrapper has to be transparent."""
+    from torchtitan.experiments.rl.harness.agents.terminus import _CountingParser
+
+    class _Inner:
+        def salvage_truncated_response(self, _text):
+            return "<response/>", False
+
+        def parse_response(self, _content):
+            return _parse_result(commands=["ls"])
+
+    wrapped = _CountingParser(_Inner())
+    assert hasattr(wrapped, "salvage_truncated_response")
+    assert wrapped.salvage_truncated_response("x") == ("<response/>", False)
+
+
+# --------------------------------------------------------------------------
+# The wall-clock budget. The vanillux loop stops at a turn boundary once the
+# rollout's budget is spent; Terminus-2's loop is inside harbor, so the one hook
+# that runs per episode is the LLM call. Without this Terminus-2 runs until the
+# rollouter's outer guard kills it, which lands as an infra failure -- 28 of the
+# 445 trials in a 9B pass ended that way -- rather than a graded attempt.
+# --------------------------------------------------------------------------
+
+
+def test_a_spent_budget_stops_before_the_next_episode():
+    from torchtitan.experiments.rl.harness.agents.terminus import (
+        _AdapterLLM,
+        _TimeBudgetExhausted,
+    )
+
+    class _Adapter:
+        async def complete(self, _session_id, _payload):
+            raise AssertionError("must not ask the policy past the deadline")
+
+    llm = _AdapterLLM(
+        _Adapter(),
+        session_id="group=-1/rollout=0",
+        max_context=63488,
+        turn_max_tokens=16384,
+        deadline=0.0,
+    )
+    with pytest.raises(_TimeBudgetExhausted):
+        asyncio.run(llm.call(prompt="go"))
+
+
+def test_no_budget_means_no_deadline():
+    """time_budget_sec is optional on AgentTask; absent, nothing should expire."""
+    llm = _adapter_llm(_reply("<response/>", "end_turn"))
+    assert llm._deadline is None
+    assert asyncio.run(llm.call(prompt="go")).content == "<response/>"
+
+
+def test_running_out_of_budget_is_reported_as_such(monkeypatch):
+    from torchtitan.experiments.rl.harness.agents.terminus import _TimeBudgetExhausted
+
+    run = _run(
+        monkeypatch,
+        max_turns=150,
+        episodes=9,
+        pending_completion=False,
+        raises=_TimeBudgetExhausted("spent"),
+    )
+    assert (run.finish_reason, run.submitted, run.turns) == (
+        "hit_time_budget",
+        False,
+        9,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +457,44 @@ def test_an_exhausted_context_raises_its_own_error():
         asyncio.run(llm.call(prompt="go"))
     # Specifically NOT the truncation error, whose handler re-asks.
     assert not issubclass(ContextLengthExceededError, OutputLengthExceededError)
+
+
+def test_a_clamped_turn_is_the_context_wall_not_a_truncation():
+    """The regression this replaced: keying on output_tokens > 0.
+
+    The adapter clamps the per-turn cap down to the context that is left, so a turn
+    with a few hundred tokens of headroom stops at "max_tokens" after a few hundred
+    tokens and looks exactly like a capped generation -- but re-asking for a shorter
+    answer cannot help, because the retry has the same headroom. Taken from a real
+    trace: 63,388 tokens of prompt, ~100 tokens of prose cut off mid-sentence.
+    """
+    from harbor.llms.base import ContextLengthExceededError
+
+    llm = _adapter_llm(
+        {
+            "content": [{"type": "text", "text": "In the debug session, I computed:"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 63388, "output_tokens": 100},
+        }
+    )
+    with pytest.raises(ContextLengthExceededError):
+        asyncio.run(llm.call(prompt="go"))
+
+
+def test_headroom_left_is_still_a_re_askable_truncation():
+    """The other side of the same discriminator: the turn really did hit the
+    generation cap, so Terminus-2's salvage / re-ask is worth an attempt."""
+    from harbor.llms.base import OutputLengthExceededError
+
+    llm = _adapter_llm(
+        {
+            "content": [{"type": "text", "text": "<response><commands>"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 2000, "output_tokens": 16384},
+        }
+    )
+    with pytest.raises(OutputLengthExceededError):
+        asyncio.run(llm.call(prompt="go"))
 
 
 def test_a_turn_burned_entirely_inside_thinking_still_raises():
