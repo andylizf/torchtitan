@@ -138,6 +138,74 @@ def test_local_copy_sources_are_carried_as_build_context(tmp_path):
     assert base64.b64decode(ctx["fixtures/a.txt"]) == b"hello"
 
 
+def test_a_backslash_continued_copy_carries_every_source(tmp_path):
+    """One instruction split over lines is still one instruction.
+
+    Scanning line by line sees only ``a.yml \\``, whose trailing backslash makes
+    ``shlex.split`` raise -- reported as an unbuildable task -- and hides every
+    source after the first.
+    """
+    root = tmp_path / "tasks"
+    root.mkdir()
+    task = _write_task(
+        root,
+        "rts_task_cont",
+        dockerfile="FROM ubuntu:22.04\nWORKDIR /app\n"
+        "COPY a.yml \\\n     b.yml \\\n     /app/\n",
+    )
+    (task / "environment" / "a.yml").write_text("a: 1")
+    (task / "environment" / "b.yml").write_text("b: 2")
+
+    rows, reasons = build_rows([str(root)])
+
+    assert reasons == {"ok": 1}
+    assert set(rows[0]["metadata"]["build_context"]) == {"a.yml", "b.yml"}
+
+
+def test_a_copy_heredoc_needs_no_build_context(tmp_path):
+    """BuildKit ``COPY <<'EOF'`` inlines its content, so there is no local source.
+
+    Treating ``<<'EOF'`` as a filename makes the task look like it references a file
+    the corpus does not ship.
+    """
+    root = tmp_path / "tasks"
+    root.mkdir()
+    _write_task(
+        root,
+        "rts_task_heredoc",
+        dockerfile="FROM ubuntu:22.04\nWORKDIR /app\n"
+        "COPY <<'EOF' /app/config.yml\nkey: value\nEOF\n",
+    )
+
+    rows, reasons = build_rows([str(root)])
+
+    assert reasons == {"ok": 1}
+    assert rows[0]["metadata"].get("build_context") is None
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        # 87 of 89 --privileged / docker.sock hits in the corpus are prose about how
+        # the task was authored; the task itself builds and grades in a plain
+        # container (and a Dockerfile cannot grant privilege anyway).
+        "FROM ubuntu:22.04\nWORKDIR /app\n"
+        "# the reference solution was developed with --privileged\nRUN ls /app\n",
+        "FROM ubuntu:22.04\nWORKDIR /app\n"
+        "# NOTE: do not mount /var/run/docker.sock here\nRUN ls /app\n",
+    ],
+)
+def test_privileged_mentions_inside_comments_are_not_filtered(tmp_path, dockerfile):
+    root = tmp_path / "tasks"
+    root.mkdir()
+    _write_task(root, "rts_task_prose", dockerfile=dockerfile)
+
+    rows, reasons = build_rows([str(root)])
+
+    assert reasons == {"ok": 1}
+    assert len(rows) == 1
+
+
 def test_missing_copy_source_is_filtered(tmp_path):
     root = tmp_path / "tasks"
     root.mkdir()

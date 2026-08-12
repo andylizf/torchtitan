@@ -56,15 +56,24 @@ import sys
 from torchtitan.experiments.rl.examples.tmax.prepare_tmax_data import _REWARD_PATH
 
 # A COPY/ADD whose source is local needs the task's ``environment/`` shipped with
-# the row; ``--from=`` pulls from another image or stage and needs nothing.
+# the row; ``--from=`` pulls from another image or stage and needs nothing. Matched
+# against the backslash-JOINED Dockerfile (see ``_join_continuations``), so a
+# multi-line COPY yields all of its sources rather than just the first line.
 _LOCAL_COPY = re.compile(r"^\s*(?:COPY|ADD)\s+(?!--from=)(.+?)\s*$", re.M | re.I)
 # Flags that only affect ownership/permissions of the copied files.
 _COPY_FLAG = re.compile(r"^--(chown|chmod|link)=")
+# BuildKit here-document (``COPY <<'EOF' /app/f``): the content is inline in the
+# Dockerfile, so there is no local source to ship.
+_COPY_HEREDOC = re.compile(r"^<<-?")
 
 # Tasks that need a host we do not control. Measured, not guessed: a substring
 # match on "systemd"/"docker-compose" rejects ~1700 tasks of which 0 actually run
 # an init system -- the corpus mentions them in comments explaining solve.sh. Only
 # these signals correlate with a task that really cannot run in a plain container.
+# Matched against the COMMENT-STRIPPED Dockerfile for the same reason: on the
+# TerminalWorld corpus 87 of 89 ``--privileged`` / ``docker.sock`` hits were inside
+# comments describing how the task was authored, and those tasks build and grade
+# fine in a plain container (a Dockerfile cannot grant privilege anyway).
 _REJECT_PRIVILEGED = re.compile(
     r"^\s*(?:ENTRYPOINT|CMD)\s+.*(?:/sbin/init|systemd)"
     r"|^\s*RUN\s+.*systemctl\s+(?:enable|start)"
@@ -72,6 +81,7 @@ _REJECT_PRIVILEGED = re.compile(
     r"|--privileged",
     re.M | re.I,
 )
+_COMMENT_LINE = re.compile(r"^\s*#.*$", re.M)
 
 # Byte ceiling for an inlined build context. The corpus is tiny here (p50 ~5 KB,
 # p90 ~15 KB) but a handful of tasks carry multi-MB fixtures that would bloat the
@@ -79,6 +89,21 @@ _REJECT_PRIVILEGED = re.compile(
 _MAX_CONTEXT_BYTES = 1 << 20
 
 _DEFAULT_WORKDIR = "/app"
+
+
+def _join_continuations(dockerfile: str) -> str:
+    """Fold backslash-continued Dockerfile lines into one physical line each.
+
+    ``COPY a.yml \\<newline> b.yml dest`` is one instruction; matching it line by
+    line sees only ``a.yml \\``, whose trailing backslash then makes ``shlex.split``
+    raise (reported as an unbuildable task) and hides every source but the first.
+    """
+    return re.sub(r"\\\n\s*", " ", dockerfile)
+
+
+def _strip_comments(dockerfile: str) -> str:
+    """Drop whole-line ``#`` comments so instruction scans ignore prose."""
+    return _COMMENT_LINE.sub("", dockerfile)
 
 
 def _workdir_from_dockerfile(text: str) -> str:
@@ -103,7 +128,9 @@ def _build_context(env_dir: str, dockerfile: str) -> dict[str, str]:
     """
     context: dict[str, str] = {}
     total = 0
-    for rest in _LOCAL_COPY.findall(dockerfile):
+    for rest in _LOCAL_COPY.findall(_join_continuations(dockerfile)):
+        if _COPY_HEREDOC.match(rest):
+            continue
         parts = [p for p in shlex.split(rest) if not _COPY_FLAG.match(p)]
         for src in parts[:-1]:
             abspath = os.path.normpath(os.path.join(env_dir, src))
@@ -186,7 +213,7 @@ def _to_row(task_dir: str) -> tuple[dict | None, str]:
 
     with open(paths["dockerfile"], encoding="utf-8") as f:
         dockerfile = f.read()
-    if _REJECT_PRIVILEGED.search(dockerfile):
+    if _REJECT_PRIVILEGED.search(_strip_comments(_join_continuations(dockerfile))):
         return None, "needs_privileged"
 
     env_dir = os.path.join(task_dir, "environment")
