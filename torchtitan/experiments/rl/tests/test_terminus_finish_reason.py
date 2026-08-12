@@ -136,3 +136,67 @@ def test_every_reported_reason_is_one_the_rollouter_accepts(reason):
     from torchtitan.experiments.rl.examples.tmax.rollouter import _FINISH_REASONS
 
     assert reason in _FINISH_REASONS
+
+
+# --------------------------------------------------------------------------
+# The truncation seam. Terminus-2 handles a turn cut off at max_tokens INSIDE its
+# LLM call -- salvage a complete action from the truncated text, else re-ask for a
+# shorter one -- and neither costs an episode. That only fires if the backend
+# RAISES OutputLengthExceededError; returning the truncated text as a normal reply
+# sends it to the XML parser instead, which fails and burns an episode. Both of
+# harbor's own backends raise, so ours has to as well.
+# --------------------------------------------------------------------------
+
+
+def _adapter_llm(reply, *, turn_max_tokens=16384):
+    from torchtitan.experiments.rl.harness.agents.terminus import _AdapterLLM
+
+    class _Adapter:
+        async def complete(self, _session_id, _payload):
+            return reply
+
+    return _AdapterLLM(
+        _Adapter(),
+        session_id="group=-1/rollout=0",
+        max_context=63488,
+        turn_max_tokens=turn_max_tokens,
+    )
+
+
+def _reply(text, stop_reason):
+    return {"content": [{"type": "text", "text": text}], "stop_reason": stop_reason}
+
+
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "length"])
+def test_a_truncated_turn_raises_output_length_exceeded(stop_reason):
+    from harbor.llms.base import OutputLengthExceededError
+
+    llm = _adapter_llm(_reply("<response><commands>ls", stop_reason))
+
+    with pytest.raises(OutputLengthExceededError) as excinfo:
+        asyncio.run(llm.call(prompt="go"))
+
+    # Terminus-2 reads truncated_response off the exception to try the salvage.
+    assert excinfo.value.truncated_response == "<response><commands>ls"
+
+
+@pytest.mark.parametrize("stop_reason", ["end_turn", "tool_use", None])
+def test_a_complete_turn_is_returned_normally(stop_reason):
+    llm = _adapter_llm(
+        _reply("<response><commands>ls</commands></response>", stop_reason)
+    )
+
+    response = asyncio.run(llm.call(prompt="go"))
+
+    assert response.content == "<response><commands>ls</commands></response>"
+
+
+def test_output_limit_is_reported_so_the_retry_can_name_it():
+    """Terminus-2 interpolates this into 'you exceeded N tokens, break it into
+    chunks'; None degrades that to 'the maximum output length'."""
+    assert (
+        _adapter_llm(
+            _reply("x", "end_turn"), turn_max_tokens=32768
+        ).get_model_output_limit()
+        == 32768
+    )

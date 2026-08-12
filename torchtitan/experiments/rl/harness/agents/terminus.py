@@ -86,10 +86,16 @@ class _AdapterLLM:
         return self._max_context
 
     def get_model_output_limit(self) -> int | None:
-        return None
+        # Terminus-2 puts this number in the retry it sends after a truncated turn
+        # ("you exceeded N tokens, break it into chunks"). None degrades that to
+        # "the maximum output length", which the model cannot act on.
+        return self._turn_max_tokens
 
     async def call(self, prompt: str, message_history=None, **_kwargs):
-        from harbor.llms.base import LLMResponse  # type: ignore
+        from harbor.llms.base import (  # type: ignore
+            LLMResponse,
+            OutputLengthExceededError,
+        )
 
         messages = list(message_history or [])
         messages.append({"role": "user", "content": prompt})
@@ -112,6 +118,17 @@ class _AdapterLLM:
             for block in (reply.get("content") or [])
             if isinstance(block, dict) and block.get("type") == "text"
         )
+        # A turn cut off at max_tokens has to be raised, not returned. Terminus-2
+        # handles it inside its LLM call -- salvage a complete action out of the
+        # truncated text, else re-ask for a shorter one -- and neither step costs an
+        # episode. Returned as an ordinary reply it instead reaches the XML parser,
+        # fails there, and burns an episode on the parser-warning retry. Both of
+        # harbor's own backends raise here for the same reason.
+        if reply.get("stop_reason") in ("max_tokens", "length"):
+            raise OutputLengthExceededError(
+                f"hit max_tokens={self._turn_max_tokens} for {self._session_id}",
+                truncated_response=text,
+            )
         return LLMResponse(content=text)
 
 
