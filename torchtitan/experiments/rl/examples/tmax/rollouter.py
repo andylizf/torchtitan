@@ -55,6 +55,7 @@ import heapq
 import itertools
 import json
 import logging
+import math
 import os
 import statistics
 from collections.abc import Mapping
@@ -608,23 +609,37 @@ class TMaxRollouter(Rollouter):
                 ),
             ]
 
-        # Match Open-Instruct: after sandbox/reset retries are exhausted, keep the
-        # failed sibling in the group with reward zero. It participates in centered
-        # advantage estimation; an empty completion contributes no training tokens.
-        if any(infra_failed_flags):
-            logger.warning(
-                "[tmax] group=%d retaining %d/%d infrastructure failures as "
-                "zero-reward siblings",
-                group_id,
-                sum(infra_failed_flags),
-                len(infra_failed_flags),
-            )
-
         # Standard scoring + advantage path (mirrors Rollouter.run_group_rollouts).
         outputs = await self.score_group(rollouts, sample)
         for rollout, output in zip(rollouts, outputs, strict=True):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
+
+        # An infrastructure failure is not a verdict on the policy, so it must not
+        # become one. This used to hold the sibling at reward 0 to match
+        # Open-Instruct, reasoning that a failed rollout has no completion and so no
+        # training tokens. That holds for a sandbox that never booted and not for the
+        # timeouts that dominate: across a 445-trial pass every one of the 30 infra
+        # failures carried tokens, a median of 62 turns and 45k completion tokens.
+        # Centered advantage then gives those turns 0 minus the group mean -- a
+        # negative advantage training the policy away from behavior nothing
+        # established was wrong -- and drags the baseline down for its siblings.
+        #
+        # NaN is "no verdict", distinct from 0.0 = "verdict: failed"; the advantage
+        # estimator and the sample builder both drop it before computing any group
+        # statistic, so a group of 8 with one infra failure baselines over the
+        # surviving 7. Validation deliberately keeps 0.0: avg@k is defined over
+        # attempts, so a NaN there would move the denominator and stop the number
+        # being comparable to the published one (and index.json cannot encode it).
+        if group_id >= 0 and any(infra_failed_flags):
+            for rollout, infra_failed in zip(rollouts, infra_failed_flags, strict=True):
+                if infra_failed:
+                    rollout.reward = math.nan
+            logger.warning(
+                f"[tmax] group={group_id}: "
+                f"{sum(infra_failed_flags)}/{len(infra_failed_flags)} "
+                f"infrastructure failures excluded from the advantage baseline"
+            )
 
         group = RolloutGroup(
             group_id=group_id,

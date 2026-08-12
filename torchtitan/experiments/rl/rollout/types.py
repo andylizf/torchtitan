@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, TYPE_CHECKING
@@ -150,7 +151,13 @@ class Rollout:
     """Rollout-level terminal status."""
 
     reward: float | None = None
-    """Final weighted reward, filled by the rubric."""
+    """Final weighted reward, filled by the rubric.
+
+    ``None`` before the rubric runs, and NaN when nothing could reach a verdict on
+    this rollout -- an infrastructure failure, as opposed to 0.0, which is a verdict
+    of failure. See ``is_scored``: an unscored rollout is left out of the group
+    baseline and is not trained on, because centering would otherwise train its turns
+    away from behavior no verdict established was wrong."""
 
     reward_breakdown: dict[str, float] = field(default_factory=dict)
     """Raw per-reward-function values, filled by the rubric."""
@@ -164,6 +171,16 @@ class Rollout:
     inspection rather than training (e.g. why the agent loop stopped). Group metrics
     aggregate these away, so a report that needs them per rollout reads here instead.
     Free-form: consumers render whichever keys are present."""
+
+
+def is_scored(rollout: Rollout) -> bool:
+    """Whether a verdict was reached on this rollout, so it belongs in a baseline.
+
+    False for an unscored rollout: ``None`` (the rubric never ran) or NaN (it ran and
+    had nothing to judge, e.g. the sandbox died). Neither is the same as 0.0, which is
+    a verdict of failure and does belong in the baseline.
+    """
+    return rollout.reward is not None and not math.isnan(rollout.reward)
 
 
 @dataclass(kw_only=True, slots=True)

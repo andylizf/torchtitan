@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout import Rollout, RolloutGroup
+from torchtitan.experiments.rl.rollout.types import is_scored
 from torchtitan.experiments.rl.types import (
     RolloutTurnID,
     TrainingSample,
@@ -69,13 +70,40 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
+        # Unscored rollouts come out first, before any group statistic is taken. A NaN
+        # reward means nothing reached a verdict on this rollout (an infrastructure
+        # failure, not a failed attempt), so it is neither part of the baseline nor
+        # trained on -- a group of 8 holding one of them is scored and packed as 7.
+        # Counting it as a 0 instead would train its turns away from behavior no
+        # verdict established was wrong, and pull its siblings' baseline down with it.
+        scored_rollouts = [
+            rollout for rollout in rollout_group.rollouts if is_scored(rollout)
+        ]
+        num_unscored_rollouts = len(rollout_group.rollouts) - len(scored_rollouts)
+        if num_unscored_rollouts:
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_unscored_rollouts_dropped",
+                    m.Sum(float(num_unscored_rollouts)),
+                )
+            )
+        if not scored_rollouts:
+            # Every sibling failed on infrastructure: no baseline exists, and the
+            # group statistics below would raise on an empty sequence.
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_groups_dropped_unscored", m.Sum(1.0)
+                )
+            )
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+
         # A rollout with no completion tokens cannot produce a training sample.
-        # Most recipes drop its whole centered-advantage group. Some environments
-        # intentionally score infrastructure failures as zero, in which case the
-        # empty sibling must stay in reward centering while contributing no tokens.
+        # Most recipes drop its whole centered-advantage group.
         num_untrainable_rollouts = sum(
             not any(turn.completion_token_ids for turn in rollout.turns)
-            for rollout in rollout_group.rollouts
+            for rollout in scored_rollouts
         )
         if num_untrainable_rollouts:
             metrics.append(
@@ -102,7 +130,7 @@ class TrainingSampleBuilder(Configurable):
         # reward), the batcher never reaches num_groups_per_train_step, the trainer never steps, and
         # no step metrics are logged (they flush at train step) -> a silent hang. Emit a warning /
         # heartbeat (e.g. when N consecutive groups drop with no batch packed) so this is visible.
-        rewards = [rollout.reward for rollout in rollout_group.rollouts]
+        rewards = [rollout.reward for rollout in scored_rollouts]
         is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
         metrics.append(
             m.Metric(
@@ -157,7 +185,7 @@ class TrainingSampleBuilder(Configurable):
         # One rollout may branch into multiple trainable training_samples.
         training_samples: list[TrainingSample] = []
         branches_per_rollout: list[float] = []
-        for rollout in rollout_group.rollouts:
+        for rollout in scored_rollouts:
             rollout_training_samples = self.rollout_to_training_samples(rollout)
             training_samples.extend(rollout_training_samples)
             branches_per_rollout.append(float(len(rollout_training_samples)))
@@ -168,7 +196,7 @@ class TrainingSampleBuilder(Configurable):
         max_policy_versions = [
             training_sample.max_policy_version for training_sample in training_samples
         ]
-        advantages = [rollout.advantage for rollout in rollout_group.rollouts]
+        advantages = [rollout.advantage for rollout in scored_rollouts]
         metrics += [
             m.Metric(
                 "training_sample_builder/num_training_samples",

@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import inspect
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -338,7 +339,8 @@ def test_sandbox_issue_metrics_count_events_and_affected_rollouts() -> None:
     }
 
 
-def test_infra_failed_sibling_is_scored_as_zero_reward() -> None:
+def _run_group_with_one_infra_failure(group_id: int):
+    """Two siblings, the second an infrastructure failure, scored 1.0 / 0.0."""
     rollouter = object.__new__(TMaxRollouter)
     rollouter._ensure_adapter = AsyncMock(return_value=object())
     rollouter._read_ctrf = False
@@ -349,7 +351,7 @@ def test_infra_failed_sibling_is_scored_as_zero_reward() -> None:
         infra_failed = rollout_idx == 1
         return (
             Rollout(
-                group_id=7,
+                group_id=group_id,
                 rollout_id=rollout_idx,
                 status=(
                     RolloutStatus.ERROR if infra_failed else RolloutStatus.COMPLETED
@@ -385,15 +387,29 @@ def test_infra_failed_sibling_is_scored_as_zero_reward() -> None:
         rollouter.run_group_rollouts(
             generate_fn=AsyncMock(),
             sample=object(),
-            group_id=7,
+            group_id=group_id,
             group_size=2,
             sampling=object(),
             renderer=object(),
         )
     )
+    return rollouter, group
 
-    assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
-    assert [rollout.advantage for rollout in group.rollouts] == [0.5, -0.5]
+
+def test_infra_failure_is_unscored_not_a_zero_in_a_training_group() -> None:
+    """An infrastructure failure is not a verdict, so it must not become one.
+
+    It used to be held at 0.0 to match Open-Instruct, on the reasoning that such a
+    rollout has no completion and so no training tokens. That is false for the
+    timeouts that dominate -- they carry tens of thousands of completion tokens --
+    and centered advantage then trains those turns away from behavior no verdict
+    established was wrong. NaN says "unscored" so the baseline skips it.
+    """
+    rollouter, group = _run_group_with_one_infra_failure(group_id=7)
+
+    rewards = [rollout.reward for rollout in group.rollouts]
+    assert rewards[0] == 1.0
+    assert math.isnan(rewards[1])
     rollouter.score_group.assert_awaited_once()
     rollouter.advantage_estimator.assert_called_once()
     rollouter._maybe_annotate_zero_std.assert_called_once()
@@ -406,6 +422,15 @@ def test_infra_failed_sibling_is_scored_as_zero_reward() -> None:
         "rollout/infra_failed_frac": 0.5,
         "rollout/infra_failed_group_frac": 1.0,
     }
+
+
+def test_validation_keeps_an_infra_failure_at_zero() -> None:
+    """Validation groups carry negative ids. avg@k is defined over attempts, so a NaN
+    there would move the denominator and stop the number being comparable to the
+    published one -- and index.json cannot encode a NaN at all."""
+    _rollouter, group = _run_group_with_one_infra_failure(group_id=-3)
+
+    assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
 
 
 def test_rollout_dump_writes_machine_readable_sandbox_issues(
