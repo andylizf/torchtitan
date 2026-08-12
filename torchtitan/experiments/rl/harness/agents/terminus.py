@@ -93,6 +93,7 @@ class _AdapterLLM:
 
     async def call(self, prompt: str, message_history=None, **_kwargs):
         from harbor.llms.base import (  # type: ignore
+            ContextLengthExceededError,
             LLMResponse,
             OutputLengthExceededError,
         )
@@ -125,20 +126,28 @@ class _AdapterLLM:
         # fails there, and burns an episode on the parser-warning retry. Both of
         # harbor's own backends raise here for the same reason.
         #
-        # The adapter reports "max_tokens" for two different things, and only one of
-        # them is a truncation: a generation that ran into the per-turn cap comes back
-        # with output_tokens == cap, while a prompt that no longer fits the context
-        # comes back with output_tokens == 0 and an empty completion. Re-asking the
-        # second one is unbounded -- the retry appends to the history that is already
-        # over budget, so it returns empty again -- so let it through as an empty
-        # reply and end the trajectory, which is what it means.
-        if (
-            reply.get("stop_reason") in ("max_tokens", "length")
-            and (reply.get("usage") or {}).get("output_tokens", 0) > 0
-        ):
-            raise OutputLengthExceededError(
-                f"hit max_tokens={self._turn_max_tokens} for {self._session_id}",
-                truncated_response=text,
+        # The adapter reports "max_tokens" for two different things, and they need
+        # opposite handling. output_tokens > 0 is a generation that ran into the
+        # per-turn cap: Terminus-2 salvages an action out of it or re-asks for a
+        # shorter one, neither of which costs an episode. output_tokens == 0 with an
+        # empty completion is the prompt no longer fitting the context, and re-asking
+        # that is unbounded -- the retry appends to a history already over budget, so
+        # the next reply is empty too.
+        #
+        # Context exhaustion is its own signal. Returned as an empty reply it reaches
+        # the XML parser, fails, and Terminus-2 retries -- once the context is full
+        # every retry is empty, so the loop spins to the turn cap doing nothing.
+        # Raised, it unwinds the history and summarizes, which frees budget and lets
+        # the episode keep working; with summarization off it ends the trajectory.
+        if reply.get("stop_reason") in ("max_tokens", "length"):
+            if (reply.get("usage") or {}).get("output_tokens", 0) > 0:
+                raise OutputLengthExceededError(
+                    f"hit max_tokens={self._turn_max_tokens} for {self._session_id}",
+                    truncated_response=text,
+                )
+            raise ContextLengthExceededError(
+                f"prompt no longer fits max_context={self._max_context} "
+                f"for {self._session_id}"
             )
         return LLMResponse(content=text)
 

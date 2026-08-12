@@ -705,6 +705,7 @@ class TMaxRollouter(Rollouter):
         # Default for the timeout/exception paths where run_vanillux_loop never
         # returned (it sets its own reason on the normal path).
         finish_reason = "error"
+        agent_turns = 0
         infra_failed = False
         # Per-test verifier breakdown; stays None unless the rollout was graded with
         # the CTRF read enabled and the task wrote a parsable report.
@@ -768,6 +769,12 @@ class TMaxRollouter(Rollouter):
                     submitted = agent_run.submitted is not False
                     fmt_errors = agent_run.format_errors
                     finish_reason = agent_run.finish_reason
+                    # The harness's own turn count, which is what decides
+                    # finish_reason (a harness reports hit_max_turns off ITS counter).
+                    # Reports otherwise show len(rollout.turns) -- the trainable turns
+                    # left after empty completions are dropped -- so a trajectory that
+                    # spun out its turn budget on empty replies reads as a short one.
+                    agent_turns = agent_run.turns
                     # tmax runs the verifier only on the submit marker; a rollout that
                     # never submits scores 0 (matches SWERLVanilluxSandboxEnv). No
                     # git_diff: grade the agent's OWN sandbox in place. ``None`` means
@@ -942,6 +949,7 @@ class TMaxRollouter(Rollouter):
                 # tool_call is a format_errors=1 / stopped_early rollout).
                 diagnostics={
                     "finish_reason": finish_reason,
+                    "agent_turns": agent_turns,
                     "format_errors": fmt_errors,
                     "submitted": submitted,
                     "infra_failed": diagnostics.infra_failed,

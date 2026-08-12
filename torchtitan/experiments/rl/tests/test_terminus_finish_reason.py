@@ -210,16 +210,21 @@ def test_output_limit_is_reported_so_the_retry_can_name_it():
     )
 
 
-def test_an_exhausted_context_is_not_a_truncation():
+def test_an_exhausted_context_raises_its_own_error():
     """The adapter reports "max_tokens" for a prompt that no longer fits the context
-    too, with an EMPTY completion. Raising there sends Terminus-2 into an unbounded
-    re-ask: each retry appends to a history that is already over budget, so the next
-    reply is empty again. Let it through and end the trajectory instead."""
+    too, with an EMPTY completion. That is not a truncation and must not be re-asked
+    (every retry appends to a history already over budget, so the reply is empty
+    again). Terminus-2 answers ContextLengthExceededError by unwinding and
+    summarizing, which frees budget; returning an empty reply instead leaves it
+    spinning to the turn cap on parser retries."""
+    from harbor.llms.base import ContextLengthExceededError, OutputLengthExceededError
+
     llm = _adapter_llm(_reply("", "max_tokens", output_tokens=0))
 
-    response = asyncio.run(llm.call(prompt="go"))
-
-    assert response.content == ""
+    with pytest.raises(ContextLengthExceededError):
+        asyncio.run(llm.call(prompt="go"))
+    # Specifically NOT the truncation error, whose handler re-asks.
+    assert not issubclass(ContextLengthExceededError, OutputLengthExceededError)
 
 
 def test_a_turn_burned_entirely_inside_thinking_still_raises():
