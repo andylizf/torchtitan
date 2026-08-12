@@ -84,6 +84,22 @@ class Batcher(Configurable):
         before packing. Used by flex attention in batch-invariant mode
         so that block boundaries align regardless of batch composition."""
 
+        skip_zero_advantage_samples: bool = False
+        """Keep samples whose every trained token has advantage 0 out of the forward pass.
+
+        The policy-gradient surrogate is ``-advantage * ratio``, so such a sample
+        contributes exactly zero to the gradient while costing a full forward and
+        backward. It still counts toward ``num_global_valid_tokens``, which is
+        computed before this filter, so the loss keeps the same denominator and the
+        resulting gradient is mathematically unchanged -- not bitwise, because the
+        surviving samples repack into different rows and float addition is not
+        associative.
+
+        Only worth enabling when zero-advantage samples are a large share of the
+        batch, i.e. with ``drop_zero_std_reward_groups=False``: with the drop on,
+        every group in the batch already has reward variance.
+        """
+
     def __init__(
         self,
         config: Config,
@@ -97,6 +113,7 @@ class Batcher(Configurable):
         self.seq_len = config.batch.seq_len
         self.pad_id = pad_id
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
+        self._skip_zero_advantage_samples = config.skip_zero_advantage_samples
         self._num_groups_per_train_step = num_groups_per_train_step
         self._dp_degree = dp_degree
         self._next_batch_policy_version = initial_policy_version
@@ -145,21 +162,36 @@ class Batcher(Configurable):
             num_rollout_groups,
             num_metric_only_groups,
         ) = self._take_groups_for_train_step()
+        # The loss denominator counts every trained token the batch consumed, so it is
+        # taken before any compute-only filtering below. Equal to the loss_mask sum over
+        # the packed rows, since both per-sample and row padding mask out to False.
+        num_global_valid_tokens = sum(
+            sum(training_sample.loss_mask[1:]) for training_sample in training_samples
+        )
+        samples_to_pack = training_samples
+        if self._skip_zero_advantage_samples:
+            samples_to_pack = [
+                training_sample
+                for training_sample in training_samples
+                if any(training_sample.advantage[1:])
+            ]
         # Next-fit all taken training_samples into rows.
-        rows = self._assign_training_samples_to_rows(training_samples)
+        rows = self._assign_training_samples_to_rows(samples_to_pack)
         packed_rows = [self._pack_training_sample_row(row) for row in rows]
         return TrainingBatch(
             microbatches=self._build_microbatch_grid(packed_rows),
-            num_global_valid_tokens=sum(
-                int(row["loss_mask"].sum().item()) for row in packed_rows
-            ),
+            num_global_valid_tokens=num_global_valid_tokens,
             metrics=[
                 *metrics,
                 *self._packing_metrics(
                     packed_rows,
-                    training_samples,
+                    samples_to_pack,
                     num_rollout_groups,
                     num_metric_only_groups,
+                ),
+                m.Metric(
+                    "train_batch/num_zero_advantage_samples_skipped",
+                    m.NoReduce(float(len(training_samples) - len(samples_to_pack))),
                 ),
             ],
             target_policy_version=target_policy_version,

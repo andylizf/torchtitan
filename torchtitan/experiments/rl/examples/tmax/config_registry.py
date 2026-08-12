@@ -326,6 +326,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     group_size = int(os.environ.get("SWE_GROUP_SIZE", "32"))
     max_offpolicy_steps = int(os.environ.get("SWE_OFFPOLICY_STEPS", "4"))
     max_active_rollout_groups = int(os.environ.get("SWE_MAX_ACTIVE_GROUPS", "40"))
+    drop_zero_std_reward_groups = os.environ.get("SWE_DROP_ZERO_STD", "1") == "1"
     num_groups_in_selection_window_env = os.environ.get("SWE_SELECTION_WINDOW_GROUPS")
     num_groups_in_selection_window = (
         int(num_groups_in_selection_window_env)
@@ -415,9 +416,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             strict_fifo=os.environ.get("SWE_STRICT_FIFO", "0") == "1",
         ),
         training_sample_builder=TrainingSampleBuilder.Config(
-            drop_zero_std_reward_groups=(
-                os.environ.get("SWE_DROP_ZERO_STD", "1") == "1"
-            ),
+            drop_zero_std_reward_groups=drop_zero_std_reward_groups,
             # Open-Instruct keeps an exhausted sandbox/reset failure as a
             # zero-reward sibling. It participates in centered advantage while
             # its empty completion contributes no training tokens.
@@ -428,6 +427,12 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             batch=dataclasses.replace(
                 config.async_loop.batcher.batch, seq_len=_TMAX_9B_CONTEXT
             ),
+            # With the zero-std drop off, most of the batch is all-solved or
+            # all-failed groups whose centered advantage is 0, and a zero-advantage
+            # sample contributes nothing to `-advantage * ratio`. Keeping them out of
+            # the forward pass leaves the gradient and the loss denominator alone.
+            # Pointless with the drop on, where every group already has variance.
+            skip_zero_advantage_samples=not drop_zero_std_reward_groups,
         ),
         # Periodic held-out eval every 20 steps (+ start/end): the trained-batch reward is
         # locked near ~0.5 by drop_zero_std, so it is NOT a learning signal; a greedy
