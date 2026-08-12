@@ -163,8 +163,16 @@ def _adapter_llm(reply, *, turn_max_tokens=16384):
     )
 
 
-def _reply(text, stop_reason):
-    return {"content": [{"type": "text", "text": text}], "stop_reason": stop_reason}
+def _reply(text, stop_reason, *, output_tokens=None, blocks=None):
+    if blocks is None:
+        blocks = [{"type": "text", "text": text}]
+    if output_tokens is None:
+        output_tokens = len(text)
+    return {
+        "content": blocks,
+        "stop_reason": stop_reason,
+        "usage": {"input_tokens": 100, "output_tokens": output_tokens},
+    }
 
 
 @pytest.mark.parametrize("stop_reason", ["max_tokens", "length"])
@@ -200,3 +208,34 @@ def test_output_limit_is_reported_so_the_retry_can_name_it():
         ).get_model_output_limit()
         == 32768
     )
+
+
+def test_an_exhausted_context_is_not_a_truncation():
+    """The adapter reports "max_tokens" for a prompt that no longer fits the context
+    too, with an EMPTY completion. Raising there sends Terminus-2 into an unbounded
+    re-ask: each retry appends to a history that is already over budget, so the next
+    reply is empty again. Let it through and end the trajectory instead."""
+    llm = _adapter_llm(_reply("", "max_tokens", output_tokens=0))
+
+    response = asyncio.run(llm.call(prompt="go"))
+
+    assert response.content == ""
+
+
+def test_a_turn_burned_entirely_inside_thinking_still_raises():
+    """The failure this seam exists for: the whole per-turn budget goes into reasoning,
+    so there is no text block at all -- but output_tokens is the full cap. Keying the
+    raise on empty text would miss exactly this case."""
+    from harbor.llms.base import OutputLengthExceededError
+
+    llm = _adapter_llm(
+        _reply(
+            "",
+            "max_tokens",
+            output_tokens=16384,
+            blocks=[{"type": "thinking", "thinking": "round and round"}],
+        )
+    )
+
+    with pytest.raises(OutputLengthExceededError):
+        asyncio.run(llm.call(prompt="go"))

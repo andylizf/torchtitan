@@ -124,7 +124,18 @@ class _AdapterLLM:
         # episode. Returned as an ordinary reply it instead reaches the XML parser,
         # fails there, and burns an episode on the parser-warning retry. Both of
         # harbor's own backends raise here for the same reason.
-        if reply.get("stop_reason") in ("max_tokens", "length"):
+        #
+        # The adapter reports "max_tokens" for two different things, and only one of
+        # them is a truncation: a generation that ran into the per-turn cap comes back
+        # with output_tokens == cap, while a prompt that no longer fits the context
+        # comes back with output_tokens == 0 and an empty completion. Re-asking the
+        # second one is unbounded -- the retry appends to the history that is already
+        # over budget, so it returns empty again -- so let it through as an empty
+        # reply and end the trajectory, which is what it means.
+        if (
+            reply.get("stop_reason") in ("max_tokens", "length")
+            and (reply.get("usage") or {}).get("output_tokens", 0) > 0
+        ):
             raise OutputLengthExceededError(
                 f"hit max_tokens={self._turn_max_tokens} for {self._session_id}",
                 truncated_response=text,
