@@ -48,6 +48,7 @@ from torchtitan.experiments.rl.controller import (
 from torchtitan.experiments.rl.eval_trace_recorder import ValidationTraceRecorder
 from torchtitan.experiments.rl.examples.swe_r2e.config_registry import (
     _CKPT_DIR,
+    _qwen3_5_rl_model_registry,
     _qwen3_rl_model_registry,
     _set_max_seq_len,
     rl_grpo_qwen3_5_27b_swe_r2e as _swe_27b,
@@ -103,6 +104,13 @@ _TB2_VAL_MAX_TOKENS = int(os.environ.get("SWE_TB2_VAL_MAX_TOKENS", "0")) or None
 # seq_len), or a full episode is truncated by vLLM / dropped during packing.
 _TMAX_9B_CONTEXT = 65536
 _TMAX_9B_PER_TURN_TOKENS = 16384
+# 27B terminus default per-turn cap (TMAX_TURN_MAX_TOKENS overrides). Terminus-2
+# thinks for longer per step than vanillux, so the 9B's 16384 truncates its turns.
+_TMAX_27B_PER_TURN_TOKENS = 32768
+# GB200 hosts carry 2 GPUs (torchx `gb200`), which sizes one generator: the
+# launcher spreads a generator's dp x tp world size over world_size/GPUs-per-host
+# machines, so dp must equal the host's GPU count for one generator per host.
+_GB200_GPUS_PER_HOST = 2
 # Held-out prompts per periodic validation pass (greedy, n=1). Runs concurrently, so its
 # wall time is ~one rollout regardless of count; 32 gives a stable enough solve-rate.
 _TMAX_9B_VAL_SAMPLES = 32
@@ -274,6 +282,107 @@ def rl_grpo_qwen3_5_27b_tmax() -> Controller.Config:
     config.rollouter = _tmax_rollouter()
     config.trainer = dataclasses.replace(
         config.trainer, loss=_tmax_recipe_loss(config.trainer.loss)
+    )
+    return config
+
+
+def rl_grpo_qwen3_5_27b_tmax_fsdp16() -> Controller.Config:
+    """27B tmax at the 9B recipe's full 65536 context: FSDP-16 trainer, generator TP-1.
+
+    ``rl_grpo_qwen3_5_27b_tmax`` inherits the swe_r2e 24576 context on a single
+    FSDP-8 host, which is far too short for a 120-turn terminal agent. Three changes,
+    each forced by the previous one:
+
+    - context 65536 (the 9B recipe's ``response_length``), so a full episode is
+      neither truncated by vLLM nor dropped by the trainer's packer;
+    - trainer FSDP-16 over 2 hosts (the launcher derives the host count from
+      ``data_parallel_shard_degree``), because 27B at seq 65536 does not fit the
+      FSDP-8 activation + optimizer footprint on 80GB H100s;
+    - generator TP-1, so one host runs 8 independent engines (DP-8) as the 9B recipe
+      does. 27B bf16 is ~54GB, which leaves ~26GB per GPU for KV cache -- workable
+      because the GDN hybrid keeps a KV cache for only 1 in 4 layers
+      (``full_attention_interval=4``).
+
+    Everything else (bf16 master/Adam, FullAC, chunked DAPO loss) is unchanged, and
+    the batch shape stays env-driven so a launcher can match another run's schedule.
+    """
+    config = rl_grpo_qwen3_5_27b_tmax()
+    assert config.model_spec is not None
+    _set_max_seq_len(config.model_spec, _TMAX_9B_CONTEXT)
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism,
+            data_parallel_shard_degree=16,
+            tensor_parallel_degree=1,
+        ),
+    )
+    # Per-turn generation cap. The swe_r2e 27B base leaves this at 8192; the terminus
+    # scaffold's TMAX_TURN_MAX_TOKENS is only a hint in the HTTP body (the adapter
+    # generates from this SamplingConfig), so the cap has to be raised here or a turn
+    # is cut off mid-thought no matter what the launcher exports.
+    config.generator = dataclasses.replace(
+        config.generator,
+        sampling=dataclasses.replace(
+            config.generator.sampling,
+            max_tokens=int(
+                os.environ.get("TMAX_TURN_MAX_TOKENS", _TMAX_27B_PER_TURN_TOKENS)
+            ),
+        ),
+        parallelism=dataclasses.replace(
+            config.generator.parallelism, tensor_parallel_degree=1
+        ),
+    )
+    return config
+
+
+def rl_grpo_qwen3_5_27b_tmax_gb200() -> Controller.Config:
+    """Qwen3.5-27B tmax terminal-agent on MAST GB200 (Grace ARM64, 2 GPU/host, ~186GB).
+
+    Base = ``rl_grpo_qwen3_5_9b_tmax``, i.e. the TUNED tmax recipe: fp32 master
+    parameters with bf16 compute and fp32 reduce, fp32 AdamW via ``_tmax_9b_adamw``
+    (open-instruct betas/eps/wd), DPPO loss chunked 32 ways, batcher + RoPE at 65536,
+    preserve_all_thinking, salt-KV weight sync. Only three things change for the 27B
+    on GB200:
+
+    - the model is 27B instead of 9B;
+    - trainer attention varlen -> flex. FA3 has no Blackwell kernels, and FA4's
+      flash-attn-4 needs apache-tvm-ffi >= 0.1.12, which breaks the fla/tilelang GDN
+      kernels this model needs (measured on a GB200: the two cannot coexist).
+      FlexAttention is Triton and runs on sm_100 (verified fwd+bwd at head_dim 256).
+      flex_flash is NOT usable: its BlockMask path asserts "SM100 forward with
+      head_dim=256 does not support block sparsity".
+    - nothing else. The 9B recipe is already FSDP-8 + generator TP-1, which on a
+      2-GPU host means 4 trainer hosts and 2 engines per generator host. TP-1 works
+      here only because of the 186GB GPU: the same TP-1 on an 80GB H100 measured
+      "Available KV cache memory: -8.96 GiB" and died at engine init.
+
+    REQUIRES the aarch64 conda env; submit FROM the aarch64 host.
+    """
+    config = rl_grpo_qwen3_5_9b_tmax()
+    config.model_spec = _qwen3_5_rl_model_registry("27B", attn_backend="flex")
+    _set_max_seq_len(config.model_spec, _TMAX_9B_CONTEXT)
+    # Per-turn generation cap. The 9B recipe pins vanillux's 16384; Terminus-2 thinks
+    # longer per step, and TMAX_TURN_MAX_TOKENS is only a hint in the HTTP body (the
+    # adapter generates from this SamplingConfig), so honour it here.
+    #
+    # data_parallel_degree 8 -> 2: one generator's world size is dp x tp, and the
+    # launcher spreads it over world_size / GPUs-per-host machines. The 9B recipe's
+    # DP-8 is one 8-GPU H100 host, but on a 2-GPU GB200 it silently becomes FOUR
+    # hosts per generator -- 6 generators + 1 eval + 4 trainer + controller = 33
+    # hosts instead of 12, with each vLLM data-parallel group split across machines.
+    config.generator = dataclasses.replace(
+        config.generator,
+        sampling=dataclasses.replace(
+            config.generator.sampling,
+            max_tokens=int(
+                os.environ.get("TMAX_TURN_MAX_TOKENS", _TMAX_27B_PER_TURN_TOKENS)
+            ),
+        ),
+        parallelism=dataclasses.replace(
+            config.generator.parallelism,
+            data_parallel_degree=_GB200_GPUS_PER_HOST,
+        ),
     )
     return config
 
