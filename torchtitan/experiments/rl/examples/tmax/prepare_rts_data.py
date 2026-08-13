@@ -90,6 +90,53 @@ _MAX_CONTEXT_BYTES = 1 << 20
 
 _DEFAULT_WORKDIR = "/app"
 
+# Terminus-2 drives a live tmux pane, so a task image without tmux fails every
+# rollout at session bring-up. RTS ships this step in its own Dockerfiles; corpora
+# that carry the upstream task content verbatim (e.g. TerminalWorld-Seeds) do not,
+# hence --inject-agent-runtime.
+#
+# The distro branches matter: a third of these corpora sit on images whose mirrors
+# are gone (centos:7 -> mirrorlist.centos.org, ubuntu:16.04 and debian buster/
+# stretch -> their archives), so a bare `apt-get update && apt-get install tmux`
+# fails at build on them. Each branch retries once against the archive mirror.
+# Deliberately fatal when tmux still cannot be installed: a silently tmux-less
+# image is worse than an unbuildable task, since the failure then surfaces per
+# rollout as an opaque "Failed to start tmux session".
+_AGENT_RUNTIME_BLOCK = """
+# harbor-agent-runtime: tmux is required by the terminal agent
+RUN if command -v tmux >/dev/null 2>&1; then \\
+      exit 0; \\
+    elif command -v apt-get >/dev/null 2>&1; then \\
+      (apt-get update || ( \\
+        sed -i -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \\
+               -e 's|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' \\
+               -e 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|g' \\
+               -e 's|http://archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
+               -e 's|http://security.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
+               -e 's|http://.*archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
+               /etc/apt/sources.list 2>/dev/null; \\
+        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99harbor-archive; \\
+        apt-get update \\
+      )) && (apt-get install -y tmux || apt-get install -y --allow-unauthenticated tmux) \\
+      && rm -rf /var/lib/apt/lists/*; \\
+    elif command -v yum >/dev/null 2>&1; then \\
+      (yum install -y tmux || ( \\
+        sed -i -e 's|^mirrorlist=|#mirrorlist=|g' \\
+               -e 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \\
+               /etc/yum.repos.d/CentOS-*.repo 2>/dev/null; \\
+        yum install -y tmux \\
+      )) && yum clean all; \\
+    elif command -v dnf >/dev/null 2>&1; then \\
+      dnf install -y tmux && dnf clean all; \\
+    elif command -v microdnf >/dev/null 2>&1; then \\
+      microdnf install -y tmux && microdnf clean all; \\
+    elif command -v apk >/dev/null 2>&1; then \\
+      apk add --no-cache tmux; \\
+    else \\
+      echo 'ERROR: no supported package manager to install tmux' >&2; exit 1; \\
+    fi
+"""
+
 
 def _join_continuations(dockerfile: str) -> str:
     """Fold backslash-continued Dockerfile lines into one physical line each.
@@ -199,7 +246,9 @@ def _grading_fixtures(task_dir: str) -> dict[str, str]:
     return fixtures
 
 
-def _to_row(task_dir: str) -> tuple[dict | None, str]:
+def _to_row(
+    task_dir: str, *, inject_agent_runtime: bool = False
+) -> tuple[dict | None, str]:
     """Build one output row, or ``(None, reason)`` when the task is filtered out."""
     task_id = os.path.basename(task_dir.rstrip("/"))
     paths = {
@@ -223,6 +272,10 @@ def _to_row(task_dir: str) -> tuple[dict | None, str]:
         return None, "copy_source_missing"
     except ValueError:
         return None, "build_context_too_large"
+    # After _build_context: the appended step has no COPY sources of its own, and a
+    # trailing RUN in the final stage leaves WORKDIR/ENTRYPOINT/CMD untouched.
+    if inject_agent_runtime:
+        dockerfile = dockerfile.rstrip("\n") + "\n" + _AGENT_RUNTIME_BLOCK
 
     with open(paths["instruction"], encoding="utf-8") as f:
         instruction = f.read()
@@ -267,6 +320,7 @@ def build_rows(
     limit: int | None = None,
     seed: int = 42,
     max_oracle_commands: int | None = None,
+    inject_agent_runtime: bool = False,
 ) -> tuple[list[dict], dict[str, int]]:
     """Convert every task dir under ``tasks_roots`` to a row, applying the filters.
 
@@ -285,7 +339,7 @@ def build_rows(
     rows: list[dict] = []
     reasons: dict[str, int] = {}
     for d in dirs:
-        row, reason = _to_row(d)
+        row, reason = _to_row(d, inject_agent_runtime=inject_agent_runtime)
         if (
             row is not None
             and max_oracle_commands is not None
@@ -329,6 +383,13 @@ def main() -> None:
         "so pair this with SWE_MAX_TURNS (e.g. N=64 under a 128-turn cap)",
     )
     ap.add_argument(
+        "--inject-agent-runtime",
+        action="store_true",
+        help="append a tmux install step to each Dockerfile -- required for corpora "
+        "that ship the upstream task content verbatim (TerminalWorld-Seeds) rather "
+        "than RTS, whose Dockerfiles already carry it",
+    )
+    ap.add_argument(
         "--smoke-size",
         type=int,
         default=0,
@@ -341,6 +402,7 @@ def main() -> None:
         limit=args.limit,
         seed=args.seed,
         max_oracle_commands=args.max_oracle_commands,
+        inject_agent_runtime=args.inject_agent_runtime,
     )
     if not rows:
         print(f"ERROR: produced 0 rows (filters: {reasons})", file=sys.stderr)

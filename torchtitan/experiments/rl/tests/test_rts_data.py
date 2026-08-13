@@ -138,6 +138,50 @@ def test_local_copy_sources_are_carried_as_build_context(tmp_path):
     assert base64.b64decode(ctx["fixtures/a.txt"]) == b"hello"
 
 
+def test_agent_runtime_is_not_injected_by_default(tmp_path):
+    """RTS Dockerfiles already install tmux; injecting would be a no-op RUN layer."""
+    root = tmp_path / "tasks"
+    root.mkdir()
+    _write_task(root, "rts_task_ggg")
+
+    rows, _reasons = build_rows([str(root)])
+
+    assert rows[0]["metadata"]["dockerfile"] == _DOCKERFILE
+
+
+def test_injected_agent_runtime_installs_tmux_without_touching_the_workdir(tmp_path):
+    """Corpora carrying upstream task content verbatim (TerminalWorld-Seeds) ship no
+    tmux, which Terminus-2 needs; the appended step must not shift WORKDIR."""
+    root = tmp_path / "tasks"
+    root.mkdir()
+    _write_task(root, "rts_task_hhh")
+
+    rows, reasons = build_rows([str(root)], inject_agent_runtime=True)
+
+    assert reasons == {"ok": 1}
+    md = rows[0]["metadata"]
+    assert md["dockerfile"].startswith(_DOCKERFILE)
+    assert "tmux" in md["dockerfile"]
+    # A trailing RUN leaves the last WORKDIR in force.
+    assert md["workdir"] == "/srv/final"
+
+
+def test_injection_does_not_add_build_context_sources(tmp_path):
+    """The injected step has no COPY of its own, so the row's context is unchanged."""
+    root = tmp_path / "tasks"
+    root.mkdir()
+    task = _write_task(
+        root,
+        "rts_task_iii",
+        dockerfile="FROM ubuntu:22.04\nWORKDIR /app\nCOPY seed.bin /app/seed.bin\n",
+    )
+    (task / "environment" / "seed.bin").write_bytes(b"seed")
+
+    rows, _reasons = build_rows([str(root)], inject_agent_runtime=True)
+
+    assert set(rows[0]["metadata"]["build_context"]) == {"seed.bin"}
+
+
 def test_a_backslash_continued_copy_carries_every_source(tmp_path):
     """One instruction split over lines is still one instruction.
 
