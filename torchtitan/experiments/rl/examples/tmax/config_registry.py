@@ -572,6 +572,19 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # Cap the eval sandbox burst. A k=5 sweep over 89 TB-2.0 tasks is 445 rollouts;
     # admitting them all at once puts 445 sandbox creates on top of the training
     # pool's, and Daytona rate-limits creation well below that.
+    #
+    # Size it against the eval host's own seat count too, not just the sandbox quota.
+    # One eval generator is DP-8 x TP-1 = 8 engines, so its capacity is 8 x
+    # max_num_seqs -- 256 at the SWE_MAX_NUM_SEQS=32 the 9B launcher sets. Below that
+    # the pass runs in waves and the eval host idles. Measured on a 30-step 9B RTS run
+    # at 128 (half the seats): 445/128 = 3.5 waves, 2.70 h then 2.88 h per pass against
+    # a 10-step x ~20-min = 3.3 h interval, i.e. an 86% duty cycle -- a pass almost
+    # always in flight, competing with training for the controller host.
+    #
+    # An in-flight pass at the next interval is DROPPED, not queued (see
+    # Controller._start_async_validation). That run never tripped the skip path, but
+    # only by ~3 minutes, so validation/skipped staying 0 is the check that the
+    # interval and this concurrency are sized for the benchmark.
     config.eval_rollout_concurrency = int(
         os.environ.get("SWE_EVAL_ROLLOUT_CONCURRENCY", "128")
     )
