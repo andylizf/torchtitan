@@ -32,6 +32,20 @@ def has_cuda_capability(major: int, minor: int) -> bool:
     )
 
 
+def get_cuda_flash_attention_impl() -> str | None:
+    """The FlashAttention implementation to activate on this GPU, or None for FA2.
+
+    Blackwell (SM 10.x) needs FA4; FA3 refuses to run there ("FA3 requires compute
+    capability 9.0"). Since ``has_cuda_capability`` is a >= test, selecting FA3 off a
+    (9, 0) check silently force-activates it on Blackwell and breaks varlen there.
+    """
+    if has_cuda_capability(10, 0):
+        return "FA4"
+    if has_cuda_capability(9, 0):
+        return "FA3"
+    return None
+
+
 def has_rocm_capability(major: int, minor: int) -> bool:
     is_rocm = torch.cuda.is_available() and torch.version.hip is not None
     return is_rocm and torch.cuda.get_device_capability() >= (

@@ -47,7 +47,6 @@ from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import init_logger
-from torchtitan.tools.utils import has_cuda_capability
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig, ParallelConfig
 from vllm.config.compilation import CompilationMode
@@ -56,6 +55,32 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = logging.getLogger(__name__)
+
+
+def _flash_attention_kernels_available() -> bool:
+    """Whether this GPU's FlashAttention kernels (FA3 on Hopper, FA4 on Blackwell)
+    are installed, so vLLM will not silently fall back to FA2.
+
+    Activation is the only reliable probe: ``list_flash_attention_impls`` reports
+    registered names even when the underlying package is missing (FA4 is registered
+    by torch itself but needs a separate flash-attn-4 install).
+    """
+    from torch.nn.attention import activate_flash_attention_impl
+
+    from torchtitan.tools.utils import get_cuda_flash_attention_impl
+
+    impl = get_cuda_flash_attention_impl()
+    if impl is None:
+        return False
+    try:
+        activate_flash_attention_impl(impl)
+    except Exception as e:
+        logger.warning(
+            f"FlashAttention {impl} kernels unavailable ({type(e).__name__}: {e}); "
+            "vLLM will use FA2, so forcing block_size=256"
+        )
+        return False
+    return True
 
 
 def _resolve_max_num_batched_tokens(
@@ -1070,8 +1095,14 @@ class VLLMGenerator(Actor, Configurable):
         # Continuous batching requires FCFS scheduling: admission order must equal the
         # broadcast order on every rank
         engine_kwargs["scheduling_policy"] = "fcfs"
-        # FA2 requires block_size to be a multiple of 256
-        if not has_cuda_capability(9, 0):
+        # FA2 requires block_size to be a multiple of 256, and FA2 is what vLLM
+        # falls back to whenever the capability-appropriate FlashAttention kernels
+        # are absent. Key the override on the kernels actually being loadable, not
+        # on raw capability: `has_cuda_capability` is a >= test, so a bare (9, 0)
+        # check also skips it on Blackwell, where FA3 has no kernels at all and FA4
+        # needs a separate flash-attn-4 install -- without which the engine dies at
+        # startup with "Paged KV cache block size must be divisible by 256".
+        if not _flash_attention_kernels_available():
             engine_kwargs["block_size"] = 256
         if config.parallelism.tensor_parallel_degree > 1:
             # vLLM's custom all-reduce hangs under Monarch's external_launcher at
@@ -1111,9 +1142,19 @@ class VLLMGenerator(Actor, Configurable):
             # let vLLM capture our cudagraph. Native manages its own compilation.
             engine_kwargs["disable_custom_all_reduce"] = True
             engine_kwargs["config_format"] = TORCHTITAN_CONFIG_FORMAT
+            # SWE_GEN_VLLM_ATTENTION overrides the backend derived from the
+            # ModelSpec. Needed for large head_dim on Blackwell: vLLM's flex backend
+            # sizes its Triton tiles from the GPU's shared memory alone
+            # (get_kernel_options: BLOCK_M=BLOCK_N=64 for bf16, halved only below
+            # 144KB), ignoring head_dim, so Qwen3.5's head_dim 256 asks for 552KB
+            # against sm_100's 227KB limit and compilation dies with
+            # "out of resource: triton_tem_fused_flex_attention".
+            _backend_override = os.environ.get("SWE_GEN_VLLM_ATTENTION", "")
             engine_kwargs["attention_config"] = AttentionConfig(
                 backend=(
-                    AttentionBackendEnum.FLEX_ATTENTION
+                    AttentionBackendEnum[_backend_override]
+                    if _backend_override
+                    else AttentionBackendEnum.FLEX_ATTENTION
                     if isinstance(inner_attn, FlexAttention.Config)
                     else AttentionBackendEnum.CUSTOM
                 ),
