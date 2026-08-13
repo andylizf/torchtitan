@@ -36,7 +36,14 @@ Knobs read from env (the launcher sets these; see ``submit_swe_tmax_9b.sh``):
   ``TMAX_EVAL_TIMEOUT_SEC``           verifier run timeout (default 900)
   ``SWE_MAX_CONTEXT_LEN``             model context budget for the adapter session
   ``SWE_ROLLOUT_CONCURRENCY``         concurrently-active rollouts (default 16)
-  ``TMAX_CALL_LIMIT`` / ``TMAX_TURN_MAX_TOKENS``  Vanillux step + per-turn caps
+  ``TMAX_CALL_LIMIT``                 Vanillux step cap (its per-turn token cap is a
+                                      constant in vanillux_loop, not an env knob)
+  ``TMAX_TURN_MAX_TOKENS``            per-turn generation cap, but only where a
+                                      recipe reads it into the generator's
+                                      SamplingConfig -- that config is what bounds
+                                      generation, NOT the ``max_tokens`` a harness
+                                      puts in the request body, which the adapter
+                                      ignores
   ``TMAX_CTRF_DIAGNOSTICS``           read the verifier's per-test CTRF report for
                                       metrics ONLY (default off; costs one extra
                                       sandbox read per graded rollout and never

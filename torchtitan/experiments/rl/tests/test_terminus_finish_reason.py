@@ -427,6 +427,10 @@ def _adapter_llm(reply, *, turn_max_tokens=16384):
     from torchtitan.experiments.rl.harness.agents.terminus import _AdapterLLM
 
     class _Adapter:
+        def session_max_tokens(self, _session_id):
+            # No session to report on, so the module default stands in.
+            return None
+
         async def complete(self, _session_id, _payload):
             return reply
 
@@ -474,15 +478,63 @@ def test_a_complete_turn_is_returned_normally(stop_reason):
     assert response.content == "<response><commands>ls</commands></response>"
 
 
-def test_output_limit_is_reported_so_the_retry_can_name_it():
+def test_output_limit_comes_from_the_session_not_the_module_default():
     """Terminus-2 interpolates this into 'you exceeded N tokens, break it into
-    chunks'; None degrades that to 'the maximum output length'."""
-    assert (
-        _adapter_llm(
-            _reply("x", "end_turn"), turn_max_tokens=32768
-        ).get_model_output_limit()
-        == 32768
+    chunks', so it has to be the cap generation actually ran under.
+
+    The regression it guards: the adapter never reads max_tokens out of the request
+    body -- generation runs on the SamplingConfig the rollouter opened the session
+    with -- and a recipe sets that independently. The 27B one raises it to 32768
+    against this module's 16384 default, so quoting the module default told the model
+    to chunk under half the budget it had.
+    """
+    from torchtitan.experiments.rl.harness.agents.terminus import _AdapterLLM
+
+    class _Adapter:
+        def session_max_tokens(self, _session_id):
+            return 32768
+
+        async def complete(self, _session_id, _payload):
+            raise AssertionError("not called")
+
+    llm = _AdapterLLM(
+        _Adapter(),
+        session_id="group=-1/rollout=0",
+        max_context=63488,
+        turn_max_tokens=16384,
     )
+    assert llm.get_model_output_limit() == 32768
+
+
+def test_the_module_default_is_only_a_fallback():
+    """None means the adapter has no session to report on (not yet open, or closed),
+    which is not a reason to tell the model nothing."""
+    assert _adapter_llm(_reply("x", "end_turn")).get_model_output_limit() == 16384
+
+
+def test_the_request_body_carries_no_max_tokens():
+    """Sending one reads as though it sets the cap; the adapter ignores it."""
+    from torchtitan.experiments.rl.harness.agents.terminus import _AdapterLLM
+
+    seen: dict = {}
+
+    class _Adapter:
+        def session_max_tokens(self, _session_id):
+            return None
+
+        async def complete(self, _session_id, payload):
+            seen.update(payload)
+            return _reply("<response/>", "end_turn")
+
+    llm = _AdapterLLM(
+        _Adapter(),
+        session_id="group=-1/rollout=0",
+        max_context=63488,
+        turn_max_tokens=16384,
+    )
+    asyncio.run(llm.call(prompt="go"))
+
+    assert "max_tokens" not in seen
 
 
 def test_an_exhausted_context_raises_its_own_error():

@@ -431,6 +431,22 @@ class AnthropicAdapter:
             return []
         return list(session.turns)
 
+    def session_max_tokens(self, sid: str) -> int | None:
+        """The per-turn generation cap this session actually samples under.
+
+        ``max_tokens`` in the request body is NOT read -- generation is driven by the
+        ``SamplingConfig`` the rollouter opened the session with -- so a harness that
+        wants to tell the model its own limit has to ask for it rather than assume the
+        number it sent applies. Reading it off the config keeps the two from drifting:
+        the 27B recipe raises the cap to 32768 while the terminus default is 16384,
+        and quoting the wrong one at the model wastes half the budget on every
+        truncation retry.
+
+        ``None`` when the session is unknown or closed; the caller keeps its default.
+        """
+        session = self.store.get(sid)
+        return None if session is None else session.sampling.max_tokens
+
     async def complete(self, sid: str, body: dict) -> dict | None:
         """Run one Anthropic ``/v1/messages`` turn in-process (no HTTP).
 

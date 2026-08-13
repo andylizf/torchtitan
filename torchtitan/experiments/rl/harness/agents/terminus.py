@@ -71,7 +71,9 @@ _PARSER = os.environ.get("TMAX_TERMINUS_PARSER", "xml")
 _DEFAULT_MAX_TURNS = int(os.environ.get("TMAX_TERMINUS_MAX_TURNS", "64"))
 # Terminus-2 asks the backend for a context limit to decide when to summarize.
 _MAX_CONTEXT = int(os.environ.get("SWE_MAX_CONTEXT_LEN", "63488"))
-# Per-turn generation cap; the adapter clamps it to the remaining context budget.
+# Fallback for the per-turn cap quoted to the model. The real cap is the session's
+# SamplingConfig (see _AdapterLLM.get_model_output_limit); this only applies when the
+# adapter cannot be asked, e.g. before the session is open.
 _TURN_MAX_TOKENS = int(os.environ.get("TMAX_TURN_MAX_TOKENS", "16384"))
 # See the module docstring: upstream defaults this on, and on a 9B it is lethal.
 _SUMMARIZE = os.environ.get("TMAX_TERMINUS_SUMMARIZE", "0") == "1"
@@ -131,7 +133,14 @@ class _AdapterLLM:
         # Terminus-2 puts this number in the retry it sends after a truncated turn
         # ("you exceeded N tokens, break it into chunks"). None degrades that to
         # "the maximum output length", which the model cannot act on.
-        return self._turn_max_tokens
+        #
+        # Ask the adapter rather than quoting TMAX_TURN_MAX_TOKENS: generation runs on
+        # the SamplingConfig the rollouter opened the session with, and a recipe can
+        # set that independently -- the 27B one raises it to 32768 against this
+        # module's 16384 default. Quoting the smaller number tells the model to chunk
+        # under half the budget it actually has.
+        session_max_tokens = self._adapter.session_max_tokens(self._session_id)
+        return session_max_tokens or self._turn_max_tokens
 
     async def call(self, prompt: str, message_history=None, **_kwargs):
         from harbor.llms.base import (  # type: ignore
@@ -146,13 +155,12 @@ class _AdapterLLM:
             )
         messages = list(message_history or [])
         messages.append({"role": "user", "content": prompt})
+        # No max_tokens: the adapter does not read it from the body (generation runs
+        # on the session's SamplingConfig), and sending it reads as though it sets the
+        # cap. See get_model_output_limit for where the real one comes from.
         reply = await self._adapter.complete(
             self._session_id,
-            {
-                "messages": messages,
-                "max_tokens": self._turn_max_tokens,
-                "stream": False,
-            },
+            {"messages": messages, "stream": False},
         )
         if reply is None:
             # The session is closed or the generator yielded nothing; ending the
