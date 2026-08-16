@@ -49,7 +49,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import init_logger
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig, ParallelConfig
-from vllm.config.compilation import CompilationMode
+from vllm.config.compilation import CompilationMode, PassConfig
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -121,14 +121,24 @@ def _install_flashinfer_allreduce_import_stub() -> None:
 
     module = types.ModuleType(module_name)
 
+    def _disabled(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            "FlashInfer all-reduce is disabled in TorchTitan's "
+            "torchtitan_wrapper generator path."
+        )
+
     class FlashInferAllReduce:
         def __init__(self, *args: object, **kwargs: object) -> None:
-            raise RuntimeError(
-                "FlashInfer all-reduce is disabled in TorchTitan's "
-                "torchtitan_wrapper generator path."
-            )
+            _disabled()
 
     module.FlashInferAllReduce = FlashInferAllReduce
+    # TP>1 additionally pulls in the allreduce+rmsnorm fusion pass, which imports
+    # the workspace helpers from this module at import time. Stub them too: the
+    # getters raise if something actually tries to allocate a FlashInfer
+    # workspace, while destroy is a no-op so teardown paths stay safe.
+    module.get_fi_ar_workspace = _disabled
+    module.get_fi_ar_quant_workspace = _disabled
+    module.destroy_fi_ar_workspace = lambda *args, **kwargs: None
     sys.modules[module_name] = module
 
 
@@ -350,6 +360,16 @@ class VLLMCudagraphConfig:
             cudagraph_mode=self.mode,
             mode=CompilationMode.NONE,
             cudagraph_capture_sizes=sizes,
+            # Off because it is unreachable here and, at TP>1, fatal. vLLM resolves
+            # it truthy even at CompilationMode.NONE, and VllmConfig.__post_init__ ->
+            # _set_compile_ranges then asks flashinfer for its allreduce-fusion size
+            # -- but only for world sizes 2/4/8, which is why TP-1 never sees it. In
+            # some deployment conda environments that import lands on an incomplete
+            # flashinfer_all_reduce ("cannot import name destroy_fi_ar_workspace
+            # ... (unknown location)") and every generator dies at engine init.
+            # Nothing is lost: this codebase already runs TP>1 with
+            # disable_custom_all_reduce.
+            pass_config=PassConfig(fuse_allreduce_rms=False),
         )
 
 

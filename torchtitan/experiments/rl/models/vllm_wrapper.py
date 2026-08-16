@@ -133,6 +133,57 @@ def _patch_vllm_all_reduce() -> None:
     )
 
 
+def _set_inference_core_sharding(model_config, *, tp: int) -> None:
+    """Attach the head-sharded TP ShardingConfig to the injected GDN inference core.
+
+    ``GatedDeltaNet._forward_generation`` calls ``inference_core(mixed_qkv_BTC,
+    a_BTHv, b_BTHv, A_log=, dt_bias=, conv_weight=, conv_bias=)`` and feeds the result straight to
+    ``RMSNormGated``, whose plan expects Shard(2) on the head dim. The core runs the
+    vLLM/fla kernels on rank-local tensors, so it needs the same local_map boundary
+    the training kernel uses (see ``qwen3_5/sharding.py`` ``deltanet_cfg.kernel``):
+    activations Shard(2) on the head/channel dim, per-head params Shard(0).
+    """
+    if tp <= 1:
+        return
+
+    import spmd_types as spmd
+
+    from torchtitan.models.common.decoder_sharding import (
+        dense_activation_placement,
+        dense_param_placement,
+    )
+    from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
+
+    act = dense_activation_placement(tp=spmd.S(2))
+
+    for layer_cfg in model_config.layers:
+        delta_net_cfg = getattr(layer_cfg, "delta_net", None)
+        core_cfg = getattr(delta_net_cfg, "inference_core", None)
+        if core_cfg is None:
+            continue
+        # ONLY the positional args go through local_map. The keyword-only args
+        # (A_log / dt_bias / conv_weight / conv_bias) are NOT converted by it --
+        # declaring them here just re-wraps them with from_local, so the core would
+        # receive a DTensor and read its GLOBAL width. GatedDeltaNet already hands
+        # those in rank-local (see _fused_conv_weight_bias / _local).
+        arg_placements = {
+            "mixed_qkv_BTC": act,
+            "a_BTHv": act,
+            "b_BTHv": act,
+        }
+        # mixed_qkv_BTC is handed in already rank-local (GatedDeltaNet cats the
+        # local q/k/v slices), so declare its incoming placement: from_local wraps
+        # it with no collective and local_map returns the same local tensor.
+        core_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={"mixed_qkv_BTC": act},
+            in_dst_shardings=dict(arg_placements),
+            out_src_shardings=act,
+            local_map=LocalMapConfig(
+                in_grad_placements=tuple(arg_placements.values()),
+            ),
+        )
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -278,6 +329,13 @@ class VLLMModelWrapper(Module):
 
         self.config.update_from_config(
             config=_InferenceConfig(parallelism=training_parallelism)
+        )
+        # update_from_config fills the model's own sharding configs, but the GDN
+        # inference core is injected by this wrapper, so its ShardingConfig is ours
+        # to set. Without it the core returns a plain tensor that reads as
+        # Replicate and RMSNormGated (which expects Shard(2)) rejects it.
+        _set_inference_core_sharding(
+            self.config, tp=training_parallelism.tensor_parallel_degree
         )
 
         # Apply config overrides (e.g. the fused gate+up SwiGLU) after

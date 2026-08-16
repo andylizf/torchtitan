@@ -17,7 +17,8 @@ from fla.ops.gated_delta_rule import (
     fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
 )
 from torch import nn
-from torch.distributed.tensor import DTensor
+
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental import local_map
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
@@ -388,6 +389,62 @@ class GatedDeltaKernel(Module):
         return out
 
 
+
+def _tp_local_param(t: torch.Tensor | None) -> torch.Tensor | None:
+    """Rank-local out-channel slice of one conv weight.
+
+    ``to_local()`` alone is not enough: the weight is only rank-local if it
+    is actually Shard(0) on the TP axis. In the generator (wrapper) path it
+    can arrive Replicate, and then ``to_local()`` hands back the full
+    out-channel range -- which the fused conv would run against rank-local
+    activations. Slice explicitly in that case.
+    """
+    if not isinstance(t, DTensor):
+        return t
+    local = t.to_local()
+    mesh = t.device_mesh
+    names = mesh.mesh_dim_names or ()
+    if "tp" not in names:
+        return local
+    axis = names.index("tp")
+    placement = t.placements[axis]
+    if isinstance(placement, Shard) and placement.dim == 0:
+        return local
+    tp_size = mesh.size(axis)
+    if tp_size == 1:
+        return local
+    if local.size(0) % tp_size:
+        raise ValueError(
+            f"conv weight out-channels {local.size(0)} not divisible by "
+            f"tp={tp_size}"
+        )
+    chunk = local.size(0) // tp_size
+    start = mesh.get_local_rank(axis) * chunk
+    return local[start : start + chunk]
+
+
+
+def _tp_local_last_dim(t: torch.Tensor) -> torch.Tensor:
+    """Rank-local slice of a colwise activation (sharded on its last dim)."""
+    if not isinstance(t, DTensor):
+        return t
+    local = t.to_local()
+    mesh = t.device_mesh
+    names = mesh.mesh_dim_names or ()
+    if "tp" not in names:
+        return local
+    axis = names.index("tp")
+    placement = t.placements[axis]
+    if isinstance(placement, Shard) and placement.dim in (t.dim() - 1, -1):
+        return local
+    tp_size = mesh.size(axis)
+    if tp_size == 1:
+        return local
+    chunk = local.size(-1) // tp_size
+    start = mesh.get_local_rank(axis) * chunk
+    return local[..., start : start + chunk]
+
+
 class GatedDeltaNet(Module):
     """Gated DeltaNet linear attention.
 
@@ -461,34 +518,48 @@ class GatedDeltaNet(Module):
         # Packed samples: the causal conv window must not cross sample boundaries
         # (else the first conv_kernel_size-1 tokens of each sample see the previous
         # one). fla's causal_conv1d resets at cu_seqlens. Flatten [B, L, C] channels-
-        # last -> [1, B*L, C]; depthwise weight [C, 1, k] -> [C, k]. cu_seqlens is only
-        # built under packing (FSDP, non-TP activations), so x is a plain tensor here.
+        # last -> [1, B*L, C]; depthwise weight [C, 1, k] -> [C, k].
         if cu_seqlens is not None:
-            # TODO(qwen3.5-gdn): support packed GDN under TP. The varlen FLA conv
-            # path flattens the sequence and currently assumes local activations;
-            # TP needs a local_map/placement-preserving version instead of
-            # materializing full tensors or rejecting DTensor activations.
-            assert not isinstance(
-                x, DTensor
-            ), "packed GDN conv (cu_seqlens) assumes non-TP (FSDP) activations"
             bs, seqlen, channels = x.shape
-            weight = conv.weight
-            bias = conv.bias
-            if isinstance(weight, DTensor):
-                weight = weight.full_tensor()
-            if isinstance(bias, DTensor):
-                bias = bias.full_tensor()
-            # fla's causal_conv1d is untyped (pyrefly reads it as a Tensor).
-            y = _fla_causal_conv1d(
-                x.reshape(1, bs * seqlen, channels),
-                weight=weight.squeeze(1),  # pyrefly: ignore [not-callable]
-                bias=bias,
-                activation="silu",
-                cu_seqlens=cu_seqlens,
+
+            def _varlen_conv(
+                x_in: torch.Tensor, w_in: torch.Tensor, b_in: torch.Tensor | None
+            ) -> torch.Tensor:
+                # fla's causal_conv1d is untyped (pyrefly reads it as a Tensor).
+                y = _fla_causal_conv1d(
+                    x_in.reshape(1, bs * seqlen, -1),
+                    weight=w_in.squeeze(1),  # pyrefly: ignore [not-callable]
+                    bias=b_in,
+                    activation="silu",
+                    cu_seqlens=cu_seqlens,
+                )
+                if isinstance(y, tuple):
+                    y = y[0]
+                return y.reshape(bs, seqlen, -1)
+
+            if not isinstance(x, DTensor):
+                return _varlen_conv(x, conv.weight, conv.bias)
+            # Under TP the channels are sharded and this conv is depthwise, so
+            # running the varlen kernel on the local channel shard is exact -- the
+            # same argument the non-packed branch below relies on. cu_seqlens is a
+            # replicated plain index tensor (sequence boundaries, and SP allgathers
+            # the sequence before this layer), so it is closed over rather than
+            # mapped.
+            x_plc = x.placements
+            w_plc = conv.weight.placements  # pyrefly: ignore [missing-attribute]
+            b_plc = (
+                conv.bias.placements  # pyrefly: ignore [missing-attribute]
+                if isinstance(conv.bias, DTensor)
+                else None
             )
-            if isinstance(y, tuple):
-                y = y[0]
-            return y.reshape(bs, seqlen, channels)
+            conv_dt = local_map(
+                _varlen_conv,
+                out_placements=(x_plc,),
+                in_placements=(x_plc, w_plc, b_plc),
+                in_grad_placements=(x_plc, w_plc, b_plc),
+                device_mesh=x.device_mesh,
+            )
+            return conv_dt(x, conv.weight, conv.bias)  # pyrefly: ignore
 
         x = F.pad(x.transpose(1, 2), [self.conv_kernel_size - 1, 0])
         if isinstance(x, DTensor):
@@ -532,12 +603,25 @@ class GatedDeltaNet(Module):
         # fused conv vLLM's causal_conv1d kernels expect. Depthwise (per-channel
         # independent) -> concatenation is numerically identical to 3 convs.
         # Order [q | k | v] matches the mixed_qkv concat and vLLM's conv layout.
+        # Under TP each conv_* weight is a Shard(0) DTensor over out-channels.
+        # Concatenating along the shard dim would force a redistribute and yield the
+        # GLOBAL [q_all | k_all | v_all] layout, whose Shard(0) slice is NOT what the
+        # kernel needs ([q_local | k_local | v_local]). Go to local first, then cat.
         w = torch.cat(
-            [self.conv_q.weight, self.conv_k.weight, self.conv_v.weight], dim=0
+            [
+                _tp_local_param(self.conv_q.weight),
+                _tp_local_param(self.conv_k.weight),
+                _tp_local_param(self.conv_v.weight),
+            ],
+            dim=0,
         )
         w = w.view(w.size(0), w.size(-1))  # [C,1,k] -> [C,k]
         biases = [self.conv_q.bias, self.conv_k.bias, self.conv_v.bias]
-        bias = torch.cat(biases, dim=0) if biases[0] is not None else None
+        bias = (
+            torch.cat([_tp_local_param(b) for b in biases], dim=0)
+            if biases[0] is not None
+            else None
+        )
         return w, bias
 
     def _forward_generation(self, x: torch.Tensor) -> torch.Tensor:
@@ -552,15 +636,26 @@ class GatedDeltaNet(Module):
         xa = self.in_proj_a(x)
         xb = self.in_proj_b(x)
 
-        mixed_qkv = torch.cat([xq, xk, xv], dim=-1)
+        # Same trap as the conv weights: xq/xk/xv are colwise DTensors sharded on
+        # the last dim, so cat-ing along that dim forces a redistribute and yields
+        # the GLOBAL [q_all | k_all | v_all] layout. Re-slicing that per rank gives
+        # [q_all | half of k_all] -- right width, wrong content, silently wrong
+        # logprobs. Cat the rank-local pieces so the layout is
+        # [q_local | k_local | v_local], matching the fused conv weight.
+        mixed_qkv = torch.cat(
+            [_tp_local_last_dim(xq), _tp_local_last_dim(xk), _tp_local_last_dim(xv)],
+            dim=-1,
+        )
         conv_weight, conv_bias = self._fused_conv_weight_bias()
         # Reached only when inference_core is set (guarded in forward).
         output = self.inference_core(  # pyrefly: ignore [not-callable]
             mixed_qkv,
             xa,
             xb,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
+            # Keyword-only args bypass the inference core's local_map, so hand
+            # them in already rank-local (per-head Shard(0) under TP).
+            A_log=_tp_local_param(self.A_log),
+            dt_bias=_tp_local_param(self.dt_bias),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
         )  # [bs, seqlen, n_value_heads, value_head_dim]
@@ -585,17 +680,12 @@ class GatedDeltaNet(Module):
         cu_seqlens = (
             _cu_seqlens_from_positions(positions) if positions is not None else None
         )
-        # One segment ([0, L]) is mathematically identical to the non-packed path, and
-        # the varlen fla path can't shard activations; under TP/SP (DTensor activations)
-        # fall back to the non-packed (local_map) path. Parity only matters under FSDP
-        # (the generator runs TP=1). Multi-segment (real packing) keeps the fla+cu path
-        # and its existing non-TP assertion.
-        if (
-            cu_seqlens is not None
-            and cu_seqlens.numel() == 2
-            and isinstance(x, DTensor)
-        ):
-            cu_seqlens = None
+        # cu_seqlens is kept under TP as well: SP allgathers the sequence at this
+        # layer's boundary (in_dst_shardings maps x to Replicate), so the boundaries
+        # it names are intact on every rank, and _causal_conv now runs its varlen
+        # kernel through local_map on the channel shard. Dropping it under TP would
+        # stop the recurrence and conv resetting at packed-sample boundaries, which
+        # is a training-correctness bug, not just a parity one.
 
         # Shapes:
         #   xq, xk: (bs, seqlen, n_key_heads * key_head_dim)
@@ -865,6 +955,7 @@ class Qwen35Model(Decoder):
             set_qwen35_sharding_config(
                 self,
                 enable_ep=parallelism.expert_parallel_degree > 1,
+                enable_sp=parallelism.enable_sequence_parallel,
             )
 
         def get_nparams_and_flops(

@@ -140,17 +140,26 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
             speculative_config.num_speculative_tokens if speculative_config else 0
         )
 
-        # TODO(qwen3.5-gdn-unified-tp): support TP by passing local head counts
-        # and using the local fused conv/projection width. Current unified GDN
-        # generation is validated only for pure DP / TP=1.
-        if self.tp_size != 1:
-            raise ValueError(
-                "VLLMGatedDeltaNetCore currently supports tensor_parallel_size=1 "
-                f"only, got tensor_parallel_size={self.tp_size}."
-            )
-
-        self.num_k_heads = config.num_k_heads
-        self.num_v_heads = config.num_v_heads
+        # Head counts come from the model config, i.e. they are GLOBAL. Under TP
+        # the enclosing GatedDeltaNet is head-sharded (in_proj_* ColwiseParallel,
+        # conv weights Shard(0), out_proj RowwiseParallel), so every tensor this
+        # core sees is already rank-local: split offsets and head-dim reshapes
+        # must use LOCAL counts. The one exception is get_state_shape(), which
+        # takes the global counts plus tp_size and divides internally.
+        self.num_k_heads_global = config.num_k_heads
+        self.num_v_heads_global = config.num_v_heads
+        for name, heads in (
+            ("num_k_heads", self.num_k_heads_global),
+            ("num_v_heads", self.num_v_heads_global),
+        ):
+            if heads % self.tp_size:
+                raise ValueError(
+                    f"VLLMGatedDeltaNetCore needs {name} divisible by "
+                    f"tensor_parallel_size, got {name}={heads}, "
+                    f"tensor_parallel_size={self.tp_size}."
+                )
+        self.num_k_heads = self.num_k_heads_global // self.tp_size
+        self.num_v_heads = self.num_v_heads_global // self.tp_size
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
@@ -190,8 +199,8 @@ class VLLMGatedDeltaNetCore(Module, MambaBase):
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
-            self.num_k_heads,
-            self.num_v_heads,
+            self.num_k_heads_global,
+            self.num_v_heads_global,
             self.head_k_dim,
             self.head_v_dim,
             self.conv_kernel_size,
