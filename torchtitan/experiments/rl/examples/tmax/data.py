@@ -59,6 +59,20 @@ class TMaxSample:
     """That Dockerfile's COPY sources as {relpath: base64}, materialized next to
     the Dockerfile at build time. None when the Dockerfile needs no context."""
 
+    entrypoint: str | None = None
+    """The image's ENTRYPOINT with CMD as its arguments, as one shell command.
+
+    Sandbox backends exec commands directly and never run PID 1, so a task whose
+    environment is set up by its ENTRYPOINT (a localhost server standing in for a
+    hardcoded URL, an /etc/hosts entry, a daemon the instruction assumes) needs it
+    started explicitly before the agent. None when the Dockerfile declares none."""
+
+    agent_timeout_sec: float | None = None
+    """The task's own wall-clock budget for the agent (Harbor ``[agent].timeout_sec``).
+
+    Harbor states this per task, not per benchmark. None for corpora that do not
+    declare one, in which case the rollouter falls back to its configured default."""
+
     daytona_disk_gb: int | None = None
     """Optional per-task Daytona root-disk allocation in GiB."""
 
@@ -158,6 +172,8 @@ class TMaxDataset(Configurable):
                         image=image or "",
                         dockerfile=dockerfile,
                         build_context=build_context,
+                        entrypoint=md.get("entrypoint"),
+                        agent_timeout_sec=md.get("agent_timeout_sec"),
                         daytona_disk_gb=daytona_disk_gb,
                         workdir=md.get("workdir") or "/workspace",
                         problem_statement=md.get("problem_statement")

@@ -133,6 +133,10 @@ def _dispatcher(*, rank=0, dp_degree=1, tp_degree=1, dp_routing_strategy=None):
     [
         (1024, True, True, False, 2048),
         (8192, True, True, False, 8192),
+        # Long context under align-mode prefix caching: the budget is CAPPED so vLLM
+        # chunks the prefill (which align mode requires) instead of sizing its
+        # non-KV reserve from a 65536-token dummy forward.
+        (65536, True, True, False, 8192),
         (1024, False, True, False, None),
         (1024, True, False, False, None),
         (1024, True, False, True, 2048),

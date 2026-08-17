@@ -91,6 +91,27 @@ def _docker_image(task_dir: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _agent_timeout_sec(task_dir: str) -> float | None:
+    """Read ``[agent].timeout_sec`` from the task's task.toml, or None if absent.
+
+    Harbor states a wall-clock budget per task rather than one number for the whole
+    benchmark: across TB-2.0's 89 tasks it is 900s for 49 of them, 1800 for 16, 3600
+    for 12, 1200 for 6, 2400 for 2, and one each of 600, 750 and 12000. Ignoring it
+    and using a single fixed budget is wrong in both directions -- our 2400s default
+    gave over half the tasks 2.7x what they declare, and a 20th of what the longest
+    one does.
+    """
+    toml_path = os.path.join(task_dir, "task.toml")
+    if not os.path.exists(toml_path):
+        return None
+    with open(toml_path, encoding="utf-8") as f:
+        text = f.read()
+    # [agent] and [verifier] both carry timeout_sec; anchor on the [agent] section so
+    # the verifier's value is not picked up instead.
+    m = re.search(r"\[agent\][^\[]*?timeout_sec\s*=\s*([0-9.]+)", text, re.S)
+    return float(m.group(1)) if m else None
+
+
 def _workdir_from_dockerfile(task_dir: str) -> str:
     """Read the last ``WORKDIR`` from the task's environment Dockerfile.
 
@@ -158,6 +179,7 @@ def _to_row(task_id: str, task_dir: str, *, image_prefix: str) -> dict | None:
             "image": image,
             "workdir": _workdir_from_dockerfile(task_dir),
             "problem_statement": instruction,
+            "agent_timeout_sec": _agent_timeout_sec(task_dir),
             "tmax": {
                 "test_sh": test_sh,
                 "fixtures": _collect_fixtures(task_dir),

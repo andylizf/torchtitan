@@ -33,7 +33,9 @@ last turn's ``env_rewards`` (key ``tmax_reward``) and read back by ``RewardTMax`
 Knobs read from env (the launcher sets these; see ``submit_swe_tmax_9b.sh``):
   ``SHIM_BIND_HOST`` / ``SHIM_PORT``  adapter bind address (default 127.0.0.1:18001)
   ``SWE_TIME_BUDGET_SEC``             per-agent wallclock (default 2400)
-  ``TMAX_EVAL_TIMEOUT_SEC``           verifier run timeout (default 900)
+  ``TMAX_EVAL_TIMEOUT_SEC``           verifier (test.sh) run timeout, applied to
+                                      TRAINING and validation rollouts alike
+                                      (default 600)
   ``SWE_MAX_CONTEXT_LEN``             model context budget for the adapter session
   ``SWE_ROLLOUT_CONCURRENCY``         concurrently-active rollouts (default 16)
   ``TMAX_CALL_LIMIT``                 Vanillux step cap (its per-turn token cap is a
@@ -64,6 +66,7 @@ import json
 import logging
 import math
 import os
+import shlex
 import statistics
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -335,6 +338,52 @@ class _RootSandbox:
         return await self._inner.read_file(sandbox_path, user="root")
 
 
+# Floor applied ONLY to a task's own declared agent budget (Harbor
+# ``[agent].timeout_sec``). Today that means the TB-2.0 eval set --
+# ``prepare_tb2_data`` extracts the declaration; RTS/TerminalWorld training rows carry
+# none and keep the configured ``time_budget_sec``, so training throughput stays under
+# launcher control while eval gets the wall clock its tasks actually need.
+#
+# A declared budget is raised to the floor, never lowered: TB-2.0 declares 900s for 49
+# of its 89 tasks, which is nowhere near what a 120-turn Terminus-2 episode needs in a
+# 2 vCPU sandbox. Measured over a full step-0 pass, only ~2% of the wall clock is token
+# generation (11,927 completion tokens at ~200 tok/s = 60s); ~98% is in-sandbox command
+# execution -- apt, pip, pytest, tmux round trips.
+_DECLARED_AGENT_BUDGET_FLOOR_SEC = int(
+    os.environ.get("SWE_AGENT_TIMEOUT_FLOOR_SEC", "7200")
+)
+
+# Seconds to let an ENTRYPOINT reach a state the agent can use. It is a startup
+# script, not a health-checked service: the ones in these corpora bind a local port
+# or append to /etc/hosts and are ready well inside this, and there is no generic
+# readiness signal to wait on instead.
+_ENTRYPOINT_SETTLE_SEC = 2.0
+_ENTRYPOINT_LOG = "/tmp/.titan_entrypoint.log"
+
+
+async def _start_entrypoint(sb: Sandbox, command: str, *, workdir: str) -> None:
+    """Start the image ENTRYPOINT in the background, as PID 1 would.
+
+    Detached (``setsid``, every fd redirected) so it outlives this exec instead of
+    holding it open: the command is typically a script whose tail is ``exec "$@"``,
+    which never returns. Best-effort -- a task whose ENTRYPOINT fails scores what it
+    scores, and the oracle-validation pass over the corpus already measures that.
+    """
+    rc, _out, err = await sb.exec(
+        f"cd {shlex.quote(workdir)} 2>/dev/null || cd /; "
+        f"setsid nohup {command} > {_ENTRYPOINT_LOG} 2>&1 < /dev/null &",
+        user="root",
+        check=False,
+        timeout=120,
+    )
+    if rc != 0:
+        logger.warning(
+            f"[tmax] entrypoint start returned {rc}: {command[:200]!r} "
+            f"stderr={(err or '')[-200:]!r}"
+        )
+    await asyncio.sleep(_ENTRYPOINT_SETTLE_SEC)
+
+
 class _RolloutIssueGate:
     """Work-conserving async gate for sibling rollouts in one worker process.
 
@@ -491,7 +540,9 @@ class TMaxRollouter(Rollouter):
             or os.environ.get("TMAX_CTRF_DIAGNOSTICS", "0") == "1"
         )
         # Whole-rollout wall-clock guard: agent budget + eval + boot buffer.
-        self._guard_sec = self._time_budget_sec + self._eval_timeout_sec + 300
+        # Fallback guard; a rollout whose task declares its own budget derives its
+        # own (see _agent_budget_sec / _guard_for).
+        self._guard_sec = self._guard_for(self._time_budget_sec)
         # Per-worker rollout-issue gate (one rollouter per worker proc). Each sibling
         # holds one slot, matching open-instruct's per-rollout environment acquire and
         # release. Ordering is per worker. The controller pins group-loop lanes to
@@ -694,6 +745,29 @@ class TMaxRollouter(Rollouter):
         except OSError as e:
             logger.warning(f"[tmax] zero-std annotate failed for {dump_dir}: {e}")
 
+    def _guard_for(self, budget_sec: int) -> int:
+        """Whole-rollout wall-clock guard for an agent budget: + verifier + boot."""
+        return budget_sec + self._eval_timeout_sec + 300
+
+    def _agent_budget_sec(self, sample: TMaxSample) -> int:
+        """Wall-clock budget for this task's agent, in seconds.
+
+        A task that declares its own budget (TB-2.0) gets
+        ``max(declared, _DECLARED_AGENT_BUDGET_FLOOR_SEC)`` -- the floor only ever
+        raises, so a task asking for more keeps its own value. The declared numbers are
+        sized for a human or a fast local runner, not for a 120-turn Terminus-2 episode
+        whose wall clock is ~98% in-sandbox command execution.
+
+        A task that declares nothing (RTS, TerminalWorld) gets the configured
+        ``time_budget_sec`` unchanged: training throughput is a launcher decision, and
+        raising it there would triple the wall clock of every rollout that currently
+        stops at the budget (47% of them, measured on a TB-2.0 pass).
+        """
+        declared = sample.agent_timeout_sec
+        if declared is None:
+            return self._time_budget_sec
+        return max(int(declared), _DECLARED_AGENT_BUDGET_FLOOR_SEC)
+
     async def _run_agent_rollout(
         self,
         *,
@@ -758,7 +832,8 @@ class TMaxRollouter(Rollouter):
                 routing_session_id=rollout_id,
                 max_context_tokens=self._max_context_tokens,
             )
-            async with asyncio.timeout(self._guard_sec) as rollout_timeout:
+            budget_sec = self._agent_budget_sec(sample)
+            async with asyncio.timeout(self._guard_for(budget_sec)) as rollout_timeout:
                 # host_loop drives the sandbox with bash directly; it never runs the
                 # Claude Code CLI, so skip the curl-based install (the tmax task
                 # images have no curl, which would otherwise fail every boot).
@@ -773,6 +848,13 @@ class TMaxRollouter(Rollouter):
                     # Force every tool command to run as root (tmax tasks touch
                     # system paths); the faithful Vanillux loop dispatches bash here.
                     root_sb = _RootSandbox(sandbox)
+                    # Docker would have run this as PID 1 before anything else; our
+                    # backends exec commands directly, so start it here or every
+                    # task that depends on it is unsolvable.
+                    if sample.entrypoint:
+                        await _start_entrypoint(
+                            root_sb, sample.entrypoint, workdir=sample.workdir
+                        )
                     # Seed the agent-facing inputs (environment/seeds/* -> /workspace)
                     # BEFORE the agent runs -- upstream seeds at reset. Without this,
                     # seed-bearing tasks are unsolvable (inputs absent during rollout).
@@ -784,7 +866,7 @@ class TMaxRollouter(Rollouter):
                             instruction=sample.problem_statement,
                             session_id=rollout_id,
                             adapter=adapter,
-                            time_budget_sec=self._time_budget_sec,
+                            time_budget_sec=budget_sec,
                             workdir=sample.workdir,
                         )
                     )

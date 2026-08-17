@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import base64
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset
+from torchtitan.experiments.rl.examples.tmax.data import TMaxDataset, TMaxSample
 from torchtitan.experiments.rl.examples.tmax.prepare_rts_data import (
+    _entrypoint_command,
     _oracle_commands,
     build_rows,
 )
@@ -136,6 +138,59 @@ def test_local_copy_sources_are_carried_as_build_context(tmp_path):
     # Base64 so binary COPY sources survive the JSONL round-trip.
     assert base64.b64decode(ctx["seed.bin"]) == b"\x00\x01\x02binary"
     assert base64.b64decode(ctx["fixtures/a.txt"]) == b"hello"
+
+
+@pytest.mark.parametrize(
+    "dockerfile,expected",
+    [
+        # Exec form, no CMD: sleep infinity stands in for "$@".
+        (
+            'FROM ubuntu:22.04\nWORKDIR /app\nENTRYPOINT ["/entrypoint.sh"]\n',
+            "/entrypoint.sh sleep infinity",
+        ),
+        # CMD supplies the arguments the entrypoint execs.
+        (
+            'FROM ubuntu:22.04\nWORKDIR /app\nENTRYPOINT ["/entrypoint.sh"]\n'
+            'CMD ["sleep", "3600"]\n',
+            "/entrypoint.sh sleep 3600",
+        ),
+        # Shell form is what docker wraps in /bin/sh -c.
+        (
+            "FROM ubuntu:22.04\nWORKDIR /app\nENTRYPOINT /start.sh --serve\n",
+            "/bin/sh -c '/start.sh --serve' sleep infinity",
+        ),
+        # Last ENTRYPOINT wins, as in docker.
+        (
+            'FROM ubuntu:22.04\nENTRYPOINT ["/a.sh"]\nENTRYPOINT ["/b.sh"]\n',
+            "/b.sh sleep infinity",
+        ),
+        # A CMD-only image has nothing to start: docker would run CMD as PID 1, but
+        # it is the container's main process, not environment setup.
+        ('FROM ubuntu:22.04\nCMD ["sleep", "infinity"]\n', None),
+        ("FROM ubuntu:22.04\nWORKDIR /app\n", None),
+    ],
+)
+def test_entrypoint_command(dockerfile, expected):
+    assert _entrypoint_command(dockerfile) == expected
+
+
+def test_entrypoint_reaches_the_row_and_the_dataset(tmp_path):
+    """The rollouter reads it off TMaxSample, so it has to survive the JSONL."""
+    root = tmp_path / "tasks"
+    root.mkdir()
+    _write_task(
+        root,
+        "rts_task_jjj",
+        dockerfile='FROM ubuntu:22.04\nWORKDIR /app\nENTRYPOINT ["/entrypoint.sh"]\n',
+    )
+
+    rows, _reasons = build_rows([str(root)])
+    assert rows[0]["metadata"]["entrypoint"] == "/entrypoint.sh sleep infinity"
+
+    path = tmp_path / "rts.jsonl"
+    path.write_text(json.dumps(rows[0]) + "\n")
+    dataset = TMaxDataset(TMaxDataset.Config(data_path=str(path), shuffle=False))
+    assert next(iter(dataset)).entrypoint == "/entrypoint.sh sleep infinity"
 
 
 def test_agent_runtime_is_not_injected_by_default(tmp_path):
@@ -348,3 +403,47 @@ def test_dataset_loads_a_dockerfile_only_row(tmp_path):
     )
     with pytest.raises(ValueError, match="missing image/dockerfile/tmax"):
         TMaxDataset(TMaxDataset.Config(data_path=str(bad), shuffle=False))
+
+
+@pytest.mark.parametrize(
+    "declared,expected",
+    [
+        # TB-2.0's common values are all below the floor, so they are raised to it:
+        # the declared numbers are sized for a fast local runner, not for a 120-turn
+        # episode whose wall clock is ~98% in-sandbox command execution.
+        (900.0, 7200),
+        (1800.0, 7200),
+        (3600.0, 7200),
+        (7200.0, 7200),
+        # Above the floor -> its own value is kept (the floor only ever raises).
+        (12000.0, 12000),
+        # Corpora that declare nothing (RTS, TerminalWorld) keep the configured
+        # budget: training wall clock stays a launcher decision.
+        (None, 2400),
+    ],
+)
+def test_agent_budget_policy(declared, expected):
+    from torchtitan.experiments.rl.examples.tmax.rollouter import TMaxRollouter
+
+    sample = TMaxSample(
+        instance_id="t",
+        image="img",
+        workdir="/app",
+        problem_statement="do it",
+        agent_timeout_sec=declared,
+        tmax={"test_sh": "x"},
+    )
+    rollouter = SimpleNamespace(
+        _time_budget_sec=2400,
+        _agent_budget_sec=TMaxRollouter._agent_budget_sec,
+    )
+    assert TMaxRollouter._agent_budget_sec(rollouter, sample) == expected
+
+
+def test_guard_covers_the_agent_budget():
+    """The whole-rollout guard must not cut a raised budget short."""
+    from torchtitan.experiments.rl.examples.tmax.rollouter import TMaxRollouter
+
+    rollouter = SimpleNamespace(_eval_timeout_sec=600)
+    guard = TMaxRollouter._guard_for(rollouter, 7200)
+    assert guard > 7200 and guard == 7200 + 600 + 300

@@ -90,18 +90,17 @@ _MAX_CONTEXT_BYTES = 1 << 20
 
 _DEFAULT_WORKDIR = "/app"
 
-# Terminus-2 drives a live tmux pane, so a task image without tmux fails every
-# rollout at session bring-up. RTS ships this step in its own Dockerfiles; corpora
-# that carry the upstream task content verbatim (e.g. TerminalWorld-Seeds) do not,
-# hence --inject-agent-runtime.
+# A latency optimization, NOT a requirement. Terminus-2 installs tmux itself at
+# session bring-up (harbor ``TmuxSession.start`` -> ``_attempt_tmux_installation``:
+# package manager first, then a from-source build), so an image without tmux is not
+# unsolvable. Measured against un-injected TerminalWorld-Seeds images, harbor's
+# runtime install succeeded on 6/6 bases -- ubuntu:16.04 5.0s, centos:7 (yum) 10.9s,
+# ubuntu:22.04 9.1s. Baking the step in moves those seconds off every rollout and
+# onto the once-per-Dockerfile Daytona build, at the cost of coupling the JSONL to
+# one harness; hence opt-in, off by default.
 #
-# The distro branches matter: a third of these corpora sit on images whose mirrors
-# are gone (centos:7 -> mirrorlist.centos.org, ubuntu:16.04 and debian buster/
-# stretch -> their archives), so a bare `apt-get update && apt-get install tmux`
-# fails at build on them. Each branch retries once against the archive mirror.
-# Deliberately fatal when tmux still cannot be installed: a silently tmux-less
-# image is worse than an unbuildable task, since the failure then surfaces per
-# rollout as an opaque "Failed to start tmux session".
+# The archive-mirror rewrites keep the EOL bases (centos:7, ubuntu:16.04, debian
+# buster/stretch) buildable if their default mirrors go away.
 _AGENT_RUNTIME_BLOCK = """
 # harbor-agent-runtime: tmux is required by the terminal agent
 RUN if command -v tmux >/dev/null 2>&1; then \\
@@ -161,6 +160,54 @@ def _workdir_from_dockerfile(text: str) -> str:
         if m:
             workdir = m.group(1)
     return workdir
+
+
+def _argv_from_instruction(rest: str) -> list[str]:
+    """Parse the argument of an ENTRYPOINT/CMD into argv.
+
+    Both take an exec form (``["/entrypoint.sh", "-x"]``, a JSON array) and a shell
+    form (``/entrypoint.sh -x``, which docker wraps in ``/bin/sh -c``).
+    """
+    rest = rest.strip()
+    if rest.startswith("["):
+        try:
+            argv = json.loads(rest)
+        except json.JSONDecodeError:
+            return []
+        return [str(a) for a in argv] if isinstance(argv, list) else []
+    return ["/bin/sh", "-c", rest]
+
+
+def _entrypoint_command(dockerfile: str) -> str | None:
+    """The image's ENTRYPOINT as a shell command, or None when it has none.
+
+    Docker runs ENTRYPOINT as PID 1 with CMD appended as its arguments; our sandbox
+    backends exec commands directly and never run it. Tasks that rely on it (serving
+    a bundled file over localhost, seeding /etc/hosts, starting a daemon the
+    instruction assumes) are then unsolvable no matter what the agent does, and
+    their own reference solution scores 0 -- which is the whole gap between this
+    corpus's published oracle pass rate and ours.
+
+    CMD supplies ``"$@"`` for the near-universal ``exec "$@"`` tail. ``sleep
+    infinity`` stands in when there is no CMD, so that tail has something to exec
+    that neither exits nor does anything.
+    """
+    text = _strip_comments(_join_continuations(dockerfile))
+    entry: list[str] = []
+    cmd: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"\s*(ENTRYPOINT|CMD)\s+(.+)$", line, re.I)
+        if not m:
+            continue
+        # Last one wins, as in docker.
+        argv = _argv_from_instruction(m.group(2))
+        if m.group(1).upper() == "ENTRYPOINT":
+            entry = argv
+        else:
+            cmd = argv
+    if not entry:
+        return None
+    return shlex.join(entry + (cmd or ["sleep", "infinity"]))
 
 
 def _build_context(env_dir: str, dockerfile: str) -> dict[str, str]:
@@ -311,6 +358,9 @@ def _to_row(
     }
     if build_context:
         metadata["build_context"] = build_context
+    entrypoint = _entrypoint_command(dockerfile)
+    if entrypoint:
+        metadata["entrypoint"] = entrypoint
     return {"prompt": instruction, "label": task_id, "metadata": metadata}, "ok"
 
 
