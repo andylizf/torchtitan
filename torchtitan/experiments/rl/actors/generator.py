@@ -83,6 +83,26 @@ def _flash_attention_kernels_available() -> bool:
     return True
 
 
+# Scheduler token budget for GDN models under align-mode prefix caching. Chunked
+# prefill is required there, so this is a real per-step budget rather than a
+# "never chunk" sentinel.
+_GDN_ALIGN_MAX_NUM_BATCHED_TOKENS = 8192
+
+
+def _state_dict_local_gib(state_dict: dict) -> float:
+    """Local (this-rank) byte size of a state dict, in GiB. Counts the bytes each
+    rank actually moves over the wire on a pull -- DTensor values report their local
+    shard, plain tensors their full size. Used to turn the [pull-timing] transfer
+    seconds into an achieved GB/s so the fabric throughput is measured, not guessed."""
+    total_bytes = 0
+    for value in state_dict.values():
+        if not isinstance(value, torch.Tensor):
+            continue
+        local = value.to_local() if hasattr(value, "to_local") else value
+        total_bytes += local.numel() * local.element_size()
+    return total_bytes / (1024**3)
+
+
 def _resolve_max_num_batched_tokens(
     *,
     max_model_len: int,
@@ -91,11 +111,27 @@ def _resolve_max_num_batched_tokens(
     gdn_trainer_parity: bool,
 ) -> int | None:
     """Return the vLLM scheduler override required by hybrid GDN modes."""
-    if gdn_trainer_parity or (prefix_caching_enabled and has_gdn_layers):
-        # Parity needs unchunked prefill. Align-mode prefix caching also pads
-        # the Mamba page to 1056 tokens for Qwen3.5-35B-A3B, so retain vLLM's
-        # 2048-token default floor even when max_model_len is shorter.
+    if gdn_trainer_parity:
+        # Bitwise parity needs the whole prefill in ONE scheduler step: GDN's
+        # chunk-parallel prefill recurs a state over the sequence, and a state
+        # recurred over two vLLM chunks is not bitwise equal to one recurred over
+        # the full prefix, so the trainer's logprobs stop matching.
         return max(max_model_len, 2048)
+    if prefix_caching_enabled and has_gdn_layers:
+        # NOT max_model_len here. vLLM's align-mode Mamba prefix caching (the mode
+        # it selects for these models) *requires* chunked prefill -- see
+        # MambaModelConfig.verify_and_update_config: `assert
+        # enable_chunked_prefill, "Chunked prefill is required for mamba cache mode
+        # 'align'"` -- because align checkpoints the GDN state on KV-block
+        # boundaries. Pinning the budget to max_model_len therefore bought nothing
+        # and cost twice: vLLM sizes its non-KV reserve from a dummy forward of this
+        # many tokens (measured on the 27B: a 65536 budget left 28.06 GiB of KV
+        # where 8192 leaves ~35 GiB), and a single 65536-token prefill fills a whole
+        # scheduler step, so no decode runs in it. Kept well above the 1056-token
+        # Mamba page so a page still fits in one step. Written as a cap, not a flat
+        # constant, so a short-context model keeps its old budget (its whole prefill
+        # already fits one step) and only long contexts start chunking.
+        return max(2048, min(_GDN_ALIGN_MAX_NUM_BATCHED_TOKENS, max_model_len))
     return None
 
 
@@ -849,6 +885,18 @@ class VLLMGenerator(Actor, Configurable):
         Every generation call is queued for execution by the `engine_loop`. A higher value enables buffering
         of more requests to avoid a prefill between every engine decode step, which is inefficient."""
 
+        overlap_weight_fetch: bool = False
+        """Overlap the weight-pull FETCH (network -> staging buffer) with ongoing
+        generation, so only the APPLY (staging -> live model) pauses the engine.
+        Without it, a pull is one engine-loop decision that blocks generation for the
+        whole fetch+apply. With it, the loop starts the fetch as a background task,
+        keeps issuing STEP bursts (generation continues) until the fetch completes,
+        then applies. The fetch writes a SEPARATE staging buffer (never the live
+        weights), so in-flight decodes keep reading consistent weights. Off (default)
+        keeps the historical blocking pull. Same idea as a production async sampler's
+        fetch-on-thread / apply-in-loop split. NOTE: pending multi-GPU validation of the
+        collective apply coordination across TP ranks."""
+
         # TODO: check if we should put these under WeightSyncConfig
         reset_prefix_cache_on_weight_sync: bool = True
         """Drop the prefix cache when weights change so new requests don't reuse KV computed under the old
@@ -1174,9 +1222,11 @@ class VLLMGenerator(Actor, Configurable):
                 backend=(
                     AttentionBackendEnum[_backend_override]
                     if _backend_override
-                    else AttentionBackendEnum.FLEX_ATTENTION
-                    if isinstance(inner_attn, FlexAttention.Config)
-                    else AttentionBackendEnum.CUSTOM
+                    else (
+                        AttentionBackendEnum.FLEX_ATTENTION
+                        if isinstance(inner_attn, FlexAttention.Config)
+                        else AttentionBackendEnum.CUSTOM
+                    )
                 ),
             )
             vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
@@ -1221,6 +1271,12 @@ class VLLMGenerator(Actor, Configurable):
         self._close_request: CloseRequest | None = None
 
         self._pull_model_state_dict_future: asyncio.Future[int] | None = None
+
+        # overlap_weight_fetch: the in-flight background fetch task (None when idle) and
+        # the version it is fetching. The loop keeps stepping (generating) while this is
+        # in flight, then applies its result. Each rank owns its own task.
+        self._pending_weight_fetch: asyncio.Task | None = None
+        self._pending_weight_fetch_version: int = 0
 
         # Background asyncio.Task running _engine_loop; None until the first generate/pull starts it.
         self._engine_loop_task: asyncio.Task | None = None
@@ -1381,6 +1437,30 @@ class VLLMGenerator(Actor, Configurable):
                     await self._pull_model_state_dict(decision.pull_version)
                     continue  # back to the start for the next decision
 
+                if decision.action is LoopAction.PULL_FETCH:
+                    # overlap_weight_fetch: each rank starts its own background fetch
+                    # into a staging buffer and returns to STEP, so generation keeps
+                    # running while weights transfer. The apply happens later, once
+                    # rank 0 sees the fetch is done and broadcasts PULL_APPLY.
+                    self._pending_weight_fetch_version = decision.pull_version
+                    self._pending_weight_fetch = asyncio.create_task(
+                        self._fetch_model_state_dict(
+                            decision.pull_version, overlap_safe=True
+                        )
+                    )
+                    continue
+
+                if decision.action is LoopAction.PULL_APPLY:
+                    # overlap_weight_fetch: the fetch is done -> apply staged weights to
+                    # the live model (the only part that pauses generation). Each rank
+                    # awaits its OWN fetch (may still be finishing) before applying.
+                    staged, get_secs, gib = await self._pending_weight_fetch
+                    self._pending_weight_fetch = None
+                    self._apply_model_state_dict(
+                        decision.pull_version, staged, get_secs=get_secs, gib=gib
+                    )
+                    continue
+
                 if decision.action is LoopAction.STEP:
                     # Rank 0 owns all futures, so it stamps the admitted (min) version for the whole decision.
                     # TODO: move under the engine_step call (register at generation_start, not admission).
@@ -1455,6 +1535,9 @@ class VLLMGenerator(Actor, Configurable):
             await self._engine_loop_condition.wait_for(
                 lambda: self._close_request is not None
                 or self._model_state_dict_pull_request is not None
+                # A background weight fetch keeps rank 0 issuing STEP (generation runs
+                # during the transfer) until it can broadcast PULL_APPLY.
+                or self._pending_weight_fetch is not None
                 or self._queued_generation_requests
                 # In-flight requests (on any DP rank) keep rank 0 issuing STEP.
                 or self._request_dispatcher.rank0_has_pending_futures()
@@ -1463,10 +1546,25 @@ class VLLMGenerator(Actor, Configurable):
             if self._close_request is not None:
                 return LoopDecision(action=LoopAction.CLOSE, requests_per_dp_rank=[])
 
-            # A weight pull takes priority over admitting new requests.
-            if self._model_state_dict_pull_request is not None:
+            # overlap_weight_fetch: a fetch already started. Apply it once done;
+            # otherwise fall through to STEP so generation runs while it transfers.
+            if self._pending_weight_fetch is not None:
+                if self._pending_weight_fetch.done():
+                    return LoopDecision(
+                        action=LoopAction.PULL_APPLY,
+                        requests_per_dp_rank=[],
+                        pull_version=self._pending_weight_fetch_version,
+                    )
+            # A weight pull takes priority over admitting new requests. With
+            # overlap_weight_fetch, start it as a background fetch (PULL_FETCH) and keep
+            # stepping; otherwise do the blocking fetch+apply (PULL_MODEL_STATE_DICT).
+            elif self._model_state_dict_pull_request is not None:
                 return LoopDecision(
-                    action=LoopAction.PULL_MODEL_STATE_DICT,
+                    action=(
+                        LoopAction.PULL_FETCH
+                        if self.config.overlap_weight_fetch
+                        else LoopAction.PULL_MODEL_STATE_DICT
+                    ),
                     requests_per_dp_rank=[],
                     pull_version=self._model_state_dict_pull_request.version,
                 )
@@ -1484,6 +1582,12 @@ class VLLMGenerator(Actor, Configurable):
     def _fail_outstanding_futures(self, exc: BaseException) -> None:
         """Fail every unresolved future after an exception or engine teardown."""
         self._request_dispatcher.fail_generation_futures(exc)
+
+        # overlap_weight_fetch: drop any in-flight background fetch so it does not
+        # outlive the loop or leak its staging buffer.
+        if self._pending_weight_fetch is not None:
+            self._pending_weight_fetch.cancel()
+            self._pending_weight_fetch = None
 
         if self._pull_model_state_dict_future is not None:
             if not self._pull_model_state_dict_future.done():
@@ -1552,56 +1656,85 @@ class VLLMGenerator(Actor, Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         await pull_model_state_dict_future
 
-    @sl.log_trace_span("pull_model_state_dict_copy")
-    async def _pull_model_state_dict(self, version: int) -> None:
-        """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
-        prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.
+    async def _fetch_model_state_dict(self, version: int, *, overlap_safe: bool):
+        """ALL RANKS: fetch ``version``'s weights from TorchStore into a staging buffer.
+
+        Returns ``(staged, get_secs, transfer_gib)`` for ``_apply_model_state_dict``.
+        The transfer dominates the pull: torchstore's cpu_staged path reads the remote
+        CPU snapshot over MonarchRDMA, and with many generators pulling at once the
+        per-reader bandwidth is far below the fabric line rate ([pull-timing] reports
+        the achieved GB/s -- do not assume a fixed rate).
+
+        When ``overlap_safe`` the staged buffer is SEPARATE from the live model so the
+        fetch never writes weights an in-flight decode is reading; ``_apply`` copies it
+        into the live model afterward. Native always fetches a fresh dict (already
+        separate). Wrapper fills the live state dict in place unless ``overlap_safe``,
+        in which case it stages on CPU (no extra GPU memory held during generation).
         """
+        _t0 = time.perf_counter()
         if self._backend == "vllm_native":
-            # The native model is not a torchtitan model, so weights cannot be
-            # filled in place by FQN. Pull the full state dict (no template) and
-            # let the vLLM model's load_weights copy + TP-shard the HF tensors
-            # (converted from torchtitan layout by the state_dict_adapter).
-            # Weight-sync timing breakdown (rank 0): split the pull into transfer
-            # (ts.get_state_dict), layout conversion (to_hf), and vLLM load_weights.
-            # The transfer dominates -- torchstore's cpu_staged RDMA runs ~0.9 GB/s,
-            # so the ~34s/step pull is transfer-bound, not load/convert-bound.
-            _t0 = time.perf_counter()
-            tt_state_dict = await ts.get_state_dict(
-                "model_state_dict",
-                direct_rdma=False,
-            )
-            _t1 = time.perf_counter()
-            hf_state_dict = self._sd_adapter.to_hf(tt_state_dict)
-            _t2 = time.perf_counter()
-            self._get_model().load_weights(hf_state_dict.items())
-            _t3 = time.perf_counter()
-            if self._rank == 0:
-                logger.info(
-                    f"[pull-timing] get={_t1 - _t0:.2f}s to_hf={_t2 - _t1:.2f}s "
-                    f"load_weights={_t3 - _t2:.2f}s total={_t3 - _t0:.2f}s"
-                )
+            # The native model is not a torchtitan model, so weights cannot be filled
+            # in place by FQN: pull the full state dict (no template). The result is a
+            # fresh dict, so it is already safe to fetch while generation runs.
+            staged = await ts.get_state_dict("model_state_dict", direct_rdma=False)
         else:
-            # Async RL uses a StorageVolume snapshot so generators do not read
-            # live trainer GPU tensors while optimizer steps may be mutating them.
-            # TODO(async-rl): use 2 version keys so trainer can push a new version
-            # without being blocked by a generator's ongoing pull.
-            model_sd = self._get_model().model.state_dict()
+            # Async RL uses a StorageVolume snapshot so generators never read the
+            # trainer's live GPU tensors while an optimizer step may be mutating them.
+            model = self._get_model().model
+            if overlap_safe:
+                # Stage on CPU: the fetch writes this buffer (not the live GPU params
+                # a concurrent decode reads), and holds no extra GPU memory. _apply
+                # then copies CPU -> live GPU params.
+                staged = {
+                    k: v.detach().to("cpu", copy=True)
+                    for k, v in model.state_dict().items()
+                }
+            else:
+                staged = model.state_dict()
             await ts.get_state_dict(
                 "model_state_dict",
-                user_state_dict=model_sd,
+                user_state_dict=staged,
                 strict=False,
                 direct_rdma=False,
             )
+        get_secs = time.perf_counter() - _t0
+        gib = _state_dict_local_gib(staged) if self._rank == 0 else 0.0
+        return staged, get_secs, gib
+
+    def _apply_model_state_dict(
+        self, version: int, staged, *, get_secs: float, gib: float
+    ) -> None:
+        """ALL RANKS: apply staged weights to the LIVE model (the part that pauses
+        generation), refresh caches, bump the policy version, resolve the pull future.
+        """
+        _t1 = time.perf_counter()
+        if self._backend == "vllm_native":
+            # Convert torchtitan layout -> HF, then let vLLM copy + TP-shard.
+            hf_state_dict = self._sd_adapter.to_hf(staged)
+            _t2 = time.perf_counter()
+            self._get_model().load_weights(hf_state_dict.items())
+            _t3 = time.perf_counter()
+            apply_detail = f"to_hf={_t2 - _t1:.2f}s load_weights={_t3 - _t2:.2f}s"
+        else:
             # state_dict() returns hook-produced copies for fused modules (e.g.
-            # FusedQKVLinear's wqkv -> wq/wk/wv), so the in-place fill above never
+            # FusedQKVLinear's wqkv -> wq/wk/wv), so the fetch's in-place fill never
             # reaches the real param. Re-apply via load_state_dict to run the merge
-            # hook. Non-fused params share storage with model_sd, so reloading them
-            # is a harmless self-copy; only the fused wqkv is actually rebuilt.
+            # hook. Non-fused params share storage with the (non-staged) dict, so
+            # reloading them is a harmless self-copy; only the fused wqkv is rebuilt.
             # TODO: can we avoid the copy and properly load fused qkv weights?
             model = self._get_model().model
-            model.load_state_dict(model_sd, strict=False)
+            model.load_state_dict(staged, strict=False)
+            _t2 = time.perf_counter()
             refresh_cast_linear_inference_caches(model)
+            _t3 = time.perf_counter()
+            apply_detail = f"load_state_dict={_t2 - _t1:.2f}s refresh={_t3 - _t2:.2f}s"
+        if self._rank == 0:
+            gbps = gib * 1.0737 / max(get_secs, 1e-9)  # GiB -> GB, over get()
+            logger.info(
+                f"[pull-timing] get={get_secs:.2f}s apply={_t3 - _t1:.2f}s "
+                f"({apply_detail}) total={get_secs + (_t3 - _t1):.2f}s "
+                f"transfer={gib:.1f}GiB @ {gbps:.2f}GB/s"
+            )
         self.policy_version = version
         if self.config.salt_prefix_cache_on_weight_sync:
             # Salt mode: keep BOTH in-flight KV and the prefix cache (no preempt, no
@@ -1624,6 +1757,19 @@ class VLLMGenerator(Actor, Configurable):
             self._pull_model_state_dict_future.set_result(version)
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
+
+    @sl.log_trace_span("pull_model_state_dict_copy")
+    async def _pull_model_state_dict(self, version: int) -> None:
+        """ALL RANKS: blocking pull (fetch then apply) between engine.step bursts.
+
+        This is the default path; ``overlap_weight_fetch`` instead drives
+        ``_fetch_model_state_dict`` / ``_apply_model_state_dict`` from the engine loop
+        so generation continues during the fetch.
+        """
+        staged, get_secs, gib = await self._fetch_model_state_dict(
+            version, overlap_safe=False
+        )
+        self._apply_model_state_dict(version, staged, get_secs=get_secs, gib=gib)
 
     @endpoint
     async def close(self) -> None:
@@ -1718,7 +1864,15 @@ class LoopAction(enum.Enum):
     # run a burst of engine.step(); first admit any newly-queued requests.
 
     PULL_MODEL_STATE_DICT = "pull_model_state_dict"
-    # pull the latest weights between bursts
+    # pull the latest weights between bursts (fetch + apply, blocking generation)
+
+    PULL_FETCH = "pull_fetch"
+    # overlap_weight_fetch: START the background fetch (network -> staging buffer);
+    # generation keeps running via STEP while it is in flight.
+
+    PULL_APPLY = "pull_apply"
+    # overlap_weight_fetch: the background fetch is done -> apply staged weights to
+    # the live model (the only part that pauses generation).
 
     CLOSE = "close"
     # stop the loop

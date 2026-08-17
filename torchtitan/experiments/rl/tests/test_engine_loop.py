@@ -42,6 +42,9 @@ def _bare_generator(
     inflight: bool = False,
     dp_size: int = 1,
     dp_routing_strategy: RoutingStrategy.Config | None = None,
+    overlap_weight_fetch: bool = False,
+    pending_weight_fetch: object | None = None,
+    pending_weight_fetch_version: int = 0,
 ) -> VLLMGenerator:
     # Bypass __init__ (which builds the vLLM engine); set only the loop's state.
     # _decide_next_action delegates the in-flight check and routing to the
@@ -51,6 +54,11 @@ def _bare_generator(
     generator._close_request = CloseRequest() if close_requested else None
     generator._model_state_dict_pull_request = model_state_dict_pull_request
     generator._queued_generation_requests = pending or []
+    # overlap_weight_fetch state. pending_weight_fetch is polled via .done() only, so a
+    # SimpleNamespace(done=lambda: ...) stands in for the real asyncio.Task.
+    generator.config = SimpleNamespace(overlap_weight_fetch=overlap_weight_fetch)
+    generator._pending_weight_fetch = pending_weight_fetch
+    generator._pending_weight_fetch_version = pending_weight_fetch_version
     generator._request_dispatcher = RequestDispatcher(
         rank=0,
         parallelism=SimpleNamespace(
@@ -168,3 +176,61 @@ def test_step_sticky_session_reuses_dp_rank() -> None:
         "r1": 0,
         "r2": 1,
     }
+
+
+# --- overlap_weight_fetch: fetch runs during generation; only apply pauses it. ---
+
+
+def test_overlap_off_pull_is_blocking() -> None:
+    """Default (overlap off): a pull is the single blocking PULL_MODEL_STATE_DICT."""
+    generator = _bare_generator(
+        model_state_dict_pull_request=ModelStateDictPullRequest(version=7),
+        overlap_weight_fetch=False,
+    )
+    decision = asyncio.run(generator._decide_next_action())
+    assert decision.action is LoopAction.PULL_MODEL_STATE_DICT
+    assert decision.pull_version == 7
+
+
+def test_overlap_on_pull_starts_background_fetch() -> None:
+    """overlap on + a fresh pull: start the background fetch (PULL_FETCH), not a
+    blocking pull, so the next iterations can keep generating."""
+    generator = _bare_generator(
+        model_state_dict_pull_request=ModelStateDictPullRequest(version=7),
+        overlap_weight_fetch=True,
+    )
+    decision = asyncio.run(generator._decide_next_action())
+    assert decision.action is LoopAction.PULL_FETCH
+    assert decision.pull_version == 7
+
+
+def test_overlap_pending_fetch_not_done_keeps_stepping() -> None:
+    """While the fetch is in flight, generation continues: decide returns STEP even
+    though a pull is outstanding."""
+    generator = _bare_generator(
+        model_state_dict_pull_request=ModelStateDictPullRequest(version=7),
+        overlap_weight_fetch=True,
+        pending_weight_fetch=SimpleNamespace(done=lambda: False),
+        pending_weight_fetch_version=7,
+        pending=[_request()],
+    )
+    decision = asyncio.run(generator._decide_next_action())
+    assert decision.action is LoopAction.STEP
+    # The queued request is admitted during the fetch (generation is not stalled).
+    assert generator._queued_generation_requests == []
+
+
+def test_overlap_pending_fetch_done_applies() -> None:
+    """When the fetch finishes, decide switches to PULL_APPLY at the fetched version,
+    taking precedence over admitting new requests."""
+    generator = _bare_generator(
+        overlap_weight_fetch=True,
+        pending_weight_fetch=SimpleNamespace(done=lambda: True),
+        pending_weight_fetch_version=9,
+        pending=[_request()],
+    )
+    decision = asyncio.run(generator._decide_next_action())
+    assert decision.action is LoopAction.PULL_APPLY
+    assert decision.pull_version == 9
+    # Apply runs first; the queued request is not consumed this iteration.
+    assert generator._queued_generation_requests == [_request()]

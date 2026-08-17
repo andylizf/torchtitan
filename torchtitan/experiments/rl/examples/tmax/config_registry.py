@@ -700,6 +700,12 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         salt_prefix_cache_on_weight_sync=_salt_kv,
         reset_prefix_cache_on_weight_sync=not _salt_kv,
         reset_running_requests_on_weight_sync=not _salt_kv,
+        # Overlap the weight-pull FETCH with generation (only the APPLY pauses the
+        # engine), so generators keep producing rollouts during the ~minutes-long
+        # transfer instead of sitting idle. Default off; opt in for the 27B run where
+        # the pull is a large fraction of the step. Pairs with salt-KV (in-flight KV
+        # survives the sync).
+        overlap_weight_fetch=os.environ.get("SWE_OVERLAP_WEIGHT_FETCH", "0") == "1",
     )
     # 32 chunks keeps per-chunk fp32 lm_head logits ~1.2 GiB at seq_len 65536
     # (16 chunks -> ~2.3 GiB, an OOM risk); 65536 % 32 == 0 for the chunk split.
