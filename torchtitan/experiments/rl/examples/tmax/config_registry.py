@@ -387,6 +387,93 @@ def rl_grpo_qwen3_5_27b_tmax_gb200() -> Controller.Config:
     return config
 
 
+def rl_grpo_qwen3_5_27b_tmax_fsdp32_tp2() -> Controller.Config:
+    """Qwen3.5-27B tmax terminal-agent on H100: trainer FSDP-32 x TP-2, generator TP-2.
+
+    Base = ``rl_grpo_qwen3_5_9b_tmax``, NOT ``rl_grpo_qwen3_5_27b_tmax``. The latter
+    descends from swe_r2e and carries bf16 master parameters with AdamW
+    betas (0.9, 0.95) / weight_decay 0.1; scaling up the 9B run means keeping ITS
+    tuned settings -- fp32 master with bf16 compute and fp32 reduce, fp32 AdamW via
+    ``_tmax_9b_adamw`` (open-instruct betas (0.9, 0.999) / wd 0.0), DPPO chunked 32
+    ways, batcher + RoPE at 65536, preserve_all_thinking, salt-KV weight sync.
+
+    Three deltas from the 9B, each measured rather than assumed:
+
+    - the model is 27B (varlen attention: H100 has FA3 kernels, unlike the Blackwell
+      variant which has to fall back to flex);
+    - trainer FSDP-32 x TP-2 (world 64 -> 8 hosts). Sharding alone does NOT fix this
+      model's OOM: per-rank ACTIVATION is one packed row of 65536
+      (``local_batch_size=1``) at ANY shard degree, and FSDP 24 -> 32 -> 64 only moved
+      the free memory 0.44 -> 0.92 -> 2.07GiB while the failing allocation grew to
+      2.12GiB = 65536 x 17408 x 2B, exactly w1's output inside the FullAC recompute.
+      TP is what shards that: w1/w3 are colwise, so the SwiGLU intermediate halves,
+      and Qwen3.5's TP plan carries SP, which shards the 64 x 65536 x 5120 x 2B =
+      42.9GB of FullAC layer inputs as well. Measured locally on a 3-GDN-layer slice
+      at seq 8192: peak 60.18 -> 37.78GiB, with TP-2 outputs matching TP-1 loaded
+      weights to bf16 reduction-order noise (loss 2.050338 vs 2.050286);
+    - generator TP-2, i.e. 4 engines per 8-GPU host. TP-1 does NOT fit: 27B is 64
+      layers with ``full_attention_interval=4`` -> 16 KV layers x 4 kv heads x
+      head_dim 256 x 2 (K,V) x 2 bytes = 64 KiB/token, so one 65536-token sequence
+      needs 4GiB of KV cache while bf16 weights already take ~54GB of the 80GB card.
+      A prior 27B TP-1 attempt on H100 measured "Available KV cache memory:
+      -8.96 GiB" and died at engine init. TP-2 halves both (27GB weights, 32
+      KiB/token/GPU), leaving room for ~19 full-length sequences. Raising TP means
+      lowering DP in step: one generator's world size is dp x tp and the launcher
+      spreads it over world_size / GPUs-per-host machines, so leaving the 9B's DP-8
+      next to TP-2 would silently give each generator TWO hosts.
+
+    Checkpoints are ~3x the 9B's measured 109GB, i.e. ~330GB each; at interval 20 a
+    150-step run writes ~2.3TB.
+    """
+    config = rl_grpo_qwen3_5_9b_tmax()
+    config.model_spec = _qwen3_5_rl_model_registry("27B", attn_backend="varlen")
+    _set_max_seq_len(config.model_spec, _TMAX_9B_CONTEXT)
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        parallelism=dataclasses.replace(
+            config.trainer.parallelism,
+            data_parallel_shard_degree=32,
+            tensor_parallel_degree=2,
+        ),
+    )
+    # Per-turn generation cap: the 9B recipe pins vanillux's 16384 and Terminus-2
+    # thinks longer per step. TMAX_TURN_MAX_TOKENS is only a hint in the HTTP body
+    # (the adapter generates from this SamplingConfig), so honour it here.
+    config.generator = dataclasses.replace(
+        config.generator,
+        sampling=dataclasses.replace(
+            config.generator.sampling,
+            max_tokens=int(
+                os.environ.get("TMAX_TURN_MAX_TOKENS", _TMAX_27B_PER_TURN_TOKENS)
+            ),
+        ),
+        parallelism=dataclasses.replace(
+            config.generator.parallelism,
+            data_parallel_degree=4,
+            tensor_parallel_degree=2,
+        ),
+        # 0.8, not the tmax chain's inherited 0.6 (search_r1 -> swe_r2e -> tmax, with
+        # no recorded reason). 0.6 is slack on the 9B, whose bf16 weights are 18GB,
+        # but on the 27B it is the binding constraint: measured "Available KV cache
+        # memory: 12.22 GiB / GPU KV cache size: 371,370 tokens", i.e. ~5.7 sequences
+        # of 65536 per engine, while ~32GiB of the card went unused. Safe to raise
+        # because weight sync stages in HOST memory (ts.get_state_dict with
+        # direct_rdma=False) and load_weights copies tensor-by-tensor into the
+        # already-allocated parameters -- no full-model GPU buffer.
+        gpu_memory_limit=0.8,
+    )
+    # 64, not the 9B's 32. The chunked lm-head loss holds one chunk's logits at a
+    # time: 65536/32 = 2048 tokens x 248320 vocab is ~1.0GB in bf16 plus a ~2.0GB
+    # fp32 upcast, and that ~3GB resident peak is what leaves the FullAC recompute
+    # 1.25GiB short. Halving the chunk halves it. The 9B fits at 32 because its
+    # hidden size is 4096 and it packs fewer rows per step.
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        loss=dataclasses.replace(config.trainer.loss, num_chunks=64),
+    )
+    return config
+
+
 def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     """Qwen3.5-9B (Gated DeltaNet hybrid, text-only) AI2 tmax terminal-agent recipe.
 
