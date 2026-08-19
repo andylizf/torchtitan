@@ -706,6 +706,14 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         # the pull is a large fraction of the step. Pairs with salt-KV (in-flight KV
         # survives the sync).
         overlap_weight_fetch=os.environ.get("SWE_OVERLAP_WEIGHT_FETCH", "0") == "1",
+        # DP weight broadcast: one rank per vLLM DP group pulls its TP
+        # shard from TorchStore and broadcasts it to the DP replicas, cutting the
+        # duplicated pull (generator DP=8 -> 1 reader instead of 8). Only the
+        # torchtitan_wrapper fill-in-place path uses it; vllm_native / DP1 / EP fall
+        # back to the legacy all-rank pull. Default off -- validate weight correctness
+        # (fused-qkv merge under broadcast) before trusting a run to it.
+        enable_dp_weight_broadcast=os.environ.get("SWE_DP_WEIGHT_BROADCAST", "0")
+        == "1",
     )
     # 32 chunks keeps per-chunk fp32 lm_head logits ~1.2 GiB at seq_len 65536
     # (16 chunks -> ~2.3 GiB, an OOM risk); 65536 % 32 == 0 for the chunk split.
@@ -727,19 +735,33 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="float32",
         ),
-        checkpoint=dataclasses.replace(config.trainer.checkpoint, interval=20),
+        checkpoint=dataclasses.replace(
+            config.trainer.checkpoint,
+            interval=int(os.environ.get("SWE_CKPT_INTERVAL", "20")),
+        ),
     )
     # Optional trainer FSDP width override for a fwd/bwd speed experiment. The mast_rl
     # launcher derives the trainer host count from data_parallel_shard_degree, so
     # SWE_DP_SHARD=16 -> 2 trainer hosts (FSDP-16), spreading the packed rows across
     # 2x DP ranks -> ~half the microbatches per rank -> ~2x faster fwd/bwd. Default
     # unset (0) keeps the base FSDP-8.
+    # SWE_DP_REPLICATE composes with the shard degree into HSDP (dp_replicate x
+    # dp_shard). Use SWE_DP_REPLICATE=2 (with the base shard 8) for FSDP-16 across 2
+    # hosts as HSDP rather than pure dp_shard=16: a naive dp_shard=16 hung on the fresh
+    # cross-host FSDP all-gather at the first fwd/bwd; HSDP (replicate 2 x shard 8) keeps
+    # each all-gather within a host and replicates across hosts, which does not hang.
     _dp_shard = int(os.environ.get("SWE_DP_SHARD", "0"))
-    if _dp_shard:
+    _dp_replicate = int(os.environ.get("SWE_DP_REPLICATE", "0"))
+    if _dp_shard or _dp_replicate:
+        _dp_overrides = {}
+        if _dp_shard:
+            _dp_overrides["data_parallel_shard_degree"] = _dp_shard
+        if _dp_replicate:
+            _dp_overrides["data_parallel_replicate_degree"] = _dp_replicate
         config.trainer = dataclasses.replace(
             config.trainer,
             parallelism=dataclasses.replace(
-                config.trainer.parallelism, data_parallel_shard_degree=_dp_shard
+                config.trainer.parallelism, **_dp_overrides
             ),
         )
     # Optional AC-policy override for a fwd/bwd speed experiment. The base is FullAC

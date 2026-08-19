@@ -28,6 +28,8 @@ import math
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
+from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
+from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.experiments.rl.rollout.types import (
     Rollout,
@@ -193,3 +195,14 @@ def test_a_group_with_no_failures_packs_everything():
     assert (
         _metric(result, "training_sample_builder/num_unscored_rollouts_dropped") is None
     )
+
+
+def test_rollout_reward_metrics_skip_unscored_rollouts():
+    metrics = compute_rollout_metrics(
+        prefix="rollout", rollouts=_group([1.0, 0.0, math.nan]).rollouts
+    )
+
+    reward_metric = next(metric for metric in metrics if metric.key == "rollout_reward")
+    assert isinstance(reward_metric.value, m.SummaryStats)
+    assert reward_metric.value.total == 1.0
+    assert reward_metric.value.count == 2.0

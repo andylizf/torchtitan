@@ -102,6 +102,7 @@ from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.experiments.rl.rollout.rollouter import Rollouter
 from torchtitan.experiments.rl.rollout.types import (
     GenerateFn,
+    is_scored,
     Rollout,
     RolloutGroup,
     RolloutStatus,
@@ -733,7 +734,10 @@ class TMaxRollouter(Rollouter):
         # would only pollute the skip list a later training run reads.
         if rollouts and rollouts[0].group_id < 0:
             return
-        rewards = [r.reward for r in rollouts if r.reward is not None]
+        # An infrastructure failure carries NaN to mean "no verdict". Match the
+        # advantage estimator and sample builder by taking variance only over the
+        # scored survivors; statistics.pstdev raises on NaN under Python 3.12.
+        rewards = [r.reward for r in rollouts if is_scored(r)]
         if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
             return
         try:

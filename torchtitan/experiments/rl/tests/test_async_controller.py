@@ -1025,6 +1025,54 @@ def test_async_validation_skips_while_a_pass_is_in_flight() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("validation_in_flight", [False, True])
+def test_eval_log_step_ping_only_while_validation_is_idle(
+    validation_in_flight: bool,
+) -> None:
+    """The eval keepalive must not compete with its own background pass."""
+
+    async def run() -> None:
+        controller = object.__new__(Controller)
+        controller.start_step = 0
+        controller.config = SimpleNamespace(
+            async_loop=SimpleNamespace(
+                validation=ValidationConfig(num_samples=1, interval=25, run_async=True),
+                max_offpolicy_steps=0,
+            )
+        )
+        controller.trainer = SimpleNamespace(
+            sync_log_step=SimpleNamespace(call=AsyncMock())
+        )
+        controller.generator_router = SimpleNamespace(fanout=AsyncMock())
+        controller.eval_generator_router = SimpleNamespace(fanout=AsyncMock())
+        controller._eval_guard_failures = 0
+
+        validation_task = None
+        if validation_in_flight:
+            validation_task = asyncio.create_task(asyncio.Event().wait())
+        controller._validation_task = validation_task
+
+        training_batch_queue = asyncio.Queue()
+        training_batch_queue.put_nowait(None)
+        try:
+            await controller._trainer_loop(training_batch_queue, num_training_steps=1)
+        finally:
+            if validation_task is not None:
+                validation_task.cancel()
+                await asyncio.gather(validation_task, return_exceptions=True)
+
+        controller.trainer.sync_log_step.call.assert_awaited_once_with(1)
+        controller.generator_router.fanout.assert_awaited_once_with("sync_log_step", 1)
+        if validation_in_flight:
+            controller.eval_generator_router.fanout.assert_not_awaited()
+        else:
+            controller.eval_generator_router.fanout.assert_awaited_once_with(
+                "sync_log_step", 1
+            )
+
+    asyncio.run(run())
+
+
 def test_eval_generator_failure_does_not_end_training(monkeypatch) -> None:
     """Validation is observability: a failing eval generator reports failure instead
     of propagating into the trainer loop.

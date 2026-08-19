@@ -566,6 +566,49 @@ def test_zero_std_annotation_skips_validation_groups(
     assert (tmp_path / "task-123.json").exists() is expect_annotation
 
 
+@pytest.mark.parametrize(
+    "rewards, expect_annotation",
+    [
+        ([0.0, 0.0, math.nan], True),
+        ([0.0, 1.0, math.nan], False),
+        ([math.nan, math.nan], False),
+    ],
+)
+def test_zero_std_annotation_ignores_unscored_rollouts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rewards: list[float],
+    expect_annotation: bool,
+) -> None:
+    monkeypatch.setenv("SWE_ZERO_STD_DIR", str(tmp_path))
+    rollouter = object.__new__(TMaxRollouter)
+    sample = TMaxSample(
+        instance_id="task-123",
+        image="example/image",
+        workdir="/workspace",
+        problem_statement="test",
+    )
+    rollouts = [
+        Rollout(
+            group_id=7,
+            rollout_id=idx,
+            status=RolloutStatus.COMPLETED,
+            reward=reward,
+        )
+        for idx, reward in enumerate(rewards)
+    ]
+
+    rollouter._maybe_annotate_zero_std(sample, rollouts)
+
+    annotation = tmp_path / "task-123.json"
+    assert annotation.exists() is expect_annotation
+    if expect_annotation:
+        assert json.loads(annotation.read_text()) == {
+            "instance_id": "task-123",
+            "reward": 0.0,
+        }
+
+
 def test_rollout_carries_its_finish_reason_and_format_errors() -> None:
     """The per-rollout loop outcome must ride on the Rollout: group metrics average it
     away, so the eval trace report has no other source for 'why did THIS trial stop'."""

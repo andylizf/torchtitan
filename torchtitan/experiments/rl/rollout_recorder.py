@@ -16,6 +16,7 @@ from typing import Any
 
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.rollout import Rollout, RolloutGroup, RolloutTurn
+from torchtitan.experiments.rl.rollout.types import is_scored
 from torchtitan.observability import structured_logger as sl
 
 # TODO(recorders): if a second recorder appears (e.g. an training_sample recorder), generalize to a list of
@@ -53,7 +54,7 @@ class KeepExtremeRewardsFilter(Configurable):
         picked: list[Rollout] = []
         for group in groups:
             ranked = sorted(
-                (rollout for rollout in group.rollouts if rollout.reward is not None),
+                (rollout for rollout in group.rollouts if is_scored(rollout)),
                 key=lambda rollout: rollout.reward,
             )
             k = self._k

@@ -131,7 +131,7 @@ from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollout import RolloutGroup
 from torchtitan.experiments.rl.rollout.rollouter import Rollouter
-from torchtitan.experiments.rl.rollout.types import GenerateFn
+from torchtitan.experiments.rl.rollout.types import GenerateFn, is_scored
 from torchtitan.experiments.rl.rollout_recorder import RolloutSampleRecorder
 from torchtitan.experiments.rl.routing.inter_generator_router import (
     InterGeneratorRouter,
@@ -1301,7 +1301,7 @@ class Controller(Configurable):
                     m.Mean(
                         1.0
                         if any(
-                            rollout.reward is not None and rollout.reward > 0
+                            is_scored(rollout) and rollout.reward > 0
                             for rollout in group.rollouts
                         )
                         else 0.0
@@ -1600,9 +1600,9 @@ class Controller(Configurable):
     def _validation_pass_in_flight(self) -> bool:
         """True while a background validation pass is still running.
 
-        Gates BOTH the eval-generator weight pull and the launch of the next pass:
-        pulling mid-pass would swap the weights underneath it, so the result would
-        no longer belong to the policy version it is labelled with.
+        Gates eval-generator maintenance and the launch of the next pass. A weight
+        pull would swap the weights underneath the pass, while an idle keepalive is
+        unnecessary and can be starved behind the pass's generation RPCs.
         """
         return self._validation_task is not None and not self._validation_task.done()
 
@@ -1786,7 +1786,7 @@ class Controller(Configurable):
             # [buffer trace] classify this completed group's solve status for per-step
             # visibility. full-solve (all rollouts pass) and not-solve (all fail) groups
             # are zero-std -> dropped by drop_zero_std; only partial-solve groups train.
-            _rw = [r.reward for r in rollout_group.rollouts if r.reward is not None]
+            _rw = [r.reward for r in rollout_group.rollouts if is_scored(r)]
             _n = len(_rw)
             _ns = sum(1 for x in _rw if x and x > 0.0)
             _cls = (
@@ -1913,12 +1913,16 @@ class Controller(Configurable):
             await self.trainer.sync_log_step.call(step)
             logger.info(f"[trainer_loop] step {step}: generator fanout sync_log_step")
             await self.generator_router.fanout("sync_log_step", step)
-            # The eval generators get the same per-step ping. They are otherwise
-            # idle between passes (tens of minutes at a realistic interval), and an
-            # idle generator mesh has been seen to lose its worker processes -- the
-            # next call then fails with a gloo "connection closed by peer". The
-            # training generators, which receive this every step, do not.
-            if self.eval_generator_router is not None:
+            # Ping eval generators only while they are idle. Between passes this
+            # keeps a mesh from being reaped, but an in-flight pass already exercises
+            # the mesh. A concurrent maintenance fanout can sit behind its generation
+            # RPCs until the guard times out and falsely declares a healthy evaluator
+            # dead. Training generators remain safe to ping because they continuously
+            # serve the training stream rather than one isolated background pass.
+            if (
+                self.eval_generator_router is not None
+                and not self._validation_pass_in_flight()
+            ):
                 await self._guard_eval_generators(
                     lambda: self.eval_generator_router.fanout("sync_log_step", step),
                     what=f"eval generator sync_log_step at step {step}",

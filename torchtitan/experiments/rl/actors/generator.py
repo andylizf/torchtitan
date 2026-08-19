@@ -23,6 +23,10 @@ import torchstore as ts
 from monarch.actor import Actor, Channel, current_rank, endpoint, Port, PortReceiver
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.config import CompileConfig, Configurable, DebugConfig, OverrideConfig
+from torchtitan.distributed.dp_weight_broadcast import (
+    dp_weight_broadcast_unsupported_reason,
+    DPWeightBroadcaster,
+)
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
@@ -50,6 +54,7 @@ from torchtitan.tools.logging import init_logger
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig, ParallelConfig
 from vllm.config.compilation import CompilationMode, PassConfig
+from vllm.distributed import get_dp_group
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -917,6 +922,11 @@ class VLLMGenerator(Actor, Configurable):
         request) + ``inflight_updates_recompute_kv_cache=False``. When True the two reset knobs above
         are bypassed."""
 
+        enable_dp_weight_broadcast: bool = False
+        """Let one rank per vLLM DP group pull its TP shard from TorchStore, then
+        broadcast that shard to its DP replicas. Dense models only; unsupported
+        layouts retain the legacy all-rank pull."""
+
         def __post_init__(self):
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
@@ -1250,6 +1260,25 @@ class VLLMGenerator(Actor, Configurable):
         # --- Continuous-batching state (see the class docstring) ---
         self._rank = dist.get_rank()
         self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
+        self._dp_weight_broadcaster: DPWeightBroadcaster | None = None
+        if config.enable_dp_weight_broadcast:
+            unsupported_reason = dp_weight_broadcast_unsupported_reason(
+                data_parallel_degree=config.parallelism.data_parallel_degree,
+                expert_parallel_degree=config.parallelism.expert_parallel_degree,
+            )
+            if unsupported_reason is not None:
+                if self._rank == 0:
+                    logger.warning(
+                        "DP weight broadcast requested but unavailable: %s; "
+                        "using the legacy all-rank TorchStore pull",
+                        unsupported_reason,
+                    )
+            else:
+                self._dp_weight_broadcaster = DPWeightBroadcaster(
+                    dp_group=get_dp_group(),
+                    control_group=self._broadcast_group,
+                    expected_dp_degree=config.parallelism.data_parallel_degree,
+                )
         self._engine_loop_condition = (
             asyncio.Condition()
         )  # Signals to wake up when there is work
@@ -1656,7 +1685,9 @@ class VLLMGenerator(Actor, Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         await pull_model_state_dict_future
 
-    async def _fetch_model_state_dict(self, version: int, *, overlap_safe: bool):
+    async def _fetch_model_state_dict(
+        self, version: int, *, overlap_safe: bool, staged: dict | None = None
+    ):
         """ALL RANKS: fetch ``version``'s weights from TorchStore into a staging buffer.
 
         Returns ``(staged, get_secs, transfer_gib)`` for ``_apply_model_state_dict``.
@@ -1681,7 +1712,11 @@ class VLLMGenerator(Actor, Configurable):
             # Async RL uses a StorageVolume snapshot so generators never read the
             # trainer's live GPU tensors while an optimizer step may be mutating them.
             model = self._get_model().model
-            if overlap_safe:
+            if staged is not None:
+                # Caller-supplied buffer (the DP-broadcast path shares one dict across
+                # fetch + broadcast + apply); fill it in place, do not rebuild.
+                pass
+            elif overlap_safe:
                 # Stage on CPU: the fetch writes this buffer (not the live GPU params
                 # a concurrent decode reads), and holds no extra GPU memory. _apply
                 # then copies CPU -> live GPU params.
@@ -1766,6 +1801,38 @@ class VLLMGenerator(Actor, Configurable):
         ``_fetch_model_state_dict`` / ``_apply_model_state_dict`` from the engine loop
         so generation continues during the fetch.
         """
+        # DP-broadcast: one rank per vLLM DP group reads TorchStore and
+        # fans its shard out to the DP replicas, cutting duplicated pulls. Only the
+        # fill-in-place (torchtitan_wrapper) path is supported -- vllm_native builds a
+        # fresh dict from the store, so a non-source replica would have no template to
+        # receive into. Native and the DP1/EP configs fall back to the legacy all-rank
+        # pull. NOTE: default-off (enable_dp_weight_broadcast); the weight-sync path is
+        # battle-tested, so validate weight correctness on a GPU A/B before enabling.
+        if self._dp_weight_broadcaster is not None and self._backend != "vllm_native":
+            model = self._get_model().model
+            staged = model.state_dict()
+            timing: dict[str, float] = {}
+
+            async def _fetch() -> None:
+                _, timing["get_secs"], timing["gib"] = await self._fetch_model_state_dict(
+                    version, overlap_safe=False, staged=staged
+                )
+
+            def _apply() -> None:
+                self._apply_model_state_dict(
+                    version,
+                    staged,
+                    get_secs=timing.get("get_secs", 0.0),
+                    gib=timing.get("gib", 0.0),
+                )
+
+            await self._dp_weight_broadcaster.synchronize(
+                state_dict=staged,
+                fetch_from_store=_fetch,
+                apply_state_dict=_apply,
+            )
+            return
+
         staged, get_secs, gib = await self._fetch_model_state_dict(
             version, overlap_safe=False
         )

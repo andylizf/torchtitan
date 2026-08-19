@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 
 from torchtitan.experiments.rl.rollout import (
     Rollout,
@@ -71,6 +72,14 @@ def test_filter_picks_highest_and_lowest_per_group() -> None:
     group = _group(0, rewards=[0.9, 0.9, 0.2, None, -0.3, -1.0, -1.0])
     picked = KeepExtremeRewardsFilter.Config(k=2).build()([group])
     assert sorted(r.reward for r in picked) == [-1.0, -1.0, 0.9, 0.9]
+
+
+def test_filter_skips_nan_unscored_rewards() -> None:
+    group = _group(0, rewards=[0.2, math.nan, 0.8])
+
+    picked = KeepExtremeRewardsFilter.Config(k=1).build()([group])
+
+    assert [rollout.reward for rollout in picked] == [0.2, 0.8]
 
 
 def test_filter_dedupes_small_groups() -> None:

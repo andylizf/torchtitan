@@ -14,7 +14,7 @@ import time
 from collections import defaultdict
 
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.rollout.types import Rollout
+from torchtitan.experiments.rl.rollout.types import is_scored, Rollout
 
 
 class MetricsTimer:
@@ -211,7 +211,7 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
     ]
 
     truncated = [float(rollout.status.is_truncated()) for rollout in rollouts]
-    rewards = [rollout.reward for rollout in rollouts if rollout.reward is not None]
+    rewards = [rollout.reward for rollout in rollouts if is_scored(rollout)]
     num_turns = [float(len(rollout.turns)) for rollout in rollouts]
 
     out: list[m.Metric] = [
