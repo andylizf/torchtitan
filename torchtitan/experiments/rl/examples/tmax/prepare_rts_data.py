@@ -101,39 +101,55 @@ _DEFAULT_WORKDIR = "/app"
 #
 # The archive-mirror rewrites keep the EOL bases (centos:7, ubuntu:16.04, debian
 # buster/stretch) buildable if their default mirrors go away.
+# Non-fatal by design: the whole install runs in a subshell whose failure is caught by
+# `|| echo ...`, so the RUN always exits 0 and a tmux preinstall failure never fails the
+# image build. Rationale: some source bases have a broken package path we don't control
+# (e.g. an EOL mirror, or a distro whose pkg manager we don't branch on), and a hard
+# `exit 1` there dropped the ENTIRE image to BUILD_FAILED -- e.g. tw_473991 (archlinux)
+# fell through to the old `else: exit 1` because pacman had no branch, and its 192
+# rollouts all BUILD_FAILED and burned Daytona create quota. When tmux is not baked in,
+# Terminus self-installs it at runtime, so a miss is degraded-but-recoverable, not fatal.
+# @andy: once the environment/base images are fixed so every task builds tmux, flip this
+# back to strict (drop the `|| echo` catch and restore `exit 1` in the else) to surface
+# real regressions instead of silently shipping images without tmux.
 _AGENT_RUNTIME_BLOCK = """
-# harbor-agent-runtime: tmux is required by the terminal agent
-RUN if command -v tmux >/dev/null 2>&1; then \\
-      exit 0; \\
-    elif command -v apt-get >/dev/null 2>&1; then \\
-      (apt-get update || ( \\
-        sed -i -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \\
-               -e 's|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' \\
-               -e 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|g' \\
-               -e 's|http://archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
-               -e 's|http://security.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
-               -e 's|http://.*archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
-               /etc/apt/sources.list 2>/dev/null; \\
-        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99harbor-archive; \\
-        apt-get update \\
-      )) && (apt-get install -y tmux || apt-get install -y --allow-unauthenticated tmux) \\
-      && rm -rf /var/lib/apt/lists/*; \\
-    elif command -v yum >/dev/null 2>&1; then \\
-      (yum install -y tmux || ( \\
-        sed -i -e 's|^mirrorlist=|#mirrorlist=|g' \\
-               -e 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \\
-               /etc/yum.repos.d/CentOS-*.repo 2>/dev/null; \\
-        yum install -y tmux \\
-      )) && yum clean all; \\
-    elif command -v dnf >/dev/null 2>&1; then \\
-      dnf install -y tmux && dnf clean all; \\
-    elif command -v microdnf >/dev/null 2>&1; then \\
-      microdnf install -y tmux && microdnf clean all; \\
-    elif command -v apk >/dev/null 2>&1; then \\
-      apk add --no-cache tmux; \\
-    else \\
-      echo 'ERROR: no supported package manager to install tmux' >&2; exit 1; \\
-    fi
+# harbor-agent-runtime: tmux is required by the terminal agent (non-fatal preinstall)
+RUN ( if command -v tmux >/dev/null 2>&1; then \\
+        exit 0; \\
+      elif command -v apt-get >/dev/null 2>&1; then \\
+        (apt-get update || ( \\
+          sed -i -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \\
+                 -e 's|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' \\
+                 -e 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|g' \\
+                 -e 's|http://archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
+                 -e 's|http://security.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
+                 -e 's|http://.*archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \\
+                 /etc/apt/sources.list 2>/dev/null; \\
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99harbor-archive; \\
+          apt-get update \\
+        )) && (apt-get install -y tmux || apt-get install -y --allow-unauthenticated tmux) \\
+        && rm -rf /var/lib/apt/lists/*; \\
+      elif command -v yum >/dev/null 2>&1; then \\
+        (yum install -y tmux || ( \\
+          sed -i -e 's|^mirrorlist=|#mirrorlist=|g' \\
+                 -e 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \\
+                 /etc/yum.repos.d/CentOS-*.repo 2>/dev/null; \\
+          yum install -y tmux \\
+        )) && yum clean all; \\
+      elif command -v dnf >/dev/null 2>&1; then \\
+        dnf install -y tmux && dnf clean all; \\
+      elif command -v microdnf >/dev/null 2>&1; then \\
+        microdnf install -y tmux && microdnf clean all; \\
+      elif command -v apk >/dev/null 2>&1; then \\
+        apk add --no-cache tmux; \\
+      elif command -v pacman >/dev/null 2>&1; then \\
+        pacman -Sy --noconfirm tmux; \\
+      elif command -v zypper >/dev/null 2>&1; then \\
+        zypper install -y tmux; \\
+      else \\
+        echo 'ERROR: no supported package manager to install tmux' >&2; exit 1; \\
+      fi ) \\
+    || echo 'harbor-agent-runtime: tmux preinstall failed (non-fatal); Terminus will self-install at runtime' >&2
 """
 
 
