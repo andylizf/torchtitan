@@ -236,9 +236,49 @@ def spawn_proc_mesh(
     return trainer_mesh, generator_meshes, eval_generator_meshes
 
 
+def _configure_monarch_runtime() -> None:
+    """Raise Monarch's actor-runtime deadlines to survive a large multi-host RL run.
+
+    Defaults, not just for our cluster: on a controller driving many generator meshes
+    at high rollout concurrency, the controller<->generator message channels congest and
+    Monarch's default deadlines fire, so HEALTHY generators get declared dead and the
+    whole job takes a global-fatal cascade. Raising these tolerates the backlog. Each is
+    env-overridable so a run can tune or disable it; humantime strings ("300s").
+
+      - message_delivery_timeout: the deadline that fires on channel backlog ("timed out
+        reaching controller ... for mesh"); the biggest lever for the false-death crash.
+      - host_spawn_ready_timeout: startup deadline for a slow host to bootstrap its procs.
+      - supervision_watchdog_timeout: liveness stream watchdog over slow-but-healthy ops
+        (e.g. a cold sandbox build), so a blocked-not-dead worker is not reaped.
+    """
+    try:
+        from monarch.config import configure
+    except Exception:
+        return
+    kwargs = {
+        "message_delivery_timeout": os.environ.get(
+            "MONARCH_MESSAGE_DELIVERY_TIMEOUT", "300s"
+        ),
+        "host_spawn_ready_timeout": os.environ.get(
+            "MONARCH_HOST_SPAWN_READY_TIMEOUT", "180s"
+        ),
+        "supervision_watchdog_timeout": os.environ.get(
+            "MONARCH_SUPERVISION_WATCHDOG_TIMEOUT", "600s"
+        ),
+    }
+    try:
+        configure(**kwargs)
+        logger.info("Monarch runtime timeouts configured: %s", kwargs)
+    except Exception as e:
+        # A Monarch API change here must never block training; the defaults only add
+        # robustness. Log and continue with Monarch's own defaults.
+        logger.warning("configure_monarch skipped (%s): %s", type(e).__name__, e)
+
+
 async def main():
     config = ConfigManager().parse_args()
     assert isinstance(config, Controller.Config)
+    _configure_monarch_runtime()
     sl.init_structured_logger(
         source="rl_controller",
         output_dir=config.dump_folder,
