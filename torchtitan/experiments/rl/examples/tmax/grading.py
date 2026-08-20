@@ -84,6 +84,14 @@ def _pre_grade_command(reward_path: str, ctrf_path: str, nonce: str) -> str:
 def _make_nonce() -> str:
     return f"tmax-sentinel-{uuid.uuid4().hex}"
 
+
+def _root_sh(cmd: str) -> str:
+    """Run ``cmd`` as root on either kind of Daytona sandbox: custom task
+    images exec as root already, while snapshot images exec as the unprivileged
+    ``daytona`` user that carries passwordless sudo."""
+    q = shlex.quote(cmd)
+    return f'if [ "$(id -u)" = 0 ]; then sh -c {q}; else sudo -n sh -c {q}; fi'
+
 # Two fixture classes with OPPOSITE timing (see seed_workspace / grade_tmax):
 #   environment/seeds/<rel> -- agent-facing INPUT files (the task's initial
 #     workspace state). Seeded to /workspace BEFORE the agent runs (upstream
@@ -291,11 +299,16 @@ def seed_workspace_daytona(sb, tmax: dict, *, dest: str = _SEEDS_DEST) -> None:
     seeds = list(_iter_seed_fixtures(tmax, dest))
     if not seeds:
         return
-    sb.process.exec(f"mkdir -p {shlex.quote(dest)}", timeout=60)
+    # The upload agent's implicit mkdir runs unprivileged even when the sandbox
+    # was created with os_user=root, so parents must exist and be writable to
+    # any uid before the first upload.
+    sb.process.exec(_root_sh(f"mkdir -p {dest} && chmod 777 {dest}"), timeout=60)
     for path, content in seeds:
         parent = posixpath.dirname(path)
         if parent and parent != dest:
-            sb.process.exec(f"mkdir -p {shlex.quote(parent)}", timeout=60)
+            sb.process.exec(
+                _root_sh(f"mkdir -p {parent} && chmod 777 {parent}"), timeout=60
+            )
         sb.fs.upload_file(content.encode("utf-8"), path)
 
 
@@ -318,10 +331,9 @@ def grade_tmax_daytona(
     fixtures = tmax.get("fixtures") or {}
     reward_path = tmax.get("reward_path") or _DEFAULT_REWARD_PATH
 
+    dirs = f"{_VERIFIER_DIR} {_TESTS_DIR} {workdir}"
     sb.process.exec(
-        f"mkdir -p {shlex.quote(_VERIFIER_DIR)} {shlex.quote(_TESTS_DIR)} "
-        f"{shlex.quote(workdir)}",
-        timeout=60,
+        _root_sh(f"mkdir -p {dirs} && chmod 777 {dirs}"), timeout=60
     )
     for rel, content in fixtures.items():
         dest = _grading_fixture_dest(rel)
@@ -332,19 +344,19 @@ def grade_tmax_daytona(
 
     nonce = _make_nonce()
     sb.process.exec(
-        _pre_grade_command(reward_path, _ctrf_path_for(reward_path), nonce),
+        _root_sh(_pre_grade_command(reward_path, _ctrf_path_for(reward_path), nonce)),
         timeout=60,
     )
-    r = sb.process.exec(f"cat {shlex.quote(reward_path)}", timeout=30)
+    r = sb.process.exec(_root_sh(f"cat {reward_path}"), timeout=30)
     sentinel = (r.result if getattr(r, "exit_code", 1) == 0 else "").strip()
     if sentinel != nonce:
         return 0.0
 
     sb.process.exec(
-        f"chmod +x {shlex.quote(_TEST_SH)}; bash {shlex.quote(_TEST_SH)}",
+        _root_sh(f"chmod +x {_TEST_SH}; bash {_TEST_SH}"),
         timeout=timeout,
     )
-    r = sb.process.exec(f"cat {shlex.quote(reward_path)}", timeout=30)
+    r = sb.process.exec(_root_sh(f"cat {reward_path}"), timeout=30)
     reward_txt = r.result if getattr(r, "exit_code", 1) == 0 else ""
     if reward_txt.strip() == nonce:
         return 0.0

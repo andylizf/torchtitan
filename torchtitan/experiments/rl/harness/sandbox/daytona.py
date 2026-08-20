@@ -744,12 +744,20 @@ class DaytonaSandbox:
             )
         if int(_getenv("TT_DAYTONA_RPC_RETRIES", default="2")) < 0:
             raise ValueError("TT_DAYTONA_RPC_RETRIES must be non-negative")
+        create_kwargs = {}
+        if _getenv("TT_DAYTONA_EPHEMERAL", default="0") == "1":
+            # Some Daytona regions reject non-ephemeral creates outright
+            # ("Only ephemeral sandboxes are permitted in this region").
+            # Opt-in: ephemeral also implies delete-on-stop, which the
+            # auto_stop/auto_delete TTLs below already arrange.
+            create_kwargs["ephemeral"] = True
         params = CreateSandboxFromImageParams(
             image=self._declarative_image() if self.dockerfile else self.image,
             resources=Resources(cpu=cpu, memory=mem, disk=disk),
             labels=HARNESS_LABELS,
             auto_stop_interval=auto_stop,
             auto_delete_interval=auto_delete,
+            **create_kwargs,
         )
         # Daytona create transiently 401s a valid key under a concurrent boot burst.
         # Retry with jittered backoff so a wide fanout does not retry in lockstep.
