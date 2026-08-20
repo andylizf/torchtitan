@@ -109,7 +109,9 @@ export SWE_DISABLE_CUSTOM_ALL_REDUCE=1  # required for the GDN generator under v
 export SWE_TIME_BUDGET_SEC=2400       # per-rollout wall-clock budget (40 min)
 export TMAX_EXEC_TIMEOUT_SEC=120      # per-command timeout inside the sandbox
 export SWE_MAX_NUM_SEQS=32            # vLLM engine max concurrent sequences
-export SWE_SELECTION_WINDOW_GROUPS=20 # scheduler look-back window for finalized groups
+# Selection window: LEAVE UNSET -> num_groups_in_selection_window=None = take-any
+# (greedy: the batcher picks from ALL finalized groups). Set it to W for MSL-style
+# sliding-prefix selection over only the oldest W finalized groups (more on-policy).
 export TT_DAYTONA_CPU=2               # per-sandbox resources (Daytona)
 export TT_DAYTONA_MEM_GB=4
 export TT_DAYTONA_DISK_GB=10
