@@ -31,6 +31,7 @@ import logging
 import os
 import posixpath
 import shlex
+import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -49,6 +50,39 @@ _DEFAULT_REWARD_PATH = "/logs/verifier/reward.txt"
 # Second verifier output: the harbor contract runs pytest with `--ctrf`, so the
 # per-test breakdown behind the binary reward lands here. Diagnostics only.
 _DEFAULT_CTRF_PATH = "/logs/verifier/ctrf.json"
+
+
+def _ctrf_path_for(reward_path: str) -> str:
+    """The ctrf report sits beside the reward file, wherever that is."""
+    parent = posixpath.dirname(reward_path) or _VERIFIER_DIR
+    return posixpath.join(parent, "ctrf.json")
+
+
+def _pre_grade_command(reward_path: str, ctrf_path: str, nonce: str) -> str:
+    """Shell that resets the verifier outputs before ``test.sh`` runs.
+
+    The agent and the verifier share one filesystem, so a rollout can pre-write
+    ``reward.txt`` (optionally ``chattr +i`` it, or make its directory immutable)
+    and be paid for a verifier that never ran. Clear any immutable bits, delete
+    both outputs, and leave a one-shot sentinel in the reward file. Grading then
+    accepts the reward only if the verifier actually replaced the sentinel; a
+    sentinel that could not even be written proves the path is out of our
+    control, and both cases score 0.
+    """
+    q_reward = shlex.quote(reward_path)
+    q_ctrf = shlex.quote(ctrf_path)
+    q_dir = shlex.quote(posixpath.dirname(reward_path) or _VERIFIER_DIR)
+    return (
+        f"chattr -R -i {q_dir} 2>/dev/null; "
+        f"chattr -i {q_reward} {q_ctrf} 2>/dev/null; "
+        f"rm -f {q_reward} {q_ctrf}; "
+        f"mkdir -p {q_dir}; "
+        f"printf %s {shlex.quote(nonce)} > {q_reward}"
+    )
+
+
+def _make_nonce() -> str:
+    return f"tmax-sentinel-{uuid.uuid4().hex}"
 
 # Two fixture classes with OPPOSITE timing (see seed_workspace / grade_tmax):
 #   environment/seeds/<rel> -- agent-facing INPUT files (the task's initial
@@ -200,6 +234,21 @@ async def grade_tmax(
         await sb.write_file(dest, content, user="root")
     await sb.write_file(_TEST_SH, test_sh, user="root")
 
+    nonce = _make_nonce()
+    await sb.exec(
+        _pre_grade_command(reward_path, _ctrf_path_for(reward_path), nonce),
+        user="root",
+        check=False,
+        timeout=60,
+    )
+    sentinel = (await sb.read_file(reward_path, user="root") or "").strip()
+    if sentinel != nonce:
+        logger.warning(
+            "[tmax] reward path %s is not writable pre-grade; scoring 0",
+            reward_path,
+        )
+        return 0.0
+
     # test.sh scripts assume they are invoked as `bash /tests/test.sh` (they use
     # $(dirname "$0") to find sibling fixtures). Run as root so /logs and any
     # system path is writable; the verifier is trusted dataset code.
@@ -210,6 +259,13 @@ async def grade_tmax(
         timeout=timeout,
     )
     reward_txt = await sb.read_file(reward_path, user="root")
+    if (reward_txt or "").strip() == nonce:
+        logger.info(
+            "[tmax] verifier left the sentinel in place (never wrote %s); "
+            "scoring 0",
+            reward_path,
+        )
+        return 0.0
     reward = _parse_reward(reward_txt)
     logger.info("[tmax] graded reward=%.2f (reward_path=%s)", reward, reward_path)
     return reward
@@ -274,10 +330,22 @@ def grade_tmax_daytona(
         sb.fs.upload_file(content.encode("utf-8"), dest)
     sb.fs.upload_file(test_sh.encode("utf-8"), _TEST_SH)
 
+    nonce = _make_nonce()
+    sb.process.exec(
+        _pre_grade_command(reward_path, _ctrf_path_for(reward_path), nonce),
+        timeout=60,
+    )
+    r = sb.process.exec(f"cat {shlex.quote(reward_path)}", timeout=30)
+    sentinel = (r.result if getattr(r, "exit_code", 1) == 0 else "").strip()
+    if sentinel != nonce:
+        return 0.0
+
     sb.process.exec(
         f"chmod +x {shlex.quote(_TEST_SH)}; bash {shlex.quote(_TEST_SH)}",
         timeout=timeout,
     )
     r = sb.process.exec(f"cat {shlex.quote(reward_path)}", timeout=30)
     reward_txt = r.result if getattr(r, "exit_code", 1) == 0 else ""
+    if reward_txt.strip() == nonce:
+        return 0.0
     return _parse_reward(reward_txt)
