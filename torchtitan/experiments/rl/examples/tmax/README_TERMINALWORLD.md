@@ -98,8 +98,15 @@ export SWE_DROP_ZERO_STD=0            # keep all-pass/all-fail groups (they add 
 export SWE_MAX_ACTIVE_GROUPS=512      # buffer capacity >= (off+1) * groups
 export SWE_TRAIN_STEPS=150
 
-# --- throughput ---
-export SWE_ROLLOUT_CONCURRENCY=1280   # active sandboxes; ~= (off+1)*groups*group_size ceiling
+# --- selection + throughput ---
+export SWE_SELECTION_WINDOW_GROUPS=64 # take from the oldest 64 finalized groups. 64 = 2x
+                                      # the 32-group batch: enough to fill a step without
+                                      # head-of-line blocking, bounded (more on-policy +
+                                      # less stale-drop waste) than None=take-any.
+export SWE_ROLLOUT_CONCURRENCY=768    # active sandboxes. Higher congests the controller<->
+                                      # generator Monarch channels -> false "proc dead"
+                                      # crashes (seen at 1280); 768 still fills a 512-rollout
+                                      # step. Raise only after removing build-failing tasks.
 export SWE_NUM_ROLLOUT_WORKERS=16     # CPU agent-orchestration processes, off the controller GIL
 export SWE_CKPT_INTERVAL=5            # checkpoint every 5 steps (cheap resume on failure)
 
@@ -109,26 +116,34 @@ export SWE_DISABLE_CUSTOM_ALL_REDUCE=1  # required for the GDN generator under v
 export SWE_TIME_BUDGET_SEC=2400       # per-rollout wall-clock budget (40 min)
 export TMAX_EXEC_TIMEOUT_SEC=120      # per-command timeout inside the sandbox
 export SWE_MAX_NUM_SEQS=32            # vLLM engine max concurrent sequences
-# Selection window: LEAVE UNSET -> num_groups_in_selection_window=None = take-any
-# (greedy: the batcher picks from ALL finalized groups). Set it to W for MSL-style
-# sliding-prefix selection over only the oldest W finalized groups (more on-policy).
 export TT_DAYTONA_CPU=2               # per-sandbox resources (Daytona)
 export TT_DAYTONA_MEM_GB=4
 export TT_DAYTONA_DISK_GB=10
 export TT_DAYTONA_HEARTBEAT_SEC=180   # sandbox keep-alive
 export TT_DAYTONA_CREATE_CONCURRENCY=8  # per-worker create parallelism; lower if the provider 429s
 
-# --- inline eval OFF: eval is decoupled to a separate job (step 3) so it never
-#     contends with training for the controller/sandbox provider ---
-export SWE_VAL_SAMPLES=0
-export SWE_NUM_EVAL_GENERATORS=0
+# --- INLINE Terminal-Bench 2.0 eval (see section 3): scored on a dedicated async eval
+#     generator every SWE_VAL_INTERVAL steps, logged to the training W&B run. The step-0
+#     pre-training pass is the baseline. ---
+export SWE_TB2_VAL_DATA=/path/to/tb2_eval.jsonl  # the 89-task TB-2.0 JSONL (prepare_tb2_data)
+export SWE_NUM_EVAL_GENERATORS=1      # one dedicated eval-generator host (async, off the training pool)
+export SWE_VAL_INTERVAL=20            # eval every 20 optimizer steps
+export SWE_VAL_SAMPLES=89             # all 89 TB-2.0 tasks per pass (k=5)
 
 python -m torchtitan.experiments.rl.train \
     --module torchtitan.experiments.rl.examples.tmax \
     --config rl_grpo_qwen3_5_9b_tmax \
     --num-generators 12 \
+    --num-eval-generators 1 \
     --hf_assets_path /path/to/Qwen3.5-9B
 ```
+
+> **Data hygiene matters for stability.** A task whose Docker image fails to build
+> (e.g. `apt-get` on an EOL Debian base) makes every rollout on it retry sandbox
+> creation ~6x; a single such task sampled repeatedly floods the rollout workers with
+> Daytona create storms that saturate the controller host and trigger the false
+> "proc dead" crash above. Filter build-failing tasks out of the training JSONL (watch
+> the logs for repeated `BUILD_FAILED` on one `instance_id`).
 
 ### Host topology
 
@@ -140,50 +155,46 @@ across hosts is your own job scheduler's problem.
 
 ### Multi-host trainer (optional)
 
-On a fresh 2-host trainer, a naive `dp_shard=16` can hang on the first cross-host
-all-gather. Use HSDP instead -- `dp_replicate=2 x dp_shard=8` keeps each all-gather
-within a host -- by setting `export SWE_DP_REPLICATE=2` (measured ~2x faster
-fwd_bwd vs FSDP-8, no hang).
+On a fresh multi-host trainer, a naive `dp_shard=N` can hang on the first cross-host
+all-gather. Use HSDP instead -- `dp_replicate x dp_shard=8` keeps each all-gather
+within a host -- via `SWE_DP_REPLICATE`: `=2` gives HSDP-16 (2 hosts, ~2x faster
+fwd_bwd vs FSDP-8), `=4` gives HSDP-32 (4 hosts). Note the run is usually
+generation-bound (steps paced by rollout production), so more trainer DP helps only
+while `batch-wait` is low; if `fwd_bwd` drops but `batch-wait` rises, add generators
+instead.
 
-## 3. Eval every N steps (decoupled) + a step-0 baseline
+## 3. Inline TB-2.0 eval (built into the run)
 
-Run the TB-2.0 eval as a SEPARATE process per checkpoint, NOT inline. Inline eval
-(hundreds of concurrent eval rollouts, some on heavy images) piles onto the
-training controller and can stall it; decoupling removes that entirely and lets you
-score every checkpoint on its own hardware.
+The launch above already turns eval on via `SWE_TB2_VAL_DATA` + `--num-eval-generators 1`:
+a validation pass scores all 89 TB-2.0 tasks (k=5, temperature 0.7, top_p 0.95) on a
+**dedicated eval-generator host, asynchronously**, every `SWE_VAL_INTERVAL` steps. A pass
+still in flight when the next interval arrives is **skipped, not queued**. Results land
+in the **training W&B run**:
 
-The eval-only config loads a checkpoint as the initial model and scores all 89
-TB-2.0 tasks once (k=5, temperature 0.7, top_p 0.95 -- so `validation/reward/mean`
-is avg@5 and `validation/pass_at_k` is pass@5). Point it at each checkpoint your
-training run drops (e.g. every 15 steps) with your own scheduler:
+- `validation/reward/mean` = **avg@5**
+- `validation/pass_at_k` = **pass@5**
+- `validation/policy_version` = the policy version scored (the async pass lags training).
+
+The **step-0 pre-training pass is the base-model baseline** (compare later versions to it).
+Because the eval runs on its own generator host, training does not block on it.
+
+Each pass also writes a browsable report at
+`<dump>/validation_traces/step-<policy_version>/{INDEX.md,summary.json,traces/}`.
+
+### Optional: score a single checkpoint offline
+
+To score one saved checkpoint without a training run (e.g. re-checking a step), use the
+eval-only recipe -- same harness, `num_training_steps=0`, one validation pass:
 
 ```bash
-# The SAME harness env as training (Terminus-2, context, turns, backend) -- otherwise
-# the eval silently runs a different agent (TMAX_AGENT defaults to vanillux).
-export TMAX_AGENT=terminus SWE_MAX_CONTEXT_LEN=63488 TMAX_TERMINUS_MAX_TURNS=120
-export TMAX_TURN_MAX_TOKENS=32768 SWE_GEN_BACKEND=torchtitan_wrapper
-export SWE_TB2_DATA=/path/to/tb2_eval.jsonl
-export SWE_ROLLOUT_CONCURRENCY=89     # all tasks at once
-
-# Score a trained checkpoint (policy_version N):
-SWE_TB2_CKPT=/path/to/run/checkpoint/step-N \
+SWE_TB2_DATA=/path/to/tb2_eval.jsonl SWE_TB2_CKPT=/path/to/run/checkpoint/step-N \
+TMAX_AGENT=terminus SWE_MAX_CONTEXT_LEN=63488 SWE_GEN_BACKEND=torchtitan_wrapper \
 python -m torchtitan.experiments.rl.train \
     --module torchtitan.experiments.rl.examples.tmax \
     --config rl_grpo_qwen3_5_9b_tmax_tb2_eval \
     --num-generators 1 --hf_assets_path /path/to/Qwen3.5-9B
-
-# Score the BASE model (the step-0 baseline, policy_version 0): leave SWE_TB2_CKPT
-# unset/empty -> the recipe loads --hf_assets_path instead of a checkpoint.
-SWE_TB2_CKPT= \
-python -m torchtitan.experiments.rl.train \
-    --module torchtitan.experiments.rl.examples.tmax \
-    --config rl_grpo_qwen3_5_9b_tmax_tb2_eval \
-    --num-generators 1 --hf_assets_path /path/to/Qwen3.5-9B
+# Leave SWE_TB2_CKPT unset to score the BASE model (the step-0 baseline).
 ```
-
-Each pass writes `<dump>/validation_traces/step-<version>/summary.json` with
-`avg_at_k`, `pass_at_k`, and `policy_version`. To build a single eval curve, read
-those and log them to your tracker keyed by `policy_version` (0, 15, 30, ...).
 
 ## 4. Parameters at a glance
 
@@ -198,22 +209,26 @@ those and log them to your tracker keyed by `policy_version` (0, 15, 30, ...).
 | `SWE_NUM_GROUPS_PER_TRAIN_STEP` | 32 | GRPO prompt groups per step |
 | `SWE_GROUP_SIZE` | 16 | Siblings per group |
 | `SWE_DROP_ZERO_STD` | 0 | Keep zero-variance groups (no oversampling) |
-| `SWE_MAX_ACTIVE_GROUPS` | 512 | Off-policy buffer capacity |
+| `SWE_MAX_ACTIVE_GROUPS` | 512 | Off-policy buffer capacity (groups) |
+| `SWE_SELECTION_WINDOW_GROUPS` | 64 | Sliding-prefix selection window (>= batch; None=take-any) |
 | `SWE_TRAIN_STEPS` | 150 | Optimizer steps |
-| `SWE_ROLLOUT_CONCURRENCY` | 1280 | Active sandboxes |
+| `SWE_ROLLOUT_CONCURRENCY` | 768 | Active sandboxes (higher risks the controller crash) |
 | `SWE_NUM_ROLLOUT_WORKERS` | 16 | Agent-orchestration CPU processes |
 | `SWE_NUM_GENERATORS` (`--num-generators`) | 12 | vLLM engines (each 1 GPU) |
 | `SWE_CKPT_INTERVAL` | 5 | Checkpoint cadence (steps) |
-| `SWE_DP_REPLICATE` | 2 (multi-host) | HSDP replicate degree |
-| `SWE_VAL_SAMPLES` / `SWE_NUM_EVAL_GENERATORS` | 0 / 0 | Inline eval OFF (decoupled instead) |
+| `SWE_DP_REPLICATE` | 2 / 4 (multi-host) | HSDP replicate degree (HSDP-16 / HSDP-32) |
+| `SWE_TB2_VAL_DATA` | `tb2_eval.jsonl` | Inline TB-2.0 eval set (enables eval) |
+| `SWE_NUM_EVAL_GENERATORS` (`--num-eval-generators`) | 1 | Dedicated async eval-generator host |
+| `SWE_VAL_INTERVAL` / `SWE_VAL_SAMPLES` | 20 / 89 | Eval every 20 steps, all 89 tasks |
 
 ## 5. Reading the metrics
 
 - **`rollout_reward/_mean`** with `drop_zero_std=0` is the real batch-mean reward
-  (not pinned), so it is a usable training-progress signal.
-- **`eval/avg_at_5`** and **`eval/pass_at_5`** (from step 3, keyed by
-  `policy_version`) are the TB-2.0 curve. Compare against the step-0 baseline you
-  scored on the base model. Do not read a trend from fewer than ~7 points -- a
-  single TB-2.0 pass has real run-to-run noise.
+  (not pinned), so it is a usable training-progress signal (though noisy: the batch
+  composition varies pass to pass).
+- **`validation/reward/mean`** (avg@5) and **`validation/pass_at_k`** (pass@5),
+  keyed by `validation/policy_version`, are the inline TB-2.0 curve. Compare later
+  versions to the step-0 base-model baseline. Do not read a trend from fewer than
+  ~7 points -- a single TB-2.0 pass has real run-to-run noise.
 - The SWE-Smith half's improvement shows only in the training reward; the TB-2.0
   eval set is terminal-only.
