@@ -87,6 +87,47 @@ _PROACTIVE_SUMMARIZE_THRESHOLD = int(
 # max_context on the wall, give or take a rendering token.
 _CONTEXT_TAIL_MARGIN = 64
 
+# Placeholder model name handed to Terminus-2. The real policy is our swapped-in
+# _AdapterLLM, but Terminus-2 still calls litellm's token_counter(model=_MODEL_NAME)
+# once per turn to decide when to summarize. litellm does not know this name, so it
+# raised a BadRequest with the "Provider List" hint every turn -- caught and harmless,
+# but it flooded controller stdout and drowned the trainer step lines.
+_MODEL_NAME = "titan-actor"
+
+_litellm_registered = False
+
+
+def _register_titan_actor_with_litellm() -> None:
+    """Register the placeholder model name so litellm's token_counter stays quiet.
+
+    token_counter falls back to a tiktoken estimate for any registered model it has
+    no exact tokenizer for; registering the name just suppresses the per-turn
+    "Provider List" BadRequest, it does not change the (approximate) token count that
+    only drives Terminus-2's summarize threshold. Idempotent and best-effort: a
+    litellm API change here must never fail a rollout, so any error is swallowed.
+    """
+    global _litellm_registered
+    if _litellm_registered:
+        return
+    try:
+        import litellm
+
+        litellm.register_model(
+            {
+                _MODEL_NAME: {
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                    "max_input_tokens": _MAX_CONTEXT,
+                    "max_tokens": _TURN_MAX_TOKENS,
+                }
+            }
+        )
+    except Exception:
+        pass
+    # Set the flag even on failure: a broken litellm import will not recover per turn,
+    # and retrying it every rollout would just re-pay the import cost for nothing.
+    _litellm_registered = True
+
 
 class _AdapterExhausted(RuntimeError):
     """The adapter has no completion left for this session."""
@@ -353,6 +394,10 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
     from harbor.llms.base import ContextLengthExceededError  # type: ignore
     from harbor.models.agent.context import AgentContext  # type: ignore
 
+    # Quiet litellm's per-turn token_counter for our placeholder model name (see
+    # _register_titan_actor_with_litellm). Idempotent, cheap after the first call.
+    _register_titan_actor_with_litellm()
+
     submitted = False
     turns = 0
     format_errors = 0
@@ -371,7 +416,7 @@ async def terminus_agent(task: AgentTask) -> AgentRun:
             max_episodes = task.max_turns or _DEFAULT_MAX_TURNS
             agent = Terminus2(
                 logs_dir=Path(logs_dir),
-                model_name="titan-actor",
+                model_name=_MODEL_NAME,
                 parser_name=_PARSER,
                 record_terminal_session=False,
                 max_turns=max_episodes,
