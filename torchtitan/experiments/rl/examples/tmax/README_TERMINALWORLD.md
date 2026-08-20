@@ -103,6 +103,19 @@ export SWE_ROLLOUT_CONCURRENCY=1280   # active sandboxes; ~= (off+1)*groups*grou
 export SWE_NUM_ROLLOUT_WORKERS=16     # CPU agent-orchestration processes, off the controller GIL
 export SWE_CKPT_INTERVAL=5            # checkpoint every 5 steps (cheap resume on failure)
 
+# --- rollout wall-clock + sandbox tuning (recipe defaults; listed for reproducibility) ---
+export SWE_GDN=1                      # GDN (Gated DeltaNet) hybrid model path
+export SWE_DISABLE_CUSTOM_ALL_REDUCE=1  # required for the GDN generator under vLLM
+export SWE_TIME_BUDGET_SEC=2400       # per-rollout wall-clock budget (40 min)
+export TMAX_EXEC_TIMEOUT_SEC=120      # per-command timeout inside the sandbox
+export SWE_MAX_NUM_SEQS=32            # vLLM engine max concurrent sequences
+export SWE_SELECTION_WINDOW_GROUPS=20 # scheduler look-back window for finalized groups
+export TT_DAYTONA_CPU=2               # per-sandbox resources (Daytona)
+export TT_DAYTONA_MEM_GB=4
+export TT_DAYTONA_DISK_GB=10
+export TT_DAYTONA_HEARTBEAT_SEC=180   # sandbox keep-alive
+export TT_DAYTONA_CREATE_CONCURRENCY=8  # per-worker create parallelism; lower if the provider 429s
+
 # --- inline eval OFF: eval is decoupled to a separate job (step 3) so it never
 #     contends with training for the controller/sandbox provider ---
 export SWE_VAL_SAMPLES=0
@@ -114,6 +127,14 @@ python -m torchtitan.experiments.rl.train \
     --num-generators 12 \
     --hf_assets_path /path/to/Qwen3.5-9B
 ```
+
+### Host topology
+
+For the parameter set above on 8-GPU hosts, the run spans **~15 hosts**: 1 controller
++ 2 trainer hosts (the HSDP-16 trainer below) + 12 generator hosts (one per
+`--num-generators`, each a TP-1 vLLM engine). Scale generator hosts to trade cost for
+rollout throughput; the trainer host count follows the parallelism degrees. Launching
+across hosts is your own job scheduler's problem.
 
 ### Multi-host trainer (optional)
 
