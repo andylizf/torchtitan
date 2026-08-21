@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import random
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -84,6 +86,49 @@ class TMaxSample:
 
     tmax: dict = field(default_factory=dict)
     """Grading payload: ``test_sh``, ``fixtures`` ({relpath: content}), ``reward_path``."""
+
+
+
+def _parse_sample_row(row: dict) -> TMaxSample:
+    """One jsonl row -> TMaxSample; shared by __init__ and hot reload so a
+    reloaded row passes exactly the checks a boot-time row does."""
+    md = row.get("metadata") or {}
+    instance_id = (
+        md.get("instance_id")
+        or (row.get("label") if isinstance(row.get("label"), str) else None)
+        or "unknown"
+    )
+    image = md.get("image")
+    dockerfile = md.get("dockerfile")
+    build_context = md.get("build_context")
+    tmax = md.get("tmax") or {}
+    if not (image or dockerfile) or not tmax:
+        raise ValueError(
+            f"row {instance_id!r} missing image/dockerfile/tmax in metadata"
+        )
+    daytona_disk_gb = md.get("daytona_disk_gb")
+    if daytona_disk_gb is not None and (
+        isinstance(daytona_disk_gb, bool)
+        or not isinstance(daytona_disk_gb, int)
+        or daytona_disk_gb <= 0
+    ):
+        raise ValueError(
+            f"row {instance_id!r} has invalid daytona_disk_gb "
+            f"{daytona_disk_gb!r}; expected a positive integer"
+        )
+    return TMaxSample(
+        instance_id=instance_id,
+        image=image or "",
+        dockerfile=dockerfile,
+        build_context=build_context,
+        entrypoint=md.get("entrypoint"),
+        agent_timeout_sec=md.get("agent_timeout_sec"),
+        daytona_disk_gb=daytona_disk_gb,
+        workdir=md.get("workdir") or "/workspace",
+        problem_statement=md.get("problem_statement")
+        or _coerce_prompt(row.get("prompt")),
+        tmax=tmax,
+    )
 
 
 class TMaxDataset(Configurable):
@@ -141,46 +186,7 @@ class TMaxDataset(Configurable):
                 line = line.strip()
                 if not line:
                     continue
-                row = json.loads(line)
-                md = row.get("metadata") or {}
-                instance_id = (
-                    md.get("instance_id")
-                    or (row.get("label") if isinstance(row.get("label"), str) else None)
-                    or "unknown"
-                )
-                image = md.get("image")
-                dockerfile = md.get("dockerfile")
-                build_context = md.get("build_context")
-                tmax = md.get("tmax") or {}
-                if not (image or dockerfile) or not tmax:
-                    raise ValueError(
-                        f"row {instance_id!r} missing image/dockerfile/tmax in metadata"
-                    )
-                daytona_disk_gb = md.get("daytona_disk_gb")
-                if daytona_disk_gb is not None and (
-                    isinstance(daytona_disk_gb, bool)
-                    or not isinstance(daytona_disk_gb, int)
-                    or daytona_disk_gb <= 0
-                ):
-                    raise ValueError(
-                        f"row {instance_id!r} has invalid daytona_disk_gb "
-                        f"{daytona_disk_gb!r}; expected a positive integer"
-                    )
-                samples.append(
-                    TMaxSample(
-                        instance_id=instance_id,
-                        image=image or "",
-                        dockerfile=dockerfile,
-                        build_context=build_context,
-                        entrypoint=md.get("entrypoint"),
-                        agent_timeout_sec=md.get("agent_timeout_sec"),
-                        daytona_disk_gb=daytona_disk_gb,
-                        workdir=md.get("workdir") or "/workspace",
-                        problem_statement=md.get("problem_statement")
-                        or _coerce_prompt(row.get("prompt")),
-                        tmax=tmax,
-                    )
-                )
+                samples.append(_parse_sample_row(json.loads(line)))
         if not samples:
             raise ValueError(f"no rows found in {config.data_path}")
 
@@ -261,6 +267,25 @@ class TMaxDataset(Configurable):
                         f"all rows filtered out by skip_ids_path={config.skip_ids_path}"
                     )
         self._pos = 0
+        # True online task evolution: when SWE_DATA_HOT_RELOAD=1 and this is the
+        # train split, an atomic replacement of data_path (write temp + mv) is
+        # picked up mid-run - same-id rows are swapped in place (indices, shuffle
+        # order and checkpoint state all stay valid), new ids are appended to the
+        # tail of the current epoch. Rows are parsed by the same _parse_sample_row
+        # as boot; a malformed reload file is logged and IGNORED, never fatal.
+        # Validation stays pinned to the boot-time file (holdout stability).
+        self._hot_reload = (
+            os.environ.get("SWE_DATA_HOT_RELOAD", "0") == "1"
+            and config.split == "train"
+        )
+        self._data_path = config.data_path
+        self._holdout_n = config.holdout_n
+        try:
+            self._data_mtime = os.stat(config.data_path).st_mtime_ns
+        except OSError:
+            self._data_mtime = 0
+        self._reload_lock = threading.Lock()
+        self._last_reload_check = time.monotonic()
         if config.initial_skip_samples < 0:
             raise ValueError(
                 "TMaxDataset.Config.initial_skip_samples must be non-negative, "
@@ -278,6 +303,8 @@ class TMaxDataset(Configurable):
         return self
 
     def __next__(self) -> TMaxSample:
+        if self._hot_reload:
+            self._maybe_reload()
         if self._pos >= len(self._order):
             if self._shuffle:
                 self._rng.shuffle(self._order)
@@ -285,6 +312,76 @@ class TMaxDataset(Configurable):
         idx = self._order[self._pos]
         self._pos += 1
         return self._samples[idx]
+
+    def _maybe_reload(self, min_interval_sec: float = 20.0) -> None:
+        """Swap in a replaced data_path without disturbing sampler state.
+
+        mtime-gated and rate-limited; the whole reload is best-effort. Same-id
+        rows replace their TMaxSample in place so every index in _order (and in
+        a restored checkpoint order) still points at the same task, now
+        re-tuned. New ids append to _samples and join the tail of the current
+        epoch; the next epoch shuffle mixes them in fully. Ids absent from the
+        new file are dropped from _order (their sample stays, unreferenced, so
+        indices never shift)."""
+        now = time.monotonic()
+        if now - self._last_reload_check < min_interval_sec:
+            return
+        self._last_reload_check = now
+        try:
+            mtime = os.stat(self._data_path).st_mtime_ns
+        except OSError:
+            return
+        if mtime == self._data_mtime:
+            return
+        with self._reload_lock:
+            if mtime == self._data_mtime:
+                return
+            try:
+                fresh: list[TMaxSample] = []
+                with open(self._data_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            fresh.append(_parse_sample_row(json.loads(line)))
+                if self._holdout_n > 0:
+                    if self._holdout_n >= len(fresh):
+                        raise ValueError(
+                            f"holdout_n={self._holdout_n} >= reloaded size {len(fresh)}"
+                        )
+                    fresh = fresh[: -self._holdout_n]
+                if not fresh:
+                    raise ValueError("reloaded data_path has no train rows")
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                logger.warning("TMaxDataset: hot reload skipped (%s)", e)
+                self._data_mtime = mtime
+                return
+            by_id = {s.instance_id: s for s in fresh}
+            replaced = 0
+            for i, old in enumerate(self._samples):
+                new = by_id.pop(old.instance_id, None)
+                if new is not None:
+                    if new is not old and new != old:
+                        replaced += 1
+                    self._samples[i] = new
+            appended = 0
+            for new in by_id.values():
+                self._samples.append(new)
+                self._order.append(len(self._samples) - 1)
+                appended += 1
+            live_ids = {s.instance_id for s in fresh}
+            before = len(self._order)
+            self._order = [
+                i for i in self._order
+                if self._samples[i].instance_id in live_ids
+            ]
+            self._pos = min(self._pos, len(self._order))
+            self._data_mtime = mtime
+            logger.info(
+                "TMaxDataset: hot reload - %d replaced, %d appended, %d retired "
+                "(%d in rotation)",
+                replaced, appended, before - len(self._order),
+                len(self._order),
+            )
 
     def state_dict(self) -> dict:
         return {
