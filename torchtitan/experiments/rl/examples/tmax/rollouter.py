@@ -709,6 +709,7 @@ class TMaxRollouter(Rollouter):
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
             rollout.advantage = advantage
         self._maybe_annotate_zero_std(sample, rollouts)
+        self._maybe_emit_evolution_signal(sample, rollouts)
         return group
 
     def _maybe_annotate_zero_std(
@@ -743,8 +744,7 @@ class TMaxRollouter(Rollouter):
         try:
             os.makedirs(dump_dir, exist_ok=True)
             safe = sample.instance_id.replace("/", "_")
-            path = os.path.join(dump_dir, f"{safe}.json")
-            with open(path, "w") as f:
+            with open(os.path.join(dump_dir, f"{safe}.json"), "w") as f:
                 json.dump({"instance_id": sample.instance_id, "reward": rewards[0]}, f)
         except OSError as e:
             logger.warning(f"[tmax] zero-std annotate failed for {dump_dir}: {e}")
@@ -771,6 +771,85 @@ class TMaxRollouter(Rollouter):
         if declared is None:
             return self._time_budget_sec
         return max(int(declared), _DECLARED_AGENT_BUDGET_FLOOR_SEC)
+    def _maybe_emit_evolution_signal(
+        self, sample: TMaxSample, rollouts: list[Rollout]
+    ) -> None:
+        """Hand a no-signal group to a data-side task factory to be re-tuned to the
+        policy, instead of shed. This is the online half of recursive task synthesis,
+        and it is a first-class step, not a rider on the drop annotation: every group
+        the policy has moved past -- all-fail (0/k) or all-pass (k/k) -- is evolved,
+        0/k made easier and k/k made harder, and returned to the pool. Both directions
+        always; a group with any reward variance is already producing signal and is
+        left untouched.
+
+        Independent of ``_maybe_annotate_zero_std``: dropping sheds the prompt, this
+        re-tunes it, and a run enables either or both via its own env var. Same
+        write-once-per-file pattern (safe on the oilfs FUSE mount and across pooled
+        RolloutWorker processes). Best-effort; never raises into the rollout.
+        """
+        dump_dir = os.environ.get("SWE_TASK_EVOLUTION_DIR", "")
+        if not dump_dir:
+            return
+        if rollouts and rollouts[0].group_id < 0:  # validation prompts, never trained
+            return
+        rewards = [r.reward for r in rollouts if r.reward is not None]
+        if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
+            return
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            safe = sample.instance_id.replace("/", "_")
+            with open(os.path.join(dump_dir, f"{safe}.json"), "w") as f:
+                json.dump(self._evolution_signal(sample, rollouts, rewards), f)
+        except OSError as e:
+            logger.warning(f"[tmax] evolution signal failed for {dump_dir}: {e}")
+
+    @staticmethod
+    def _message_text(message: object) -> str:
+        """Flatten a chat message to the text a human reading the trajectory sees."""
+        if isinstance(message, str):
+            return message
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                return "\n".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            return str(content or "")
+        return "" if message is None else str(message)
+
+    def _evolution_signal(
+        self, sample: TMaxSample, rollouts: list[Rollout], rewards: list[float]
+    ) -> dict:
+        """What a zero-std group hands the data side: which way to move the task and
+        the per-attempt command transcript a hint is read from. Same shape a solver
+        rollout carries, so training rollouts and a standalone solve pass feed one
+        pipeline. all-pass -> harder, all-fail -> easier (the group is zero-std, so
+        every reward is the same and one of them decides the direction)."""
+        passed = rewards[0] > 0
+        return {
+            "task_id": sample.instance_id,
+            "solved": len(rewards) if passed else 0,
+            "total": len(rewards),
+            "direction": "harder" if passed else "easier",
+            "attempts": [
+                {
+                    "reward": r.reward,
+                    "turns": len(r.turns),
+                    "transcript": [
+                        {
+                            "cmd": self._message_text(turn.completion_message),
+                            "out": "\n".join(
+                                self._message_text(m) for m in turn.env_messages
+                            ),
+                        }
+                        for turn in r.turns
+                    ],
+                }
+                for r in rollouts
+                if r.reward is not None
+            ],
+        }
 
     async def _run_agent_rollout(
         self,
