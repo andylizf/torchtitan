@@ -90,7 +90,10 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
         self.enable_gqa = self.num_heads > self.num_kv_heads
 
         # Hopper (SM 9.0) uses FA3
-        if has_cuda_capability(9, 0):
+        # LOCAL (terminal-rl 2026-08-08): FA3 kernels are Hopper-only (SM 9.x);
+        # has_cuda_capability(9, 0) is a >= check and wrongly matches Blackwell
+        # (SM 10.x), where FA3 refuses to run. Gate on exactly 9.x.
+        if has_cuda_capability(9, 0) and not has_cuda_capability(10, 0):
             # activate_flash_attention_impl() will restore internal global state
             # and re-run register function, so we want to only call it once.
             if current_flash_attention_impl() != "FA3":
@@ -170,7 +173,17 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
         ), "Encoder-only attention not supported yet."
 
         # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(1)
+        # LOCAL (terminal-rl 2026-08-08): mirror the installed vLLM FA
+        # backend split (v1/attention/backends/flash_attn.py) - K/V are packed
+        # along the last dim in this build; older layouts kept for fallback.
+        if kv_cache.ndim >= 2 and kv_cache.shape[0] == 2:
+            key_cache, value_cache = kv_cache.unbind(0)
+        elif kv_cache.ndim >= 2 and kv_cache.shape[1] == 2:
+            key_cache, value_cache = kv_cache.unbind(1)
+        else:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
 
         assert not self.kv_cache_dtype.startswith(
             "fp8"

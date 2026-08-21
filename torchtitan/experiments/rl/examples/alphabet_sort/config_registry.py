@@ -56,6 +56,30 @@ from torchtitan.models.qwen3_5 import model_registry as qwen3_5_model_registry
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
+
+def _env_float(name: str, default: float) -> float:
+    """Fraction of a GPU the generator may take, from the environment.
+
+    Kept a knob rather than a constant because how much is free depends on who
+    else is on the box, and a number chosen for one afternoon should not become
+    the recipe's behaviour for everyone.
+    """
+    import os
+
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+def _env_degree(name: str, default: int) -> int:
+    """Parallel degree from the environment, for fitting a shared box."""
+    import os
+
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
 _BATCH_INVARIANT_DEBUG = DebugConfig(batch_invariant=True, deterministic=True)
 
 
@@ -109,7 +133,7 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
             training=TrainingConfig(),
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
-                tensor_parallel_degree=2,
+                tensor_parallel_degree=_env_degree("SWE_TRAIN_TP", 2),
             ),
             checkpoint=CheckpointManager.Config(
                 enable=True,
@@ -121,9 +145,10 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
+            gpu_memory_limit=_env_float("SWE_GPU_MEM_LIMIT", 0.9),
             parallelism=InferenceParallelismConfig(
-                data_parallel_degree=1,
-                tensor_parallel_degree=4,
+                data_parallel_degree=_env_degree("SWE_GEN_DP", 1),
+                tensor_parallel_degree=_env_degree("SWE_GEN_TP", 4),
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(

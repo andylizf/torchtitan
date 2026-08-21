@@ -764,6 +764,21 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                 config.trainer.parallelism, **_dp_overrides
             ),
         )
+    # LOCAL (terminal-rl 2026-08-08): generator VRAM fraction override for
+    # shared boxes where other users hold GPU memory. Default keeps base 0.9.
+    _gml = float(os.environ.get("SWE_GPU_MEM_LIMIT", "0"))
+    if _gml:
+        config.generator = dataclasses.replace(config.generator, gpu_memory_limit=_gml)
+    # LOCAL (terminal-rl 2026-08-08): generator engine count override (base bakes
+    # DP-8 = 8 TP-1 engines = 8 GPUs; shared box may not have them).
+    _gdp = int(os.environ.get("SWE_GEN_DP", "0"))
+    if _gdp:
+        config.generator = dataclasses.replace(
+            config.generator,
+            parallelism=dataclasses.replace(
+                config.generator.parallelism, data_parallel_degree=_gdp
+            ),
+        )
     # Optional AC-policy override for a fwd/bwd speed experiment. The base is FullAC
     # (recompute the whole forward -- needed to fit seq 65536). SWE_AC=selective swaps
     # in per-op SAC, which saves the expensive aten op outputs (projections, flash-attn
