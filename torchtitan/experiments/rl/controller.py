@@ -1595,7 +1595,48 @@ class Controller(Configurable):
             )
         aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
         self._validation_results[step] = aggregated
+        if metrics:
+            self._mirror_validation_to_wandb(aggregated, policy_version=step)
         return aggregated
+
+    def _mirror_validation_to_wandb(
+        self, aggregated: dict[str, float], *, policy_version: int
+    ) -> None:
+        """Log validation metrics into the training W&B run on their own step axis.
+
+        The metrics_processor call in ``_validate_and_log`` routes validation to W&B at
+        the live training step, which W&B drops: an async pass finishes at a step W&B has
+        already committed, and W&B requires a strictly-increasing step. Here we log the
+        validation keys with NO explicit step -- W&B appends them at its current
+        (monotonic) step, so nothing is dropped -- and bind them to their own x-axis
+        (``validation/policy_version``) via ``define_metric`` so they chart against the
+        evaluated version rather than wall-clock order. Logging without a step advances
+        W&B's step by one; that does not drop training points, which use explicit,
+        ever-increasing steps. Best-effort: a W&B hiccup must never fail training.
+        """
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        try:
+            payload = {
+                k: v for k, v in aggregated.items() if k.startswith("validation")
+            }
+            if not payload:
+                return
+            payload["validation/policy_version"] = policy_version
+            wandb.define_metric("validation/policy_version")
+            for key in payload:
+                if key != "validation/policy_version":
+                    wandb.define_metric(key, step_metric="validation/policy_version")
+            wandb.log(payload)
+        except Exception:
+            logger.exception(
+                "failed to mirror validation to the W&B run at policy_version %d",
+                policy_version,
+            )
 
     def _validation_pass_in_flight(self) -> bool:
         """True while a background validation pass is still running.
