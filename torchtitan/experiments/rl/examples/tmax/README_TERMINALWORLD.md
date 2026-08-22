@@ -99,10 +99,10 @@ export SWE_MAX_ACTIVE_GROUPS=512      # buffer capacity >= (off+1) * groups
 export SWE_TRAIN_STEPS=150
 
 # --- selection + throughput ---
-export SWE_SELECTION_WINDOW_GROUPS=64 # take from the oldest 64 finalized groups. 64 = 2x
-                                      # the 32-group batch: enough to fill a step without
-                                      # head-of-line blocking, bounded (more on-policy +
-                                      # less stale-drop waste) than None=take-any.
+# SWE_SELECTION_WINDOW_GROUPS: leave UNSET (None = take-any over all active groups).
+# Recommended default going forward -- see the "Selection window vs buffer size" note
+# below. This run originally used =64 (take from the oldest 64 finalized groups); None
+# is as-good-or-better and never worse in the comparisons we ran.
 export SWE_ROLLOUT_CONCURRENCY=768    # active sandboxes. Higher congests the controller<->
                                       # generator Monarch channels -> false "proc dead"
                                       # crashes (seen at 1280); 768 still fills a 512-rollout
@@ -144,6 +144,21 @@ python -m torchtitan.experiments.rl.train \
 > Daytona create storms that saturate the controller host and trigger the false
 > "proc dead" crash above. Filter build-failing tasks out of the training JSONL (watch
 > the logs for repeated `BUILD_FAILED` on one `instance_id`).
+
+> **Selection window vs buffer size (measured).** `SWE_SELECTION_WINDOW_GROUPS` only
+> affects the training-reward composition when the off-policy buffer
+> (`SWE_MAX_ACTIVE_GROUPS`) is large enough to hold many finalized candidates. In
+> controlled single-variable comparisons (everything else fixed): at a large buffer
+> (`=512`), widening the window from 20 to 64 groups raised the batch-mean
+> `rollout_reward/_mean` from ~0.58 to ~0.69 over matched steps; at a small buffer
+> (`=160`), changing the window (20 vs None) stayed within run-to-run noise (~0.60 vs
+> ~0.56). A wider window can only "cherry-pick" when the candidate pool is large, so
+> its effect is conditional on the buffer. Since a wider window is as-good-or-better and
+> never worse, **prefer leaving `SWE_SELECTION_WINDOW_GROUPS` unset (None = take-any)**
+> going forward. Caveat: this rests on short single runs without a variance estimate,
+> and a higher pinned reward partly reflects a shorter-rollout selection bias, not
+> necessarily better held-out generalization -- read the TB-2.0 curve, not just the
+> training reward.
 
 ### Host topology
 
@@ -210,7 +225,7 @@ python -m torchtitan.experiments.rl.train \
 | `SWE_GROUP_SIZE` | 16 | Siblings per group |
 | `SWE_DROP_ZERO_STD` | 0 | Keep zero-variance groups (no oversampling) |
 | `SWE_MAX_ACTIVE_GROUPS` | 512 | Off-policy buffer capacity (groups) |
-| `SWE_SELECTION_WINDOW_GROUPS` | 64 | Sliding-prefix selection window (>= batch; None=take-any) |
+| `SWE_SELECTION_WINDOW_GROUPS` | None (run used 64) | Sliding-prefix selection window; None=take-any. Prefer None -- see note above |
 | `SWE_TRAIN_STEPS` | 150 | Optimizer steps |
 | `SWE_ROLLOUT_CONCURRENCY` | 768 | Active sandboxes (higher risks the controller crash) |
 | `SWE_NUM_ROLLOUT_WORKERS` | 16 | Agent-orchestration CPU processes |
