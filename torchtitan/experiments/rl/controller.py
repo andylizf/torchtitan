@@ -925,8 +925,22 @@ class Controller(Configurable):
                 generators.append(generator)
             self.generator_router = config.generator_router.build(generators=generators)
 
-            # Validation-only generators. Same engine config, sized for the
-            # validation pass instead of the rollout pool, on their own router.
+            # Validation-only generators. Their gpu_memory_limit defaults to 0.7,
+            # lower than the training generators', and is overridable via
+            # SWE_EVAL_GPU_MEMORY_LIMIT: the held-out eval workload packs many long
+            # multi-turn sequences whose KV, plus a large chunked-prefill's transient
+            # activation, can OOM an engine sized for the shorter training-mix
+            # rollouts (observed as a DP all-reduce gloo-timeout cascade after one
+            # eval rank hit CUDA OOM). The lower limit leaves activation headroom on
+            # the eval engines without shrinking training-generator KV capacity.
+            # Sized for the validation pass instead of the rollout pool, on their own
+            # router.
+            eval_generator_config = replace(
+                config.generator,
+                gpu_memory_limit=float(
+                    os.environ.get("SWE_EVAL_GPU_MEMORY_LIMIT", "0.7")
+                ),
+            )
             eval_generators = []
             for idx, eval_mesh in enumerate(eval_generator_meshes):
                 actor_name = (
@@ -938,7 +952,7 @@ class Controller(Configurable):
                     eval_mesh.spawn(
                         actor_name,
                         VLLMGenerator,
-                        config.generator,
+                        eval_generator_config,
                         model_spec=config.model_spec,
                         model_path=config.hf_assets_path,
                         compile_config=config.compile,
