@@ -351,6 +351,26 @@ def _to_row(
     if "reward.txt" not in test_sh and "reward.json" not in test_sh:
         return None, "verifier_writes_no_reward"
 
+    # Per-task sandbox sizing from the task's own declaration ([environment]
+    # cpus / memory_mb in task.toml). Only emitted when it EXCEEDS the fleet
+    # defaults (2 vCPU / 4 GiB): absent fields keep the env-default sizing, so
+    # rows for ordinary tasks are byte-identical to before.
+    daytona_mem_gb = daytona_cpu = None
+    toml_path = os.path.join(task_dir, "task.toml")
+    if os.path.exists(toml_path):
+        try:
+            import tomllib
+            with open(toml_path, "rb") as f:
+                env = tomllib.load(f).get("environment", {})
+            mb = env.get("memory_mb")
+            if isinstance(mb, (int, float)) and mb > 4096:
+                daytona_mem_gb = -(-int(mb) // 1024)
+            cp = env.get("cpus")
+            if isinstance(cp, (int, float)) and cp > 2:
+                daytona_cpu = int(cp)
+        except Exception:
+            pass  # sizing is an optimization; a bad toml never blocks the row
+
     solve_path = os.path.join(task_dir, "solution", "solve.sh")
     oracle_commands = 0
     if os.path.exists(solve_path):
@@ -374,6 +394,10 @@ def _to_row(
     }
     if build_context:
         metadata["build_context"] = build_context
+    if daytona_mem_gb:
+        metadata["daytona_mem_gb"] = daytona_mem_gb
+    if daytona_cpu:
+        metadata["daytona_cpu"] = daytona_cpu
     entrypoint = _entrypoint_command(dockerfile)
     if entrypoint:
         metadata["entrypoint"] = entrypoint
