@@ -800,6 +800,16 @@ class TMaxRollouter(Rollouter):
             rewards = [float(r.reward) for r in rollouts if r.reward is not None]
             if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
                 return
+            # An all-fail group in which no attempt ever took a turn is an
+            # infrastructure failure (agent import error, sandbox never up),
+            # not a verdict on the task -- emitting it would drive an unearned
+            # simplify. One real turn anywhere is enough to call it measured.
+            if rewards[0] == 0 and not any(len(r.turns) for r in rollouts):
+                logger.warning(
+                    f"[tmax] evolution signal suppressed for "
+                    f"{sample.instance_id}: all-fail group with zero turns"
+                )
+                return
             os.makedirs(dump_dir, exist_ok=True)
             safe = sample.instance_id.replace("/", "_")
             with open(os.path.join(dump_dir, f"{safe}.json"), "w") as f:
