@@ -277,3 +277,33 @@ python -m torchtitan.experiments.rl.train \
   ~7 points -- a single TB-2.0 pass has real run-to-run noise.
 - The SWE-Smith half's improvement shows only in the training reward; the TB-2.0
   eval set is terminal-only.
+
+## 6. Results (this recipe)
+
+A 150-step run of the recipe above (window unset / buffer 160 / off 5 / concurrency
+2048 / HSDP-32) produced the first clearly positive TB-2.0 transfer we have seen on
+this setup. Inline TB-2.0 (89 tasks, k=5), by `validation/policy_version`:
+
+| policy_version | avg@5 | pass@5 |
+| --- | --- | --- |
+| 0 (base) | 0.178 | 0.303 |
+| 40 | 0.218 | 0.326 |
+| 80 | 0.200 | 0.337 |
+| 100 | 0.207 | 0.303 |
+| 140 | **0.227** | **0.348** |
+
+All four post-training points beat the base-model baseline on avg@5 (mean ~0.21,
+best +0.049 at the end); pass@5 ends at its maximum (+0.045, ~4 tasks). The run
+finished all 150 steps with zero restarts and no supervision crash.
+
+Note the eval lags training (a pass scores an older `policy_version`) and lands
+roughly every ~40 steps, because a ~20-step pass is skipped whenever the previous
+one is still running -- so a 150-step run yields ~5 eval points, below the ~7 the
+noise caveat above wants. Treat the trend as encouraging-but-not-definitive and, for
+a cleaner curve, raise eval capacity (more `--num-eval-generators`) or
+`SWE_VAL_INTERVAL` so passes do not overlap.
+
+The likely reason this recipe transfers where larger-buffer configs did not: the
+small buffer keeps the buffer-level stale-drop rate low (~5-6% of completed rollouts
+vs ~40% at buffer 512 / concurrency 2048), so the trained batch is not skimmed toward
+short/easy tasks -- see the buffer note in section 2.
