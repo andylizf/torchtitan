@@ -74,9 +74,10 @@ DAYTONA_API_KEY=dtn_... python torchtitan/experiments/rl/examples/tmax/local_smo
 
 ## 2. Launch training
 
-The full parameter set used for this run. The trainer takes one 8-GPU host; each
-generator is a separate single-GPU vLLM engine (TP-1), data-parallel, so more
-generators means more concurrent decode for the hundreds of live agents.
+The recommended 9B parameter set (the current run). The trainer spans the HSDP-32
+degrees below; each generator is a separate single-GPU vLLM engine (TP-1),
+data-parallel, so more generators means more concurrent decode for the hundreds of
+live agents.
 
 ```bash
 export DAYTONA_API_KEY=dtn_...
@@ -95,7 +96,12 @@ export SWE_GEN_BACKEND=torchtitan_wrapper
 export SWE_NUM_GROUPS_PER_TRAIN_STEP=32
 export SWE_GROUP_SIZE=16
 export SWE_DROP_ZERO_STD=0            # keep all-pass/all-fail groups (they add no gradient)
-export SWE_MAX_ACTIVE_GROUPS=512      # buffer capacity >= (off+1) * groups
+export SWE_OFFPOLICY_STEPS=5          # policy-age cap: a group unused for >5 versions is stale-dropped
+export SWE_MAX_ACTIVE_GROUPS=160      # run-ahead buffer (groups). Must clear the per-worker
+                                      # work-conserving minimum (~144 at conc 2048 / 16 workers).
+                                      # Kept small on purpose: a LARGE buffer (e.g. 512) lets many
+                                      # slow/long rollouts finish stale and get dropped, biasing the
+                                      # trained batch toward short/easy tasks -- see the buffer note below.
 export SWE_TRAIN_STEPS=150
 
 # --- selection + throughput ---
@@ -103,12 +109,20 @@ export SWE_TRAIN_STEPS=150
 # Recommended default going forward -- see the "Selection window vs buffer size" note
 # below. This run originally used =64 (take from the oldest 64 finalized groups); None
 # is as-good-or-better and never worse in the comparisons we ran.
-export SWE_ROLLOUT_CONCURRENCY=768    # active sandboxes. Higher congests the controller<->
-                                      # generator Monarch channels -> false "proc dead"
-                                      # crashes (seen at 1280); 768 still fills a 512-rollout
-                                      # step. Raise only after removing build-failing tasks.
+export SWE_ROLLOUT_CONCURRENCY=2048   # active sandboxes. High concurrency congests the
+                                      # controller<->generator Monarch channels and can trigger
+                                      # false "proc dead" crashes (seen at 1280 with defaults);
+                                      # running this high is only safe with the stability settings
+                                      # below (raised supervision timeout + checkpoint auto-resume)
+                                      # and with build-failing tasks removed from the data.
 export SWE_NUM_ROLLOUT_WORKERS=16     # CPU agent-orchestration processes, off the controller GIL
 export SWE_CKPT_INTERVAL=5            # checkpoint every 5 steps (cheap resume on failure)
+
+# --- stability: what lets the high concurrency above survive slow-sandbox stalls ---
+export MONARCH_SUPERVISION_WATCHDOG_TIMEOUT=1000s  # tolerate slow Daytona ops (cold builds up to
+                                      # ~900s); the default (~20s) falsely declares a stalled proc
+                                      # dead and tears down the whole job. Pair with a launcher that
+                                      # auto-resumes from the latest checkpoint on failure.
 
 # --- rollout wall-clock + sandbox tuning (recipe defaults; listed for reproducibility) ---
 export SWE_GDN=1                      # GDN (Gated DeltaNet) hybrid model path
@@ -145,6 +159,20 @@ python -m torchtitan.experiments.rl.train \
 > "proc dead" crash above. Filter build-failing tasks out of the training JSONL (watch
 > the logs for repeated `BUILD_FAILED` on one `instance_id`).
 
+> **Buffer size and the stale-drop bias (measured).** `SWE_MAX_ACTIVE_GROUPS` is the
+> run-ahead pool of in-flight groups, and it is the dominant lever on the pinned
+> training reward. A large buffer keeps many rollouts racing at once; the slow/long
+> ones tend to finish *after* their `SWE_OFFPOLICY_STEPS` window and are
+> `stale_dropped` (visible in the log as `[buffer] complete ... -> RELEASE(stale_dropped)`),
+> so the trained batch is skimmed from the FAST/short finishers. Measured full-run
+> stale-drop rate rose steeply with the in-flight pool (~13% at buffer 512 / concurrency
+> 768, ~41% at buffer 512 / concurrency 2048) and the pinned `rollout_reward/_mean`
+> tracked it upward -- i.e. the "high reward" of a big buffer is partly a short-task
+> selection artifact, and it wastes compute (dropped rollouts, including trainable
+> partial-solves). We therefore keep the buffer SMALL (160): ~3-5% stale, a more
+> representative batch, at the cost of a lower (but more honest) pinned reward. Judge
+> progress on the TB-2.0 curve, not the training reward.
+
 > **Selection window vs buffer size (measured).** `SWE_SELECTION_WINDOW_GROUPS` only
 > affects the training-reward composition when the off-policy buffer
 > (`SWE_MAX_ACTIVE_GROUPS`) is large enough to hold many finalized candidates. In
@@ -162,11 +190,11 @@ python -m torchtitan.experiments.rl.train \
 
 ### Host topology
 
-For the parameter set above on 8-GPU hosts, the run spans **~15 hosts**: 1 controller
-+ 2 trainer hosts (the HSDP-16 trainer below) + 12 generator hosts (one per
-`--num-generators`, each a TP-1 vLLM engine). Scale generator hosts to trade cost for
-rollout throughput; the trainer host count follows the parallelism degrees. Launching
-across hosts is your own job scheduler's problem.
+For the parameter set above on 8-GPU hosts, the run spans **~18 hosts**: 1 controller
++ 4 trainer hosts (the HSDP-32 trainer, `SWE_DP_REPLICATE=4`) + 12 generator hosts (one
+per `--num-generators`, each a TP-1 vLLM engine) + 1 eval-generator host. Scale generator
+hosts to trade cost for rollout throughput; the trainer host count follows the parallelism
+degrees. Launching across hosts is your own job scheduler's problem.
 
 ### Multi-host trainer (optional)
 
@@ -224,14 +252,16 @@ python -m torchtitan.experiments.rl.train \
 | `SWE_NUM_GROUPS_PER_TRAIN_STEP` | 32 | GRPO prompt groups per step |
 | `SWE_GROUP_SIZE` | 16 | Siblings per group |
 | `SWE_DROP_ZERO_STD` | 0 | Keep zero-variance groups (no oversampling) |
-| `SWE_MAX_ACTIVE_GROUPS` | 512 | Off-policy buffer capacity (groups) |
+| `SWE_OFFPOLICY_STEPS` | 5 | Policy-age cap; group unused for >5 versions is stale-dropped |
+| `SWE_MAX_ACTIVE_GROUPS` | 160 | Run-ahead buffer (groups); small on purpose -- see buffer note |
 | `SWE_SELECTION_WINDOW_GROUPS` | None (run used 64) | Sliding-prefix selection window; None=take-any. Prefer None -- see note above |
 | `SWE_TRAIN_STEPS` | 150 | Optimizer steps |
-| `SWE_ROLLOUT_CONCURRENCY` | 768 | Active sandboxes (higher risks the controller crash) |
+| `SWE_ROLLOUT_CONCURRENCY` | 2048 | Active sandboxes (needs the raised supervision timeout below) |
 | `SWE_NUM_ROLLOUT_WORKERS` | 16 | Agent-orchestration CPU processes |
 | `SWE_NUM_GENERATORS` (`--num-generators`) | 12 | vLLM engines (each 1 GPU) |
 | `SWE_CKPT_INTERVAL` | 5 | Checkpoint cadence (steps) |
-| `SWE_DP_REPLICATE` | 2 / 4 (multi-host) | HSDP replicate degree (HSDP-16 / HSDP-32) |
+| `SWE_DP_REPLICATE` | 4 | HSDP replicate degree (4 = HSDP-32, 4 trainer hosts; 2 = HSDP-16) |
+| `MONARCH_SUPERVISION_WATCHDOG_TIMEOUT` | 1000s | Tolerate slow-sandbox stalls at high concurrency |
 | `SWE_TB2_VAL_DATA` | `tb2_eval.jsonl` | Inline TB-2.0 eval set (enables eval) |
 | `SWE_NUM_EVAL_GENERATORS` (`--num-eval-generators`) | 1 | Dedicated async eval-generator host |
 | `SWE_VAL_INTERVAL` / `SWE_VAL_SAMPLES` | 20 / 89 | Eval every 20 steps, all 89 tasks |
