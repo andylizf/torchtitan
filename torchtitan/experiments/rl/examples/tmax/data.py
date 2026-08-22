@@ -383,6 +383,16 @@ class TMaxDataset(Configurable):
                 i for i in self._order
                 if self._samples[i].instance_id in live_ids
             ]
+            # Readmission: a sample retired by an earlier reload stays in
+            # _samples; if its id returns to the file it matches the replace
+            # loop above (so it is never in by_id/appended) but without this
+            # it would stay out of _order forever. Seen live: repaired tasks
+            # re-added to the mix were counted "replaced" yet never rotated.
+            in_order = set(self._order)
+            for i, s in enumerate(self._samples):
+                if s.instance_id in live_ids and i not in in_order:
+                    self._order.append(i)
+                    in_order.add(i)
             self._pos = min(self._pos, len(self._order))
             self._data_mtime = mtime
             logger.info(
