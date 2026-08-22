@@ -1129,7 +1129,8 @@ class TMaxRollouter(Rollouter):
         # sandbox is smaller than 26 tasks own declared req_memory_mb, so this
         # is the readout that says when memory, not the model, failed the task.
         _oom_marks = ("Killed", "Out of memory", "Cannot allocate memory",
-                      "MemoryError", "exit=137", "exit code 137")
+                      "MemoryError", "exit=137", "exit code 137",
+                      "No space left on device", "Disk quota exceeded")
         oom_suspect = any(
             any(m in self._message_text(msg) for m in _oom_marks)
             for turn in turns
