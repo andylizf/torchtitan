@@ -78,6 +78,12 @@ class TMaxSample:
     daytona_disk_gb: int | None = None
     """Optional per-task Daytona root-disk allocation in GiB."""
 
+    daytona_mem_gb: int | None = None
+    """Optional per-task Daytona memory allocation in GiB (task.toml req_memory_mb)."""
+
+    daytona_cpu: int | None = None
+    """Optional per-task Daytona vCPU allocation (task.toml req_cpus)."""
+
     workdir: str
     """Working directory inside the sandbox (best-guess; default ``/workspace``)."""
 
@@ -106,16 +112,17 @@ def _parse_sample_row(row: dict) -> TMaxSample:
         raise ValueError(
             f"row {instance_id!r} missing image/dockerfile/tmax in metadata"
         )
-    daytona_disk_gb = md.get("daytona_disk_gb")
-    if daytona_disk_gb is not None and (
-        isinstance(daytona_disk_gb, bool)
-        or not isinstance(daytona_disk_gb, int)
-        or daytona_disk_gb <= 0
-    ):
-        raise ValueError(
-            f"row {instance_id!r} has invalid daytona_disk_gb "
-            f"{daytona_disk_gb!r}; expected a positive integer"
-        )
+    res: dict[str, int | None] = {}
+    for key in ("daytona_disk_gb", "daytona_mem_gb", "daytona_cpu"):
+        v = md.get(key)
+        if v is not None and (
+            isinstance(v, bool) or not isinstance(v, int) or v <= 0
+        ):
+            raise ValueError(
+                f"row {instance_id!r} has invalid {key} "
+                f"{v!r}; expected a positive integer"
+            )
+        res[key] = v
     return TMaxSample(
         instance_id=instance_id,
         image=image or "",
@@ -123,7 +130,9 @@ def _parse_sample_row(row: dict) -> TMaxSample:
         build_context=build_context,
         entrypoint=md.get("entrypoint"),
         agent_timeout_sec=md.get("agent_timeout_sec"),
-        daytona_disk_gb=daytona_disk_gb,
+        daytona_disk_gb=res["daytona_disk_gb"],
+        daytona_mem_gb=res["daytona_mem_gb"],
+        daytona_cpu=res["daytona_cpu"],
         workdir=md.get("workdir") or "/workspace",
         problem_statement=md.get("problem_statement")
         or _coerce_prompt(row.get("prompt")),

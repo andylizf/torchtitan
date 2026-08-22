@@ -488,6 +488,8 @@ class DaytonaSandbox:
         build_context: dict[str, str] | None = None,
         timeout: int | None = None,
         disk_gb: int | None = None,
+        mem_gb: int | None = None,
+        cpu: int | None = None,
         issue_tracker: SandboxIssueTracker | None = None,
         **_ignored,
     ) -> None:
@@ -506,6 +508,15 @@ class DaytonaSandbox:
         self.build_context = build_context
         self.timeout = timeout
         self.disk_gb = disk_gb
+        for _name, _v in (("mem_gb", mem_gb), ("cpu", cpu)):
+            if _v is not None and (
+                isinstance(_v, bool) or not isinstance(_v, int) or _v <= 0
+            ):
+                raise ValueError(
+                    f"daytona {_name} must be a positive integer, got {_v!r}"
+                )
+        self.mem_gb = mem_gb
+        self.cpu = cpu
         self.allocated_disk_gb: int | None = None
         self.issue_tracker = issue_tracker or SandboxIssueTracker()
         # Daytona is optional and imported lazily, so its SDK types are not
@@ -715,8 +726,10 @@ class DaytonaSandbox:
             api_url=_getenv(*self.api_url_env) or None,
             target=_getenv(*self.target_env) or None,
         )
-        cpu = int(_getenv("TT_DAYTONA_CPU", default="2"))
-        mem = int(_getenv("TT_DAYTONA_MEM_GB", default="4"))
+        cpu = (self.cpu if self.cpu is not None
+               else int(_getenv("TT_DAYTONA_CPU", default="2")))
+        mem = (self.mem_gb if self.mem_gb is not None
+               else int(_getenv("TT_DAYTONA_MEM_GB", default="4")))
         disk = (
             self.disk_gb
             if self.disk_gb is not None

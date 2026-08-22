@@ -942,6 +942,8 @@ class TMaxRollouter(Rollouter):
                     build_context=sample.build_context,
                     install_claude=False,
                     disk_gb=sample.daytona_disk_gb,
+                    mem_gb=sample.daytona_mem_gb,
+                    cpu=sample.daytona_cpu,
                     issue_tracker=issue_tracker,
                 ) as sandbox:
                     # Force every tool command to run as root (tmax tasks touch
@@ -1122,12 +1124,24 @@ class TMaxRollouter(Rollouter):
                 ),
             )
 
+        # Suspected out-of-memory kills, surfaced as a greppable per-rollout
+        # flag: exit 137 / oom phrasing in any env message. The default 4GiB
+        # sandbox is smaller than 26 tasks own declared req_memory_mb, so this
+        # is the readout that says when memory, not the model, failed the task.
+        _oom_marks = ("Killed", "Out of memory", "Cannot allocate memory",
+                      "MemoryError", "exit=137", "exit code 137")
+        oom_suspect = any(
+            any(m in self._message_text(msg) for m in _oom_marks)
+            for turn in turns
+            for msg in turn.env_messages
+        )
         logger.info(
-            "[tmax] %s: status=%s reward=%.2f turns=%d",
+            "[tmax] %s: status=%s reward=%.2f turns=%d oom_suspect=%d",
             rollout_id,
             status,
             reward,
             len(turns),
+            int(oom_suspect),
         )
         self._maybe_dump_trace(
             rollout_id=rollout_id,
