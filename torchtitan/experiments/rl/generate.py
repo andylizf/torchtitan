@@ -166,7 +166,12 @@ def generate() -> None:
     )
     engine_kwargs["max_model_len"] = config.model_spec.model.max_seq_len
     engine_kwargs["max_num_seqs"] = max_num_seqs
-    if not has_cuda_capability(9, 0):
+    # Pre-Hopper needs block_size=256 for FA2; Blackwell (SM10x) needs it too --
+    # the >=9.0 check was written for Hopper and silently skipped Blackwell,
+    # where the default page size breaks both the FA2 fallback and FA4-cute
+    # paged paths (torchtitan#4097; maintainer guidance in torchtitan#4181:
+    # "just need to pin vLLM block size to 256").
+    if not has_cuda_capability(9, 0) or has_cuda_capability(10, 0):
         engine_kwargs["block_size"] = 256
     vllm_compilation_config = gen_config.cudagraph.get_vllm_compilation_config(
         max_num_seqs=max_num_seqs,
