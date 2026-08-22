@@ -792,16 +792,22 @@ class TMaxRollouter(Rollouter):
             return
         if rollouts and rollouts[0].group_id < 0:  # validation prompts, never trained
             return
-        rewards = [r.reward for r in rollouts if r.reward is not None]
-        if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
-            return
         try:
+            # float() first: backends hand back plain floats, numpy scalars or
+            # bools depending on the agent path, and statistics.pstdev on a
+            # mixed-type list raises AttributeError (.numerator). The whole
+            # emit is inside one guard so it keeps its never-raises contract.
+            rewards = [float(r.reward) for r in rollouts if r.reward is not None]
+            if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
+                return
             os.makedirs(dump_dir, exist_ok=True)
             safe = sample.instance_id.replace("/", "_")
             with open(os.path.join(dump_dir, f"{safe}.json"), "w") as f:
                 json.dump(self._evolution_signal(sample, rollouts, rewards), f)
-        except OSError as e:
-            logger.warning(f"[tmax] evolution signal failed for {dump_dir}: {e}")
+        except Exception as e:
+            logger.warning(
+                f"[tmax] evolution signal failed for {sample.instance_id}: {e}"
+            )
 
     @staticmethod
     def _message_text(message: object) -> str:
