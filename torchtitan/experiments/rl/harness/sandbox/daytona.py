@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Label stamped on every sandbox we create, so cleanup can target ONLY our
 # sandboxes (never another tenant's) when sharing a Daytona account.
-HARNESS_LABELS = {"owner": "titan_swe_r2e"}
+HARNESS_LABELS = {"owner": os.environ.get("TT_DAYTONA_LABEL", "titan_swe_r2e")}
 
 _COMMAND_KILL_GRACE_SEC = 10
 _DEFAULT_EXEC_REQUEST_TIMEOUT_SEC = 120
