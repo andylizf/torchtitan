@@ -75,6 +75,12 @@ class TMaxSample:
     Harbor states this per task, not per benchmark. None for corpora that do not
     declare one, in which case the rollouter falls back to its configured default."""
 
+    daytona_cpu: int | None = None
+    """Optional per-task Daytona vCPU allocation. None = TT_DAYTONA_CPU default."""
+
+    daytona_mem_gb: int | None = None
+    """Optional per-task Daytona memory allocation in GiB. None = TT_DAYTONA_MEM_GB default."""
+
     daytona_disk_gb: int | None = None
     """Optional per-task Daytona root-disk allocation in GiB."""
 
@@ -106,16 +112,19 @@ def _parse_sample_row(row: dict) -> TMaxSample:
         raise ValueError(
             f"row {instance_id!r} missing image/dockerfile/tmax in metadata"
         )
-    daytona_disk_gb = md.get("daytona_disk_gb")
-    if daytona_disk_gb is not None and (
-        isinstance(daytona_disk_gb, bool)
-        or not isinstance(daytona_disk_gb, int)
-        or daytona_disk_gb <= 0
-    ):
-        raise ValueError(
-            f"row {instance_id!r} has invalid daytona_disk_gb "
-            f"{daytona_disk_gb!r}; expected a positive integer"
-        )
+    # Per-task Daytona resource overrides (cpu / mem GiB / disk GiB); each is
+    # optional and a missing/None field falls back to the TT_DAYTONA_* env default.
+    daytona_resources: dict[str, int | None] = {}
+    for md_key in ("daytona_cpu", "daytona_mem_gb", "daytona_disk_gb"):
+        val = md.get(md_key)
+        if val is not None and (
+            isinstance(val, bool) or not isinstance(val, int) or val <= 0
+        ):
+            raise ValueError(
+                f"row {instance_id!r} has invalid {md_key} "
+                f"{val!r}; expected a positive integer"
+            )
+        daytona_resources[md_key] = val
     return TMaxSample(
         instance_id=instance_id,
         image=image or "",
@@ -123,7 +132,9 @@ def _parse_sample_row(row: dict) -> TMaxSample:
         build_context=build_context,
         entrypoint=md.get("entrypoint"),
         agent_timeout_sec=md.get("agent_timeout_sec"),
-        daytona_disk_gb=daytona_disk_gb,
+        daytona_cpu=daytona_resources["daytona_cpu"],
+        daytona_mem_gb=daytona_resources["daytona_mem_gb"],
+        daytona_disk_gb=daytona_resources["daytona_disk_gb"],
         workdir=md.get("workdir") or "/workspace",
         problem_statement=md.get("problem_statement")
         or _coerce_prompt(row.get("prompt")),

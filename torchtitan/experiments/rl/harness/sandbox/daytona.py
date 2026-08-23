@@ -463,9 +463,12 @@ class DaytonaSandbox:
     Env knobs:
       ``DAYTONA_API_KEY``                  -- API key (required).
       ``DAYTONA_API_URL`` / ``DAYTONA_TARGET`` -- override cloud endpoint/region.
-      ``TT_DAYTONA_CPU``                   -- vCPUs per sandbox (default 2).
+      ``TT_DAYTONA_CPU``                   -- vCPUs per sandbox (default 2). Fallback
+                                               when no per-task ``cpu`` is given.
       ``TT_DAYTONA_MEM_GB``                -- memory GiB per sandbox (default 4).
+                                               Fallback when no per-task ``memory``.
       ``TT_DAYTONA_DISK_GB``               -- disk GiB per sandbox (default 6).
+                                               Fallback when no per-task ``disk_gb``.
       ``TT_DAYTONA_CREATE_TIMEOUT``        -- snapshot-build/boot wait (default 900s).
       ``TT_DAYTONA_EXEC_TIMEOUT_MIN``       -- SDK request timeout floor; does not
                                                extend the command runtime limit.
@@ -487,16 +490,21 @@ class DaytonaSandbox:
         dockerfile: str | None = None,
         build_context: dict[str, str] | None = None,
         timeout: int | None = None,
+        cpu: int | None = None,
+        memory: int | None = None,
         disk_gb: int | None = None,
         issue_tracker: SandboxIssueTracker | None = None,
         **_ignored,
     ) -> None:
-        if disk_gb is not None and (
-            isinstance(disk_gb, bool) or not isinstance(disk_gb, int) or disk_gb <= 0
-        ):
-            raise ValueError(
-                f"daytona disk_gb must be a positive integer, got {disk_gb!r}"
-            )
+        # Per-task overrides for vCPU / memory (GiB) / disk (GiB). None means fall
+        # back to the TT_DAYTONA_{CPU,MEM_GB,DISK_GB} env defaults at create time.
+        for name, val in (("cpu", cpu), ("memory", memory), ("disk_gb", disk_gb)):
+            if val is not None and (
+                isinstance(val, bool) or not isinstance(val, int) or val <= 0
+            ):
+                raise ValueError(
+                    f"daytona {name} must be a positive integer, got {val!r}"
+                )
         if not image and not dockerfile:
             raise ValueError("daytona sandbox needs either an image or a dockerfile")
         if build_context and not dockerfile:
@@ -505,6 +513,8 @@ class DaytonaSandbox:
         self.dockerfile = dockerfile
         self.build_context = build_context
         self.timeout = timeout
+        self.cpu = cpu
+        self.mem = memory
         self.disk_gb = disk_gb
         self.allocated_disk_gb: int | None = None
         self.issue_tracker = issue_tracker or SandboxIssueTracker()
@@ -715,8 +725,16 @@ class DaytonaSandbox:
             api_url=_getenv(*self.api_url_env) or None,
             target=_getenv(*self.target_env) or None,
         )
-        cpu = int(_getenv("TT_DAYTONA_CPU", default="2"))
-        mem = int(_getenv("TT_DAYTONA_MEM_GB", default="4"))
+        cpu = (
+            self.cpu
+            if self.cpu is not None
+            else int(_getenv("TT_DAYTONA_CPU", default="2"))
+        )
+        mem = (
+            self.mem
+            if self.mem is not None
+            else int(_getenv("TT_DAYTONA_MEM_GB", default="4"))
+        )
         disk = (
             self.disk_gb
             if self.disk_gb is not None
