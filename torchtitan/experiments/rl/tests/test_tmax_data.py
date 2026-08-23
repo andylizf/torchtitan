@@ -67,6 +67,46 @@ def test_dataset_rejects_invalid_per_task_daytona_disk(tmp_path, disk_gb) -> Non
         TMaxDataset(TMaxDataset.Config(data_path=str(path), shuffle=False))
 
 
+def _write_row_resources(tmp_path, **resources):
+    """One row carrying arbitrary daytona_* resource fields (omitting None)."""
+    metadata = {
+        "instance_id": "task-1",
+        "image": "example/image",
+        "tmax": {"test_sh": "true"},
+    }
+    for key, val in resources.items():
+        if val is not None:
+            metadata[key] = val
+    path = tmp_path / "tmax.jsonl"
+    path.write_text(json.dumps({"metadata": metadata}) + "\n")
+    return path
+
+
+def test_dataset_reads_per_task_daytona_cpu_and_mem(tmp_path) -> None:
+    path = _write_row_resources(tmp_path, daytona_cpu=1, daytona_mem_gb=2)
+    sample = next(TMaxDataset(TMaxDataset.Config(data_path=str(path), shuffle=False)))
+
+    assert sample.daytona_cpu == 1
+    assert sample.daytona_mem_gb == 2
+
+
+def test_dataset_defaults_per_task_daytona_cpu_and_mem_to_none(tmp_path) -> None:
+    path = _write_row_resources(tmp_path)
+    sample = next(TMaxDataset(TMaxDataset.Config(data_path=str(path), shuffle=False)))
+
+    assert sample.daytona_cpu is None
+    assert sample.daytona_mem_gb is None
+
+
+@pytest.mark.parametrize("field", ["daytona_cpu", "daytona_mem_gb"])
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "2"])
+def test_dataset_rejects_invalid_per_task_daytona_cpu_mem(tmp_path, field, bad) -> None:
+    path = _write_row_resources(tmp_path, **{field: bad})
+
+    with pytest.raises(ValueError, match=f"invalid {field}"):
+        TMaxDataset(TMaxDataset.Config(data_path=str(path), shuffle=False))
+
+
 def test_dataset_skips_initial_samples_and_preserves_wraps(tmp_path) -> None:
     path = _write_rows(tmp_path, 3)
     baseline = TMaxDataset(

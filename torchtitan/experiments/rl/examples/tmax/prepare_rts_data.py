@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import random
 import re
@@ -309,8 +310,55 @@ def _grading_fixtures(task_dir: str) -> dict[str, str]:
     return fixtures
 
 
+# Per-task Daytona sizing floors. The dataset's declared/estimated numbers are
+# lower bounds (TerminalWorld's est_disk_mb is explicitly "a floor with slack"),
+# and an RL agent explores far more than the oracle solution, so clamp each
+# resource up to a safe minimum. CPU is the binding Daytona quota, so honoring the
+# median req_cpus=1 (vs the flat default 2) is where the savings come from; disk
+# keeps a generous floor because agent writes dwarf the oracle's est_disk_mb.
+_DAYTONA_CPU_FLOOR = 1
+_DAYTONA_MEM_GB_FLOOR = 2
+_DAYTONA_DISK_GB_FLOOR = 10
+
+
+def _load_resource_map(parquet_path: str) -> dict[str, dict[str, int]]:
+    """Map task_id -> {daytona_cpu, daytona_mem_gb, daytona_disk_gb} from the
+    dataset's own resource columns (req_cpus / req_memory_mb / est_disk_mb),
+    each clamped to the floors above. A missing/null cell is omitted so the sandbox
+    falls back to that field's TT_DAYTONA_* env default."""
+    import pandas as pd  # local import: only needed with --metadata-parquet
+
+    df = pd.read_parquet(parquet_path)
+    id_col = "task_id" if "task_id" in df.columns else df.columns[0]
+    out: dict[str, dict[str, int]] = {}
+    for _, row in df.iterrows():
+        tid = row.get(id_col)
+        if not isinstance(tid, str):
+            continue
+        res: dict[str, int] = {}
+        cpus = row.get("req_cpus")
+        if cpus is not None and not pd.isna(cpus):
+            res["daytona_cpu"] = max(_DAYTONA_CPU_FLOOR, int(round(float(cpus))))
+        mem_mb = row.get("req_memory_mb")
+        if mem_mb is not None and not pd.isna(mem_mb):
+            res["daytona_mem_gb"] = max(
+                _DAYTONA_MEM_GB_FLOOR, math.ceil(float(mem_mb) / 1024)
+            )
+        disk_mb = row.get("est_disk_mb")
+        if disk_mb is not None and not pd.isna(disk_mb):
+            res["daytona_disk_gb"] = max(
+                _DAYTONA_DISK_GB_FLOOR, math.ceil(float(disk_mb) / 1024)
+            )
+        if res:
+            out[tid] = res
+    return out
+
+
 def _to_row(
-    task_dir: str, *, inject_agent_runtime: bool = False
+    task_dir: str,
+    *,
+    inject_agent_runtime: bool = False,
+    resources: dict[str, int] | None = None,
 ) -> tuple[dict | None, str]:
     """Build one output row, or ``(None, reason)`` when the task is filtered out."""
     task_id = os.path.basename(task_dir.rstrip("/"))
@@ -377,6 +425,10 @@ def _to_row(
     entrypoint = _entrypoint_command(dockerfile)
     if entrypoint:
         metadata["entrypoint"] = entrypoint
+    # Per-task Daytona sizing from the dataset's resource columns (only the fields
+    # present for this task; absent ones fall back to the TT_DAYTONA_* defaults).
+    if resources:
+        metadata.update(resources)
     return {"prompt": instruction, "label": task_id, "metadata": metadata}, "ok"
 
 
@@ -387,6 +439,7 @@ def build_rows(
     seed: int = 42,
     max_oracle_commands: int | None = None,
     inject_agent_runtime: bool = False,
+    resource_map: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """Convert every task dir under ``tasks_roots`` to a row, applying the filters.
 
@@ -405,7 +458,12 @@ def build_rows(
     rows: list[dict] = []
     reasons: dict[str, int] = {}
     for d in dirs:
-        row, reason = _to_row(d, inject_agent_runtime=inject_agent_runtime)
+        task_id = os.path.basename(d.rstrip("/"))
+        row, reason = _to_row(
+            d,
+            inject_agent_runtime=inject_agent_runtime,
+            resources=(resource_map or {}).get(task_id),
+        )
         if (
             row is not None
             and max_oracle_commands is not None
@@ -456,6 +514,15 @@ def main() -> None:
         "than RTS, whose Dockerfiles already carry it",
     )
     ap.add_argument(
+        "--metadata-parquet",
+        default=None,
+        metavar="PATH",
+        help="dataset metadata/tasks.parquet -- read per-task req_cpus / "
+        "req_memory_mb / est_disk_mb and emit daytona_cpu/mem_gb/disk_gb so each "
+        "sandbox is sized to the task instead of the flat TT_DAYTONA_* defaults "
+        "(missing fields fall back to those defaults)",
+    )
+    ap.add_argument(
         "--smoke-size",
         type=int,
         default=0,
@@ -463,12 +530,19 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    resource_map = (
+        _load_resource_map(args.metadata_parquet) if args.metadata_parquet else None
+    )
+    if resource_map is not None:
+        print(f"loaded per-task resources for {len(resource_map)} tasks")
+
     rows, reasons = build_rows(
         args.tasks_root,
         limit=args.limit,
         seed=args.seed,
         max_oracle_commands=args.max_oracle_commands,
         inject_agent_runtime=args.inject_agent_runtime,
+        resource_map=resource_map,
     )
     if not rows:
         print(f"ERROR: produced 0 rows (filters: {reasons})", file=sys.stderr)

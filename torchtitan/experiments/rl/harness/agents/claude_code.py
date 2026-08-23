@@ -88,6 +88,8 @@ async def boot_agent_sandbox(
     dockerfile: str | None = None,
     build_context: dict[str, str] | None = None,
     install_claude: bool = True,
+    cpu: int | None = None,
+    memory: int | None = None,
     disk_gb: int | None = None,
     issue_tracker: SandboxIssueTracker | None = None,
 ) -> AsyncIterator[Sandbox]:
@@ -118,6 +120,8 @@ async def boot_agent_sandbox(
             image,
             dockerfile=dockerfile,
             build_context=build_context,
+            cpu=cpu,
+            memory=memory,
             disk_gb=disk_gb,
             issue_tracker=tracker,
         )

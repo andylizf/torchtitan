@@ -846,6 +846,8 @@ class TMaxRollouter(Rollouter):
                     dockerfile=sample.dockerfile,
                     build_context=sample.build_context,
                     install_claude=False,
+                    cpu=sample.daytona_cpu,
+                    memory=sample.daytona_mem_gb,
                     disk_gb=sample.daytona_disk_gb,
                     issue_tracker=issue_tracker,
                 ) as sandbox:
