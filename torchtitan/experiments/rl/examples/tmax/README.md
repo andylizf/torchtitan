@@ -42,6 +42,9 @@ Two tmax-specific points:
 
 - `prepare_tmax_data.py` -- build the training JSONL from `allenai/tmax-15k-open-instruct`
 - `prepare_tb2_data.py` -- build a Terminal-Bench 2.0 eval JSONL (89 tasks) in the same schema
+- `prepare_tb2_1_data.py` -- **preferred**: the same for Terminal-Bench **2.1**, upstream's
+  verified re-cut of those 89 tasks. Fixes three defects in the 2.0 script (2.1's `tasks/`
+  layout, dropped binary grading fixtures, no per-task sandbox sizing) -- see its docstring
 - `prepare_rts_data.py` -- build a JSONL from the Recursive-Task-Synthesis corpus
   (ships a Dockerfile per task instead of an image; records `oracle_commands`)
 - `data.py` / `env.py` -- `TMaxDataset` (train/holdout split) and the token env
@@ -90,10 +93,28 @@ fp32 master params with bf16 FSDP compute, fused AdamW lr 1e-6 / betas (0.9, 0.9
 python -m torchtitan.experiments.rl.examples.tmax.prepare_tmax_data \
     --out /path/to/tmax_train.jsonl
 
-# Terminal-Bench 2.0 eval set (89 tasks, same schema)
+# Terminal-Bench 2.1 eval set (89 tasks, same schema) -- prefer this over 2.0
+python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_1_data \
+    --out /path/to/tb2_1_eval.jsonl
+
+# ...or from a local clone of github.com/harbor-framework/terminal-bench-2-1
+python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_1_data \
+    --tasks-root /path/to/terminal-bench-2-1 --out /path/to/tb2_1_eval.jsonl
+
+# Terminal-Bench 2.0 eval set (the older cut; kept for comparability with past runs)
 python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_data \
     --out /path/to/tb2_eval.jsonl
 ```
+
+> **Use 2.1 for new numbers.** TB-2.1 is upstream's verified re-cut: same 89 task ids,
+> but 10 rebuilt images, 4 timeout corrections and 27 tasks with fixed instructions /
+> tests / solutions / environments. The 2.1 builder also ships the 7 binary grading fixtures that
+> `prepare_tb2_data.py` silently dropped (those tasks could not score above 0 on the
+> old file) and emits per-task `daytona_cpu/mem_gb/disk_gb`. Set
+> `TMAX_EVAL_TIMEOUT_SEC=1800` for a full-suite eval -- two tasks declare an 1800s
+> verifier budget and the grader applies one global value. Both JSONLs feed the same
+> `SWE_TB2_DATA` / `SWE_TB2_VAL_DATA` path; a 2.0 number and a 2.1 number are not
+> directly comparable.
 
 Each row is `{prompt, label, metadata{instance_id, image, workdir, tmax{test_sh,
 fixtures, reward_path}}}` -- see the module docstrings for the full contract.
