@@ -27,10 +27,12 @@ The dataset is an endless, seeded stream of frozen ``TMaxSample``s, mirroring
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -295,6 +297,12 @@ class TMaxDataset(Configurable):
             self._data_mtime = os.stat(config.data_path).st_mtime_ns
         except OSError:
             self._data_mtime = 0
+        # Highest already-loaded evolve mix version (<stem>.v<N>.jsonl). 0 = only the
+        # boot-time base file seen. Versioned files are how the evolve loop publishes an
+        # update that a REMOTE host sees (a new filename appears on the shared mount);
+        # a rewrite of the same base name only flips mtime, which a remote FUSE client
+        # caches. See _reload_source.
+        self._data_version = 0
         self._reload_lock = threading.Lock()
         self._last_reload_check = time.monotonic()
         if config.initial_skip_samples < 0:
@@ -324,32 +332,72 @@ class TMaxDataset(Configurable):
         self._pos += 1
         return self._samples[idx]
 
-    def _maybe_reload(self, min_interval_sec: float = 20.0) -> None:
-        """Swap in a replaced data_path without disturbing sampler state.
+    def _latest_versioned(self) -> tuple[str | None, int]:
+        """Newest ``<stem>.v<N>.jsonl`` beside data_path, keyed by integer N.
 
-        mtime-gated and rate-limited; the whole reload is best-effort. Same-id
-        rows replace their TMaxSample in place so every index in _order (and in
-        a restored checkpoint order) still points at the same task, now
-        re-tuned. New ids append to _samples and join the tail of the current
-        epoch; the next epoch shuffle mixes them in fully. Ids absent from the
-        new file are dropped from _order (their sample stays, unreferenced, so
-        indices never shift)."""
+        These are the evolve loop's write-once mix versions (SWE_MIX_VERSIONED). A new
+        filename appearing is visible across hosts on the shared FUSE mount, unlike an
+        mtime bump on a rewritten same-name file. (None, 0) when none exist."""
+        base = self._data_path
+        stem = base[:-6] if base.endswith(".jsonl") else base
+        best_path, best_n = None, 0
+        try:
+            candidates = glob.glob(f"{stem}.v*.jsonl")
+        except OSError:
+            return None, 0
+        for path in candidates:
+            match = re.search(r"\.v(\d+)\.jsonl$", path)
+            if match:
+                n = int(match.group(1))
+                if n > best_n:
+                    best_n, best_path = n, path
+        return best_path, best_n
+
+    def _reload_source(self) -> tuple[str | None, int | None, int | None]:
+        """(path, version, mtime) to reload from, or (None, None, None) if unchanged.
+
+        Prefers the evolve loop's write-once versioned files (cross-host reliable).
+        Falls back to an mtime change on the base data_path for the single-host case
+        (evolve + training on one node, same FUSE client) and stays a no-op when no
+        file has changed (evolution off = static dataset). ``version`` is set for the
+        versioned path, ``mtime`` for the base path; the caller tracks whichever."""
+        latest, version = self._latest_versioned()
+        if latest is not None and version > self._data_version:
+            return latest, version, None
+        try:
+            mtime = os.stat(self._data_path).st_mtime_ns
+        except OSError:
+            return None, None, None
+        if mtime != self._data_mtime:
+            return self._data_path, None, mtime
+        return None, None, None
+
+    def _maybe_reload(self, min_interval_sec: float = 20.0) -> None:
+        """Swap in a replaced/new-version data file without disturbing sampler state.
+
+        Rate-limited; the whole reload is best-effort. Same-id rows replace their
+        TMaxSample in place so every index in _order (and in a restored checkpoint
+        order) still points at the same task, now re-tuned. New ids append to _samples
+        and join the tail of the current epoch; the next epoch shuffle mixes them in
+        fully. Ids absent from the new file are dropped from _order (their sample
+        stays, unreferenced, so indices never shift). The source is a versioned mix
+        file (cross-host) or the base data_path (single-host) -- see _reload_source."""
         now = time.monotonic()
         if now - self._last_reload_check < min_interval_sec:
             return
         self._last_reload_check = now
-        try:
-            mtime = os.stat(self._data_path).st_mtime_ns
-        except OSError:
-            return
-        if mtime == self._data_mtime:
+        src, version, mtime = self._reload_source()
+        if src is None:
             return
         with self._reload_lock:
-            if mtime == self._data_mtime:
+            # Re-check under the lock: another thread may already have this version.
+            if version is not None and version <= self._data_version:
+                return
+            if version is None and mtime == self._data_mtime:
                 return
             try:
                 fresh: list[TMaxSample] = []
-                with open(self._data_path) as f:
+                with open(src) as f:
                     for line in f:
                         line = line.strip()
                         if line:
@@ -361,10 +409,14 @@ class TMaxDataset(Configurable):
                         )
                     fresh = fresh[: -self._holdout_n]
                 if not fresh:
-                    raise ValueError("reloaded data_path has no train rows")
+                    raise ValueError(f"reloaded mix {src} has no train rows")
             except (OSError, ValueError, json.JSONDecodeError) as e:
                 logger.warning("TMaxDataset: hot reload skipped (%s)", e)
-                self._data_mtime = mtime
+                # Mark this source seen so a broken file is not retried every interval.
+                if version is not None:
+                    self._data_version = version
+                else:
+                    self._data_mtime = mtime
                 return
             by_id = {s.instance_id: s for s in fresh}
             replaced = 0
@@ -386,12 +438,15 @@ class TMaxDataset(Configurable):
                 if self._samples[i].instance_id in live_ids
             ]
             self._pos = min(self._pos, len(self._order))
-            self._data_mtime = mtime
+            if version is not None:
+                self._data_version = version
+            else:
+                self._data_mtime = mtime
             logger.info(
                 "TMaxDataset: hot reload - %d replaced, %d appended, %d retired "
-                "(%d in rotation)",
+                "(%d in rotation) from %s",
                 replaced, appended, before - len(self._order),
-                len(self._order),
+                len(self._order), os.path.basename(src),
             )
 
     def state_dict(self) -> dict:
