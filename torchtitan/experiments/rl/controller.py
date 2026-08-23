@@ -1714,6 +1714,41 @@ class Controller(Configurable):
             )
         logger.info("=" * 60)
 
+    def _evolution_metrics(self) -> list[m.Metric]:
+        """Online task-evolution counters for wandb, read from the evolve loop's stats
+        file on the shared mount (evolution_stats.json, written by evolve_ondella each
+        round). Empty when the feature is off (SWE_TASK_EVOLUTION_DIR unset) or no round
+        has completed yet. NoReduce: these are cumulative gauges, not per-token
+        reductions, so they are exempt from the loss-metric suffix rule."""
+        import json
+
+        sig_dir = os.environ.get("SWE_TASK_EVOLUTION_DIR")
+        if not sig_dir:
+            return []
+        stats_path = os.path.join(os.path.dirname(sig_dir), "evolution_stats.json")
+        try:
+            with open(stats_path) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            return []
+        counts = s.get("counts", {}) or {}
+        revalidate_failed = sum(
+            v for k, v in counts.items() if k.startswith("revalidate_")
+        )
+        return [
+            m.Metric("evolution/rounds", m.NoReduce(float(s.get("rounds", 0)))),
+            m.Metric("evolution/folded_total", m.NoReduce(float(s.get("folded", 0)))),
+            m.Metric("evolution/retuned_total", m.NoReduce(float(s.get("retuned", 0)))),
+            m.Metric(
+                "evolution/pending_signals", m.NoReduce(float(s.get("pending", 0)))
+            ),
+            m.Metric(
+                "evolution/revalidate_failed_total",
+                m.NoReduce(float(revalidate_failed)),
+            ),
+            m.Metric("evolution/kept_total", m.NoReduce(float(counts.get("kept", 0)))),
+        ]
+
     async def _data_input_loop(self, group_buffer: RolloutGroupWorkBuffer) -> None:
         """produces a RolloutGroupWork into group_buffer.
         waits for:    a free active slot (group_buffer.wait_for_slot)
@@ -2113,6 +2148,7 @@ class Controller(Configurable):
                         for key, value in optim_result.metrics.items()
                     ],
                     *self._group_buffer.metrics(),
+                    *self._evolution_metrics(),
                     *time_metrics,
                     *policy_age_panel,
                     *compute_perf_ratio_metrics(

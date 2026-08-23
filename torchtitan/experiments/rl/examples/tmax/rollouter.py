@@ -700,6 +700,24 @@ class TMaxRollouter(Rollouter):
                 f"infrastructure failures excluded from the advantage baseline"
             )
 
+        # Group reward-shape metrics -- also exactly what online evolution acts on: a
+        # zero-variance group produces no gradient and is the one re-tuned, 0/k ("too
+        # hard") made easier and k/k ("too easy") made harder. Logging the split here
+        # puts the evolve loop's input rate on the training wandb (frac of groups per
+        # step, so frac * groups-per-step = count). Same basis as
+        # _maybe_emit_evolution_signal (rewards include NaN infra-fails -> pstdev is
+        # NaN -> not zero-std), training groups only (group_id >= 0).
+        if group_id >= 0:
+            ev_rewards = [r.reward for r in rollouts if r.reward is not None]
+            ev_zero_std = len(ev_rewards) >= 2 and statistics.pstdev(ev_rewards) == 0.0
+            ev_all_pass = ev_zero_std and ev_rewards[0] > 0
+            ev_all_fail = ev_zero_std and not ev_all_pass
+            group_metrics += [
+                m.Metric("rollout/zero_std_group_frac", m.Mean(float(ev_zero_std))),
+                m.Metric("rollout/all_fail_group_frac", m.Mean(float(ev_all_fail))),
+                m.Metric("rollout/all_pass_group_frac", m.Mean(float(ev_all_pass))),
+            ]
+
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
