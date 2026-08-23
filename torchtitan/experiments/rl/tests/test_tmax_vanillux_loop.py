@@ -672,3 +672,65 @@ def test_worker_info_logging_reaches_a_handler_without_duplicating(
         titan.setLevel(saved[1])
         root.handlers[:] = saved[2]
         root.setLevel(saved[3])
+
+
+
+
+def test_evolution_signal_written_with_direction_and_transcript(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """SWE_TASK_EVOLUTION_DIR gets a fuller signal than the drop annotation: the
+    direction to move an all-pass group (harder) and each attempt's transcript."""
+    monkeypatch.delenv("SWE_ZERO_STD_DIR", raising=False)
+    monkeypatch.setenv("SWE_TASK_EVOLUTION_DIR", str(tmp_path))
+    rollouter = object.__new__(TMaxRollouter)
+    sample = TMaxSample(
+        instance_id="task-abc",  # noqa: evolution signal test
+        image="example/image",
+        workdir="/workspace",
+        problem_statement="test",
+    )
+    rollouts = [
+        Rollout(
+            group_id=1,
+            rollout_id=idx,
+            status=RolloutStatus.COMPLETED,
+            reward=1.0,
+            turns=[],
+        )
+        for idx in range(3)
+    ]
+
+    rollouter._maybe_emit_evolution_signal(sample, rollouts)
+
+    signal_path = tmp_path / "task-abc.json"
+    assert signal_path.exists()
+    import json as _json
+
+    signal = _json.loads(signal_path.read_text())
+    assert signal["task_id"] == "task-abc"
+    assert signal["solved"] == 3 and signal["total"] == 3
+    assert signal["direction"] == "harder"
+    assert len(signal["attempts"]) == 3
+
+
+def test_in_band_group_writes_no_evolution_signal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A group with reward variance still trains; it is not a candidate to evolve."""
+    monkeypatch.setenv("SWE_TASK_EVOLUTION_DIR", str(tmp_path))
+    rollouter = object.__new__(TMaxRollouter)
+    sample = TMaxSample(
+        instance_id="task-band",
+        image="example/image",
+        workdir="/workspace",
+        problem_statement="test",
+    )
+    rollouts = [
+        Rollout(group_id=1, rollout_id=0, status=RolloutStatus.COMPLETED, reward=1.0),
+        Rollout(group_id=1, rollout_id=1, status=RolloutStatus.COMPLETED, reward=0.0),
+    ]
+
+    rollouter._maybe_emit_evolution_signal(sample, rollouts)
+
+    assert not (tmp_path / "task-band.json").exists()
