@@ -709,7 +709,7 @@ class TMaxRollouter(Rollouter):
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
             rollout.advantage = advantage
         self._maybe_annotate_zero_std(sample, rollouts)
-        self._maybe_emit_evolution_signal(sample, rollouts)
+        self._maybe_emit_evolution_signal(sample, rollouts, renderer)
         return group
 
     def _maybe_annotate_zero_std(
@@ -772,7 +772,7 @@ class TMaxRollouter(Rollouter):
             return self._time_budget_sec
         return max(int(declared), _DECLARED_AGENT_BUDGET_FLOOR_SEC)
     def _maybe_emit_evolution_signal(
-        self, sample: TMaxSample, rollouts: list[Rollout]
+        self, sample: TMaxSample, rollouts: list[Rollout], renderer=None
     ) -> None:
         """Hand a no-signal group to a data-side task factory to be re-tuned to the
         policy, instead of shed. This is the online half of recursive task synthesis,
@@ -813,7 +813,7 @@ class TMaxRollouter(Rollouter):
             os.makedirs(dump_dir, exist_ok=True)
             safe = sample.instance_id.replace("/", "_")
             with open(os.path.join(dump_dir, f"{safe}.json"), "w") as f:
-                json.dump(self._evolution_signal(sample, rollouts, rewards), f)
+                json.dump(self._evolution_signal(sample, rollouts, rewards, renderer), f)
         except Exception as e:
             logger.warning(
                 f"[tmax] evolution signal failed for {sample.instance_id}: {e}"
@@ -834,34 +834,75 @@ class TMaxRollouter(Rollouter):
             return str(content or "")
         return "" if message is None else str(message)
 
+    def _rollout_transcript(self, rollout, tokenizer) -> list[dict]:
+        """Per-turn {cmd, out} decoded from TOKENS, not from parsed Messages.
+
+        The terminus agent carries its command in ``tool_calls`` and leaves
+        ``completion_message.content`` empty, so ``_message_text`` recovered
+        nothing (every cmd/out was ""). The reliable text is the token stream:
+        a turn's completion is the model's action (``<tool_call>`` and all), and
+        the tool_response is the next turn's prompt delta -- the same TITO
+        reconstruction the SWE_ROLLOUT_DUMP_DIR trace uses. Bounded per turn so
+        one pathological turn cannot bloat the signal. Best-effort: on any
+        failure the caller falls back to the message-parse path.
+        """
+        def dec(ids):
+            if tokenizer is None or not ids:
+                return ""
+            return tokenizer.decode(list(ids), skip_special_tokens=False)[:4000]
+
+        turns = rollout.turns
+        out = []
+        for i, tn in enumerate(turns):
+            cmd = dec(getattr(tn, "completion_token_ids", None))
+            resp = ""
+            if i + 1 < len(turns):
+                cur = list(getattr(tn, "prompt_token_ids", []) or []) + \
+                    list(getattr(tn, "completion_token_ids", []) or [])
+                nxt = list(getattr(turns[i + 1], "prompt_token_ids", []) or [])
+                if nxt[: len(cur)] == cur:
+                    resp = dec(nxt[len(cur):])
+            out.append({"cmd": cmd, "out": resp})
+        return out
+
     def _evolution_signal(
-        self, sample: TMaxSample, rollouts: list[Rollout], rewards: list[float]
+        self, sample: TMaxSample, rollouts: list[Rollout],
+        rewards: list[float], renderer=None
     ) -> dict:
         """What a zero-std group hands the data side: which way to move the task and
         the per-attempt command transcript a hint is read from. Same shape a solver
         rollout carries, so training rollouts and a standalone solve pass feed one
         pipeline. all-pass -> harder, all-fail -> easier (the group is zero-std, so
-        every reward is the same and one of them decides the direction)."""
+        every reward is the same and one of them decides the direction).
+
+        Transcript is decoded from tokens (see ``_rollout_transcript``); a parsed-
+        message fallback keeps the old shape if decoding is unavailable."""
         passed = rewards[0] > 0
+        tokenizer = None
+        if renderer is not None:
+            tokenizer = getattr(renderer, "tokenizer", None) or getattr(
+                renderer, "_tokenizer", None)
+
+        def transcript(r):
+            try:
+                if tokenizer is not None:
+                    return self._rollout_transcript(r, tokenizer)
+            except Exception:  # noqa: BLE001 -- never break signal emission
+                pass
+            return [
+                {"cmd": self._message_text(turn.completion_message),
+                 "out": "\n".join(self._message_text(m) for m in turn.env_messages)}
+                for turn in r.turns
+            ]
+
         return {
             "task_id": sample.instance_id,
             "solved": len(rewards) if passed else 0,
             "total": len(rewards),
             "direction": "harder" if passed else "easier",
             "attempts": [
-                {
-                    "reward": r.reward,
-                    "turns": len(r.turns),
-                    "transcript": [
-                        {
-                            "cmd": self._message_text(turn.completion_message),
-                            "out": "\n".join(
-                                self._message_text(m) for m in turn.env_messages
-                            ),
-                        }
-                        for turn in r.turns
-                    ],
-                }
+                {"reward": r.reward, "turns": len(r.turns),
+                 "transcript": transcript(r)}
                 for r in rollouts
                 if r.reward is not None
             ],
