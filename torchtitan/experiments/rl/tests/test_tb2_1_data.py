@@ -264,3 +264,46 @@ def test_injected_decoder_restores_the_binary_in_a_real_shell(tmp_path):
     # The carrier is cleaned up, so the verifier sees the same tree Harbor would.
     assert not (tests_dir / ("blob.bin" + _B64_SUFFIX)).exists()
     assert list(tests_dir.glob("*.tmp")) == []
+
+
+def test_reads_tb2_0_size_string_resources(tmp_path):
+    """TB-2.0 (schema 1.0) states ``memory = "2G"`` / ``storage = "10G"`` instead of
+    the 2.1 megabyte fields. A 2.0-style tree must still size from its own
+    declaration rather than silently falling back to the TT_DAYTONA_* defaults."""
+    root = tmp_path / "flat"
+    root.mkdir()
+    toml = """version = "1.0"
+
+[verifier]
+timeout_sec = 900.0
+
+[agent]
+timeout_sec = 900.0
+
+[environment]
+docker_image = "alexgshaw/demo:20251031"
+cpus = 4
+memory = "8G"
+storage = "10G"
+"""
+    _write_task(root, "demo-task", task_toml=toml, binary=None)
+
+    (row,), _ = build_rows(tasks_root=str(root))
+    md = row["metadata"]
+
+    assert md["daytona_cpu"] == 4
+    assert md["daytona_mem_gb"] == 8
+    assert md["daytona_disk_gb"] == 10
+    assert md["agent_timeout_sec"] == 900.0
+
+
+@pytest.mark.parametrize(
+    "size,expected",
+    [("2G", 2), ("512M", 2), ("8Gi", 8), ("1T", 1024), (6, 6), ("bogus", None)],
+)
+def test_size_string_parsing(size, expected):
+    from torchtitan.experiments.rl.examples.tmax.prepare_tb2_1_data import _size_to_gb
+
+    got = _size_to_gb(None, size)
+    # 512M rounds up to 1GiB, then the caller clamps to the 2GiB floor.
+    assert got == (1 if size == "512M" else expected)

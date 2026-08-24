@@ -253,6 +253,32 @@ def _positive_number(val) -> float | None:
     return float(val) if val > 0 else None
 
 
+def _size_to_gb(mb_value, size_value) -> int | None:
+    """GiB (rounded up) from either a megabyte number or a TB-2.0 size string.
+
+    ``memory_mb = 8192`` -> 8. ``memory = "8G"`` -> 8, ``"512M"`` -> 1. Returns None
+    when neither field states a usable positive size, so the caller can omit the key
+    and let the TT_DAYTONA_* default apply.
+    """
+    if isinstance(mb_value, (int, float)) and not isinstance(mb_value, bool):
+        if mb_value > 0:
+            return math.ceil(float(mb_value) / 1024)
+    if isinstance(size_value, (int, float)) and not isinstance(size_value, bool):
+        # A bare number in the 2.0 field is already GiB.
+        return math.ceil(float(size_value)) if size_value > 0 else None
+    if isinstance(size_value, str):
+        m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([KMGTkmgt])?[Bi]*\s*", size_value)
+        if not m:
+            return None
+        val = float(m.group(1))
+        mult = {"K": 1 / 1024**2, "M": 1 / 1024, "G": 1.0, "T": 1024.0}.get(
+            (m.group(2) or "G").upper(), 1.0
+        )
+        gb = val * mult
+        return math.ceil(gb) if gb > 0 else None
+    return None
+
+
 def _daytona_resources(cfg: dict) -> dict[str, int]:
     """Map ``[environment] cpus/memory_mb/storage_mb`` -> daytona_* metadata fields.
 
@@ -266,21 +292,17 @@ def _daytona_resources(cfg: dict) -> dict[str, int]:
     cpus = env.get("cpus")
     if isinstance(cpus, (int, float)) and not isinstance(cpus, bool) and cpus > 0:
         out["daytona_cpu"] = max(_DAYTONA_CPU_FLOOR, int(round(float(cpus))))
-    # TB-2.1 renamed 2.0's `memory`/`storage` (GiB) to `memory_mb`/`storage_mb`.
-    mem_mb = env.get("memory_mb")
-    if isinstance(mem_mb, (int, float)) and not isinstance(mem_mb, bool) and mem_mb > 0:
-        out["daytona_mem_gb"] = max(
-            _DAYTONA_MEM_GB_FLOOR, math.ceil(float(mem_mb) / 1024)
-        )
-    disk_mb = env.get("storage_mb")
-    if (
-        isinstance(disk_mb, (int, float))
-        and not isinstance(disk_mb, bool)
-        and disk_mb > 0
+    # TB-2.1 (schema 1.1) states megabytes in `memory_mb`/`storage_mb`; TB-2.0
+    # (schema 1.0) stated a size string in `memory`/`storage` (e.g. "2G", "512M").
+    # Read both so a 2.0-style tree is sized from its own declaration rather than
+    # silently falling back to the TT_DAYTONA_* defaults.
+    for mb_key, size_key, floor, out_key in (
+        ("memory_mb", "memory", _DAYTONA_MEM_GB_FLOOR, "daytona_mem_gb"),
+        ("storage_mb", "storage", _DAYTONA_DISK_GB_FLOOR, "daytona_disk_gb"),
     ):
-        out["daytona_disk_gb"] = max(
-            _DAYTONA_DISK_GB_FLOOR, math.ceil(float(disk_mb) / 1024)
-        )
+        gb = _size_to_gb(env.get(mb_key), env.get(size_key))
+        if gb is not None:
+            out[out_key] = max(floor, gb)
     return out
 
 
@@ -366,12 +388,19 @@ def _wrap_test_sh(test_sh: str) -> str:
 # --------------------------------------------------------------------------- #
 # Rows
 # --------------------------------------------------------------------------- #
+def _tb_version(cfg: dict) -> str:
+    """Benchmark version implied by the task schema: 1.1 -> 2.1, 1.0 -> 2.0."""
+    schema = str(cfg.get("schema_version") or cfg.get("version") or "").strip()
+    return {"1.1": "2.1", "1.0": "2.0"}.get(schema, schema or "unknown")
+
+
 def _to_row(
     task_id: str,
     task_dir: str,
     *,
     image_prefix: str,
     include_binary: bool = True,
+    source: str = _HF_REPO,
 ) -> tuple[dict | None, str]:
     """Build one row from a TB-2.1 task dir, or ``(None, reason)`` when unusable."""
     instr_path = os.path.join(task_dir, "instruction.md")
@@ -413,8 +442,10 @@ def _to_row(
         # Provenance only today: grade_tmax is called with one global
         # TMAX_EVAL_TIMEOUT_SEC, not with this. Two TB-2.1 tasks declare 1800.
         "verifier_timeout_sec": _positive_number(_get(cfg, "verifier", "timeout_sec")),
-        "tb_version": "2.1",
-        "task_source": _HF_REPO,
+        # Provenance must describe what was actually read, not what this script is
+        # named for: pointed at a 2.0-style tree it must not stamp rows as 2.1.
+        "tb_version": _tb_version(cfg),
+        "task_source": source,
         "tmax": {
             "test_sh": test_sh,
             "fixtures": fixtures,
@@ -445,7 +476,11 @@ def build_rows(
         if not _is_task_dir(task_dir):
             continue
         row, reason = _to_row(
-            entry, task_dir, image_prefix=image_prefix, include_binary=include_binary
+            entry,
+            task_dir,
+            image_prefix=image_prefix,
+            include_binary=include_binary,
+            source=tasks_root or _HF_REPO,
         )
         if row is None:
             skipped[entry] = reason
@@ -526,9 +561,10 @@ def main() -> None:
         if any(k.endswith(_B64_SUFFIX) for k in r["metadata"]["tmax"]["fixtures"])
     )
     size_mb = os.path.getsize(args.out) / 1e6
+    versions = sorted({r["metadata"].get("tb_version", "?") for r in rows})
     print(
-        f"wrote {len(rows)} TB-2.1 tasks -> {args.out} ({size_mb:.1f} MB; "
-        f"{n_b64} carry base64 binary fixtures)"
+        f"wrote {len(rows)} TB-{'/'.join(versions)} tasks -> {args.out} "
+        f"({size_mb:.1f} MB; {n_b64} carry base64 binary fixtures)"
     )
     print(
         "reminder: set TMAX_EVAL_TIMEOUT_SEC=1800 for a full-suite eval -- "
