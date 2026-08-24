@@ -20,6 +20,7 @@ import base64
 import json
 
 import logging
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -711,7 +712,15 @@ class DaytonaSandbox:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(base64.b64decode(b64))
         path = root / "Dockerfile"
-        path.write_text(self.dockerfile)
+        # Collapse line-continuations before the SDK sees the Dockerfile: some
+        # Daytona SDK versions parse COPY sources line-by-line with shlex.split to
+        # decide what to upload, and an instruction split across physical lines with a
+        # trailing "\" (a multi-line COPY, or the tmux-install RUN block) then makes
+        # shlex raise "No escaped character", failing provisioning for every sibling in
+        # the group. Joining "\"+newline into a space is exactly what Docker does, so
+        # the built image is unchanged.
+        flattened = re.sub(r"\\\r?\n[ \t]*", " ", self.dockerfile)
+        path.write_text(flattened)
         return Image.from_dockerfile(path)
 
     async def __aenter__(self) -> DaytonaSandbox:
