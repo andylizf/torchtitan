@@ -704,11 +704,11 @@ class TMaxRollouter(Rollouter):
         # zero-variance group produces no gradient and is the one re-tuned, 0/k ("too
         # hard") made easier and k/k ("too easy") made harder. Logging the split here
         # puts the evolve loop's input rate on the training wandb (frac of groups per
-        # step, so frac * groups-per-step = count). Same basis as
-        # _maybe_emit_evolution_signal (rewards include NaN infra-fails -> pstdev is
-        # NaN -> not zero-std), training groups only (group_id >= 0).
+        # step, so frac * groups-per-step = count). Filter to scored rollouts
+        # (is_scored) so an infra-failed sibling's NaN reward is excluded -- statistics
+        # .pstdev raises on NaN under Python 3.12. Training groups only (group_id >= 0).
         if group_id >= 0:
-            ev_rewards = [r.reward for r in rollouts if r.reward is not None]
+            ev_rewards = [r.reward for r in rollouts if is_scored(r)]
             ev_zero_std = len(ev_rewards) >= 2 and statistics.pstdev(ev_rewards) == 0.0
             ev_all_pass = ev_zero_std and ev_rewards[0] > 0
             ev_all_fail = ev_zero_std and not ev_all_pass
@@ -810,7 +810,10 @@ class TMaxRollouter(Rollouter):
             return
         if rollouts and rollouts[0].group_id < 0:  # validation prompts, never trained
             return
-        rewards = [r.reward for r in rollouts if r.reward is not None]
+        # is_scored (not "is not None"): an infra-failed sibling carries a NaN reward,
+        # and statistics.pstdev raises on NaN under Python 3.12. Matches
+        # _maybe_annotate_zero_std, so the same groups are annotated and evolved.
+        rewards = [r.reward for r in rollouts if is_scored(r)]
         if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
             return
         try:
