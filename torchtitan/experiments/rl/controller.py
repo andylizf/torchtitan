@@ -2066,7 +2066,9 @@ class Controller(Configurable):
                         microbatch_metrics.append(
                             self._get_rank_0_value(
                                 await self.trainer.forward_backward.call(
-                                    microbatch, packed.num_global_valid_tokens
+                                    microbatch,
+                                    packed.num_global_valid_tokens,
+                                    packed.num_packed_valid_tokens,
                                 )
                             )
                         )

@@ -418,6 +418,7 @@ class PolicyTrainer(Actor, Configurable):
         self,
         training_data: list[TrainingMicrobatch],
         num_global_valid_tokens: int,
+        num_packed_valid_tokens: int | None = None,
     ) -> dict[str, float]:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
@@ -426,7 +427,11 @@ class PolicyTrainer(Actor, Configurable):
                 picks training_data[self.dp_rank].
             num_global_valid_tokens: Total response tokens across all DP
                 ranks for this step. The controller computes this before
-                sharding training_samples.
+                sharding training_samples. Loss scale denominator.
+            num_packed_valid_tokens: Total ACTUALLY-packed valid tokens (excludes
+                zero-advantage samples shed by skip_zero_advantage_samples). Used as
+                the per-trained-token metric denominator; None falls back to
+                num_global_valid_tokens.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
@@ -482,6 +487,9 @@ class PolicyTrainer(Actor, Configurable):
                 # SWE_DEBUG_MAX_LOGDIFF dump to record per-token positions (which
                 # reset to 0 at each packed-sample boundary).
                 positions=positions,
+                # Per-trained-token metric denominator (excludes zero-advantage
+                # tokens the batch shed); the loss scale still uses global tokens.
+                metric_denominator=num_packed_valid_tokens,
             )
         logger.info(f"[trainer] dp_rank={self.dp_rank}: loss done")
 

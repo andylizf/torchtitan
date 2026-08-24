@@ -99,6 +99,7 @@ class DPPOLoss(BaseLoss):
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
         positions: torch.Tensor | None = None,
+        metric_denominator: float | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the DPPO (unclipped ratio + divergence-mask) surrogate loss.
 
@@ -160,6 +161,20 @@ class DPPOLoss(BaseLoss):
             max(global_valid_tokens, 1) if global_valid_tokens is not None else 1
         )
         loss = masked_loss.sum() / loss_denominator
+        # Denominator for the per-trained-token METRICS below (ratio/kept_frac/divergence
+        # etc.). With skip_zero_advantage_samples, global_valid_tokens counts the
+        # zero-advantage tokens the batch shed (so the LOSS scale stays identical to
+        # not-skipping -- do NOT change loss_denominator), but those tokens are never
+        # packed, so dividing a "fraction of TRAINED tokens" metric by it undercounts:
+        # e.g. dppo_mask_kept_frac reads (kept / all-incl-skipped) instead of
+        # (kept / actually-trained), making it look like the trust region masked tokens
+        # it never touched. metric_denominator is the global count of ACTUALLY-PACKED
+        # valid tokens; fall back to loss_denominator when unset (no skipping).
+        metric_denom = (
+            max(metric_denominator, 1)
+            if metric_denominator is not None
+            else loss_denominator
+        )
 
         with torch.no_grad():
             diff = trainer_logprobs - generator_logprobs
@@ -200,39 +215,41 @@ class DPPOLoss(BaseLoss):
             reverse_kl_for_metrics = torch.where(
                 loss_mask, reverse_kl_tok, torch.zeros_like(diff)
             )
+            # loss/mean keeps loss_denominator (the gradient scale); every other metric
+            # is a per-TRAINED-token average/fraction, so it divides by metric_denom
+            # (actually-packed valid tokens) -- see the metric_denom comment above.
             metrics = {
                 "loss/mean": loss.detach(),
-                "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
+                "loss/ratio_mean": masked_ratio.sum() / metric_denom,
                 # Fraction of trained tokens the DPPO trust region KEEPS (1.0 = no
                 # masking; lower = more off-policy tokens dropped).
-                "loss/dppo_mask_kept_frac": (dppo_mask * loss_mask).sum()
-                / loss_denominator,
+                "loss/dppo_mask_kept_frac": (dppo_mask * loss_mask).sum() / metric_denom,
                 "loss/dppo_divergence_mean": (divergence * loss_mask).sum()
-                / loss_denominator,
+                / metric_denom,
                 "loss/generator_logprob_nan_frac": (
                     (~torch.isfinite(generator_logprobs)).float() * response_mask
                 ).sum()
-                / loss_denominator,
+                / metric_denom,
                 "bit_wise/logprob_diff/mean": diff_for_metrics.float().sum()
-                / loss_denominator,
+                / metric_denom,
                 "bit_wise/logprob_diff/abs_mean": diff_for_metrics.abs().float().sum()
-                / loss_denominator,
+                / metric_denom,
                 "bit_wise/ratio_tokens_different/mean": (
                     (diff_for_metrics.abs() > 1e-6).float() * loss_mask
                 ).sum()
-                / loss_denominator,
+                / metric_denom,
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
                 "debug/vllm_local_kl_k1_mean": -diff_for_metrics.float().sum()
-                / loss_denominator,
+                / metric_denom,
                 "debug/vllm_local_kl_k3_mean": k3_for_metrics.float().sum()
-                / loss_denominator,
+                / metric_denom,
                 "debug/vllm_local_reverse_kl_mean": reverse_kl_for_metrics.float().sum()
-                / loss_denominator,
+                / metric_denom,
             }
             if self.ratio_cap > 0.0:
                 metrics["loss/ratio_capped_frac"] = (
                     (uncapped_ratio > self.ratio_cap).float() * loss_mask
-                ).sum() / loss_denominator
+                ).sum() / metric_denom
 
         return loss, metrics
 
