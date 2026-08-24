@@ -6,93 +6,32 @@
 
 """Build a Terminal-Bench 2.1 EVAL JSONL in the tmax task schema.
 
-This is the corrected sibling of ``prepare_tb2_data.py`` (which targets TB-2.0).
-TB-2.1 is upstream's *verified* re-cut of the same 89 tasks -- per its README, "26
-tasks were modified to fix bugs, modify timeouts or resources, or improve robustness
-to reward hacking", many of the changes lifted from Z.ai's terminal-bench-2-verified.
-Diffing the two published trees (harborframework/terminal-bench-2.0 vs
-harbor-framework/terminal-bench-2-1 @ 7131e43) confirms: same 89 task ids, no adds or
-drops, 10 tasks on rebuilt docker images (``:20251031`` -> ``:20260403``/``:20260430``),
-2 agent-timeout changes (caffe-cifar-10 1200->3600, crack-7z-hash 900->1800), 2
-verifier-timeout changes (filter-js-from-html, query-optimize 900->1800), and 27 tasks
-with confirmed edits to instruction.md / tests / solution / environment (upstream states
-"26 tasks were modified"; the file diff excludes LFS-tracked binaries, which cannot be
-compared without fetching them).
+Corrected sibling of ``prepare_tb2_data.py`` (TB-2.0), which is left in place so
+past TB-2.0 numbers stay reproducible. Fixes three defects in it:
 
-Output schema is unchanged -- exactly what ``TMaxDataset`` (data.py) consumes::
+  1. TB-2.1 nests task dirs under ``tasks/``; the 2.0 script globs the snapshot
+     root and emits zero rows. Either layout is accepted here.
+  2. Non-UTF-8 grading fixtures were dropped, so the 7 tasks whose verifier reads
+     a binary out of /tests could never score. The fixture channel is str->str, so
+     binaries ride as base64 at ``tests/<name>.b64`` and a decode preamble is
+     prepended to ``test_sh``. grading.py is untouched; the other 82 tasks keep a
+     byte-identical ``test_sh``.
+  3. Per-task ``[environment] cpus/memory_mb/storage_mb`` now become
+     daytona_cpu/mem_gb/disk_gb instead of the flat TT_DAYTONA_* defaults.
 
-    {
-      "prompt": <instruction.md>,
-      "label":  <task_id>,
-      "metadata": {
-        "instance_id", "image" (docker.io/...), "workdir",
-        "problem_statement": <instruction.md>,
-        "agent_timeout_sec", "verifier_timeout_sec",
-        "daytona_cpu", "daytona_mem_gb", "daytona_disk_gb",
-        "tb_version", "task_source",
-        "tmax": {"test_sh", "fixtures": {relpath: content}, "reward_path"}
-      }
-    }
+Also: real TOML parsing, ``newline=""`` on text reads (universal-newline
+translation silently ate 310 bytes of sparql-university's CRLF .ttl), and the run
+aborts unless the tree yields 89 tasks.
 
-WHAT THIS FIXES relative to ``prepare_tb2_data.py``
----------------------------------------------------
-1. **Task tree layout.** TB-2.0 published task dirs at the repo root; TB-2.1 nests
-   them under ``tasks/`` (alongside ``dataset.toml`` / ``registry.json`` /
-   ``eval.yaml``). The 2.0 script globs the snapshot root, so pointed at a 2.1 tree
-   it emits **zero** rows. ``_resolve_tasks_root`` descends into ``tasks/`` when
-   that is where the task dirs live, so either layout works.
+Rows are what ``TMaxDataset`` (data.py) consumes -- same keys as the 2.0 script
+plus agent/verifier timeouts, the daytona_* trio, and tb_version/task_source.
 
-2. **Binary grading fixtures were silently dropped -- 7 tasks could never score.**
-   ``_collect_fixtures`` in the 2.0 script swallowed ``UnicodeDecodeError`` and
-   skipped the file. Seven TB-2.1 verifiers read a non-UTF-8 file out of ``/tests``:
-   build-pov-ray (reference_illum1.png), make-doom-for-mips and make-mips-interpreter
-   (reference.jpg), pytorch-model-recovery (weights_gtruth.pt), sam-cell-seg
-   (test_img.png), train-fasttext (private_test.tar.gz), video-processing
-   (test_video.mp4). Without them the verifier errors or fails on a *correct*
-   solution -- a silent 0 that reads as a model failure. The tmax fixture channel is
-   a ``str -> str`` map (grading.py uploads ``content.encode("utf-8")``), so binaries
-   ride as base64 text at ``tests/<name>.b64`` and a decode preamble is prepended to
-   ``test_sh``; it restores ``/tests/<name>`` before the upstream verifier body runs.
-   Nothing in grading.py changes, and the 82 tasks with no binary fixture keep a
-   byte-identical ``test_sh``. ``--no-binary-fixtures`` reverts to the old (broken)
-   behaviour for size-constrained smoke runs.
+Set ``TMAX_EVAL_TIMEOUT_SEC=1800`` for a full-suite eval: filter-js-from-html and
+query-optimize declare an 1800s verifier budget and the grader applies one global
+value. Output is ~26 MB; the base64 fixtures dominate.
 
-3. **Per-task sandbox sizing.** TB-2.1's schema 1.1 declares ``[environment] cpus /
-   memory_mb / storage_mb``; this emits ``daytona_cpu`` / ``daytona_mem_gb`` /
-   ``daytona_disk_gb`` (same floors as prepare_rts_data) so each sandbox is sized to
-   the task rather than to the flat ``TT_DAYTONA_*`` defaults. TB-2.1 declares
-   cpus=1 for 83 of 89 tasks, against a default of 2 -- CPU is the binding Daytona
-   quota, so this roughly doubles achievable eval concurrency.
-
-4. **Real TOML parsing.** The 2.0 script regexed ``docker_image`` and
-   ``timeout_sec`` out of the file, which happily matches a commented-out line and
-   silently mis-reads the ``[agent]``/``[verifier]`` split. ``tomllib`` (3.11+) is
-   used when available, with the old regex kept only as a 3.10 fallback. This also
-   catches the 2.1 rename ``memory``/``storage`` -> ``memory_mb``/``storage_mb``.
-
-5. **It fails loudly.** The task count is asserted against the expected 89 (override
-   with ``--expect-tasks``), so a future layout change can never again produce a
-   silently short eval file. Tasks that parse but lack an instruction, verifier or
-   image are reported by id instead of dropped in silence.
-
-Verifier timeout: ``verifier_timeout_sec`` is emitted for provenance, but the
-rollouter still applies one global ``TMAX_EVAL_TIMEOUT_SEC`` to every grade (default
-900s). TB-2.1 declares 1800s for filter-js-from-html and query-optimize, so set
-``TMAX_EVAL_TIMEOUT_SEC=1800`` for a full-suite eval or those two grade out.
-
-Usage (needs ``huggingface_hub`` only for the default HF source)::
-
-    # from the published HF mirror of the 2.1 repo (default)
     python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_1_data \
-        --out mast_rl/swe_assets/tb2_1_eval.jsonl
-
-    # or from a local clone of github.com/harbor-framework/terminal-bench-2-1
-    python -m torchtitan.experiments.rl.examples.tmax.prepare_tb2_1_data \
-        --tasks-root /path/to/terminal-bench-2-1 \
-        --out mast_rl/swe_assets/tb2_1_eval.jsonl
-
-``--limit N`` emits only the first N tasks (smoke) and relaxes the count check.
-Expect ~26 MB of JSONL: the base64 fixtures dominate (18.2 MB of binaries).
+        --out tb2_1_eval.jsonl [--tasks-root /path/to/terminal-bench-2-1]
 """
 
 from __future__ import annotations
@@ -201,39 +140,14 @@ def _resolve_tasks_root(root: str) -> str:
 # task.toml
 # --------------------------------------------------------------------------- #
 def _load_task_toml(task_dir: str) -> dict:
-    """Parse a task.toml into a dict. Real TOML on 3.11+, regex only as a fallback.
-
-    The regex path exists because the repo still declares ``requires-python >=3.10``,
-    where ``tomllib`` is absent. It recovers just the fields this script reads.
-    """
+    """Parse a task.toml into a dict (empty when absent)."""
     path = os.path.join(task_dir, "task.toml")
     if not os.path.exists(path):
         return {}
-    try:
-        import tomllib
+    import tomllib
 
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except ImportError:
-        pass
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    out: dict = {"environment": {}, "agent": {}, "verifier": {}}
-    m = re.search(r'^\s*docker_image\s*=\s*"([^"]+)"', text, re.M)
-    if m:
-        out["environment"]["docker_image"] = m.group(1)
-    for section in ("agent", "verifier"):
-        # Anchor inside the section so the other one's timeout is not picked up.
-        m = re.search(
-            rf"^\[{section}\][^\[]*?^\s*timeout_sec\s*=\s*([0-9.]+)", text, re.M | re.S
-        )
-        if m:
-            out[section]["timeout_sec"] = float(m.group(1))
-    for key in ("cpus", "memory_mb", "storage_mb", "gpus"):
-        m = re.search(rf"^\s*{key}\s*=\s*([0-9]+)", text, re.M)
-        if m:
-            out["environment"][key] = int(m.group(1))
-    return out
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
 
 def _get(cfg: dict, *keys):
@@ -555,21 +469,7 @@ def main() -> None:
         sys.exit(1)
 
     _write_jsonl(rows, args.out)
-    n_b64 = sum(
-        1
-        for r in rows
-        if any(k.endswith(_B64_SUFFIX) for k in r["metadata"]["tmax"]["fixtures"])
-    )
-    size_mb = os.path.getsize(args.out) / 1e6
-    versions = sorted({r["metadata"].get("tb_version", "?") for r in rows})
-    print(
-        f"wrote {len(rows)} TB-{'/'.join(versions)} tasks -> {args.out} "
-        f"({size_mb:.1f} MB; {n_b64} carry base64 binary fixtures)"
-    )
-    print(
-        "reminder: set TMAX_EVAL_TIMEOUT_SEC=1800 for a full-suite eval -- "
-        "filter-js-from-html and query-optimize declare a 1800s verifier budget."
-    )
+    print(f"wrote {len(rows)} tasks -> {args.out}")
 
 
 if __name__ == "__main__":
