@@ -90,6 +90,17 @@ class RendererConfig(Configurable.Config):
             and getattr(self, field.name) is not None  # Only consider provided fields
             and field.name in config_type.model_fields  # Config supports this field
         }
+        # `preserve_all_thinking` / `preserve_thinking_between_tool_calls` are
+        # TorchTitan-level knobs; the `renderers` configs express that intent as a
+        # single `thinking_retention` enum, so the name-match filter above dropped
+        # them silently (tmax sets preserve_all_thinking=True yet the renderer
+        # logged `args {}`, leaving the qwen3.5 bridge on its implied policy and
+        # re-rendering mid-trajectory on every turn). Translate explicitly.
+        if "thinking_retention" in config_type.model_fields:
+            if self.preserve_all_thinking:
+                args["thinking_retention"] = "all"
+            elif self.preserve_thinking_between_tool_calls:
+                args["thinking_retention"] = "tool_cycle"
         logger.info(
             f"Using renderer {renderer_name}, of type {config_type}, with args {args}"
         )
