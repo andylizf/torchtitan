@@ -65,6 +65,8 @@ class DAPOLoss(BaseLoss):
         positions: (
             torch.Tensor | None
         ) = None,  # noqa: ARG002 -- accepted for chunked-loss parity; DAPO ignores it
+        # noqa: ARG002 -- DPPO-only (metric denominator); accepted for call parity.
+        metric_denominator: float | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the per-token clip-higher surrogate loss.
 

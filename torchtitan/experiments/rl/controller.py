@@ -925,8 +925,22 @@ class Controller(Configurable):
                 generators.append(generator)
             self.generator_router = config.generator_router.build(generators=generators)
 
-            # Validation-only generators. Same engine config, sized for the
-            # validation pass instead of the rollout pool, on their own router.
+            # Validation-only generators. Their gpu_memory_limit defaults to 0.7,
+            # lower than the training generators', and is overridable via
+            # SWE_EVAL_GPU_MEMORY_LIMIT: the held-out eval workload packs many long
+            # multi-turn sequences whose KV, plus a large chunked-prefill's transient
+            # activation, can OOM an engine sized for the shorter training-mix
+            # rollouts (observed as a DP all-reduce gloo-timeout cascade after one
+            # eval rank hit CUDA OOM). The lower limit leaves activation headroom on
+            # the eval engines without shrinking training-generator KV capacity.
+            # Sized for the validation pass instead of the rollout pool, on their own
+            # router.
+            eval_generator_config = replace(
+                config.generator,
+                gpu_memory_limit=float(
+                    os.environ.get("SWE_EVAL_GPU_MEMORY_LIMIT", "0.7")
+                ),
+            )
             eval_generators = []
             for idx, eval_mesh in enumerate(eval_generator_meshes):
                 actor_name = (
@@ -938,7 +952,7 @@ class Controller(Configurable):
                     eval_mesh.spawn(
                         actor_name,
                         VLLMGenerator,
-                        config.generator,
+                        eval_generator_config,
                         model_spec=config.model_spec,
                         model_path=config.hf_assets_path,
                         compile_config=config.compile,
@@ -1700,6 +1714,41 @@ class Controller(Configurable):
             )
         logger.info("=" * 60)
 
+    def _evolution_metrics(self) -> list[m.Metric]:
+        """Online task-evolution counters for wandb, read from the evolve loop's stats
+        file on the shared mount (evolution_stats.json, written by evolve_ondella each
+        round). Empty when the feature is off (SWE_TASK_EVOLUTION_DIR unset) or no round
+        has completed yet. NoReduce: these are cumulative gauges, not per-token
+        reductions, so they are exempt from the loss-metric suffix rule."""
+        import json
+
+        sig_dir = os.environ.get("SWE_TASK_EVOLUTION_DIR")
+        if not sig_dir:
+            return []
+        stats_path = os.path.join(os.path.dirname(sig_dir), "evolution_stats.json")
+        try:
+            with open(stats_path) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            return []
+        counts = s.get("counts", {}) or {}
+        revalidate_failed = sum(
+            v for k, v in counts.items() if k.startswith("revalidate_")
+        )
+        return [
+            m.Metric("evolution/rounds", m.NoReduce(float(s.get("rounds", 0)))),
+            m.Metric("evolution/folded_total", m.NoReduce(float(s.get("folded", 0)))),
+            m.Metric("evolution/retuned_total", m.NoReduce(float(s.get("retuned", 0)))),
+            m.Metric(
+                "evolution/pending_signals", m.NoReduce(float(s.get("pending", 0)))
+            ),
+            m.Metric(
+                "evolution/revalidate_failed_total",
+                m.NoReduce(float(revalidate_failed)),
+            ),
+            m.Metric("evolution/kept_total", m.NoReduce(float(counts.get("kept", 0)))),
+        ]
+
     async def _data_input_loop(self, group_buffer: RolloutGroupWorkBuffer) -> None:
         """produces a RolloutGroupWork into group_buffer.
         waits for:    a free active slot (group_buffer.wait_for_slot)
@@ -2017,7 +2066,9 @@ class Controller(Configurable):
                         microbatch_metrics.append(
                             self._get_rank_0_value(
                                 await self.trainer.forward_backward.call(
-                                    microbatch, packed.num_global_valid_tokens
+                                    microbatch,
+                                    packed.num_global_valid_tokens,
+                                    packed.num_packed_valid_tokens,
                                 )
                             )
                         )
@@ -2099,6 +2150,7 @@ class Controller(Configurable):
                         for key, value in optim_result.metrics.items()
                     ],
                     *self._group_buffer.metrics(),
+                    *self._evolution_metrics(),
                     *time_metrics,
                     *policy_age_panel,
                     *compute_perf_ratio_metrics(

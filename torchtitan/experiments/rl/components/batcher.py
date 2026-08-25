@@ -175,12 +175,20 @@ class Batcher(Configurable):
                 for training_sample in training_samples
                 if any(training_sample.advantage[1:])
             ]
+        # Valid tokens ACTUALLY packed (samples_to_pack drops zero-advantage samples
+        # when skip_zero_advantage_samples is on). Denominator for per-trained-token
+        # metrics so they are not diluted by the skipped tokens; the loss still uses
+        # num_global_valid_tokens for its scale.
+        num_packed_valid_tokens = sum(
+            sum(training_sample.loss_mask[1:]) for training_sample in samples_to_pack
+        )
         # Next-fit all taken training_samples into rows.
         rows = self._assign_training_samples_to_rows(samples_to_pack)
         packed_rows = [self._pack_training_sample_row(row) for row in rows]
         return TrainingBatch(
             microbatches=self._build_microbatch_grid(packed_rows),
             num_global_valid_tokens=num_global_valid_tokens,
+            num_packed_valid_tokens=num_packed_valid_tokens,
             metrics=[
                 *metrics,
                 *self._packing_metrics(

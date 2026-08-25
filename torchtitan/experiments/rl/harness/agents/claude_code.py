@@ -88,9 +88,9 @@ async def boot_agent_sandbox(
     dockerfile: str | None = None,
     build_context: dict[str, str] | None = None,
     install_claude: bool = True,
-    disk_gb: int | None = None,
-    mem_gb: int | None = None,
     cpu: int | None = None,
+    memory: int | None = None,
+    disk_gb: int | None = None,
     issue_tracker: SandboxIssueTracker | None = None,
 ) -> AsyncIterator[Sandbox]:
     """Boot a fresh sandbox, optionally installing the Claude Code toolchain.
@@ -120,9 +120,9 @@ async def boot_agent_sandbox(
             image,
             dockerfile=dockerfile,
             build_context=build_context,
-            disk_gb=disk_gb,
-            mem_gb=mem_gb,
             cpu=cpu,
+            memory=memory,
+            disk_gb=disk_gb,
             issue_tracker=tracker,
         )
         num_issues_before = tracker.num_events

@@ -20,6 +20,7 @@ import base64
 import json
 
 import logging
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -463,9 +464,12 @@ class DaytonaSandbox:
     Env knobs:
       ``DAYTONA_API_KEY``                  -- API key (required).
       ``DAYTONA_API_URL`` / ``DAYTONA_TARGET`` -- override cloud endpoint/region.
-      ``TT_DAYTONA_CPU``                   -- vCPUs per sandbox (default 2).
+      ``TT_DAYTONA_CPU``                   -- vCPUs per sandbox (default 2). Fallback
+                                               when no per-task ``cpu`` is given.
       ``TT_DAYTONA_MEM_GB``                -- memory GiB per sandbox (default 4).
+                                               Fallback when no per-task ``memory``.
       ``TT_DAYTONA_DISK_GB``               -- disk GiB per sandbox (default 6).
+                                               Fallback when no per-task ``disk_gb``.
       ``TT_DAYTONA_CREATE_TIMEOUT``        -- snapshot-build/boot wait (default 900s).
       ``TT_DAYTONA_EXEC_TIMEOUT_MIN``       -- SDK request timeout floor; does not
                                                extend the command runtime limit.
@@ -487,18 +491,21 @@ class DaytonaSandbox:
         dockerfile: str | None = None,
         build_context: dict[str, str] | None = None,
         timeout: int | None = None,
-        disk_gb: int | None = None,
-        mem_gb: int | None = None,
         cpu: int | None = None,
+        memory: int | None = None,
+        disk_gb: int | None = None,
         issue_tracker: SandboxIssueTracker | None = None,
         **_ignored,
     ) -> None:
-        if disk_gb is not None and (
-            isinstance(disk_gb, bool) or not isinstance(disk_gb, int) or disk_gb <= 0
-        ):
-            raise ValueError(
-                f"daytona disk_gb must be a positive integer, got {disk_gb!r}"
-            )
+        # Per-task overrides for vCPU / memory (GiB) / disk (GiB). None means fall
+        # back to the TT_DAYTONA_{CPU,MEM_GB,DISK_GB} env defaults at create time.
+        for name, val in (("cpu", cpu), ("memory", memory), ("disk_gb", disk_gb)):
+            if val is not None and (
+                isinstance(val, bool) or not isinstance(val, int) or val <= 0
+            ):
+                raise ValueError(
+                    f"daytona {name} must be a positive integer, got {val!r}"
+                )
         if not image and not dockerfile:
             raise ValueError("daytona sandbox needs either an image or a dockerfile")
         if build_context and not dockerfile:
@@ -507,16 +514,9 @@ class DaytonaSandbox:
         self.dockerfile = dockerfile
         self.build_context = build_context
         self.timeout = timeout
-        self.disk_gb = disk_gb
-        for _name, _v in (("mem_gb", mem_gb), ("cpu", cpu)):
-            if _v is not None and (
-                isinstance(_v, bool) or not isinstance(_v, int) or _v <= 0
-            ):
-                raise ValueError(
-                    f"daytona {_name} must be a positive integer, got {_v!r}"
-                )
-        self.mem_gb = mem_gb
         self.cpu = cpu
+        self.mem = memory
+        self.disk_gb = disk_gb
         self.allocated_disk_gb: int | None = None
         self.issue_tracker = issue_tracker or SandboxIssueTracker()
         # Daytona is optional and imported lazily, so its SDK types are not
@@ -712,7 +712,15 @@ class DaytonaSandbox:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(base64.b64decode(b64))
         path = root / "Dockerfile"
-        path.write_text(self.dockerfile)
+        # Collapse line-continuations before the SDK sees the Dockerfile: some
+        # Daytona SDK versions parse COPY sources line-by-line with shlex.split to
+        # decide what to upload, and an instruction split across physical lines with a
+        # trailing "\" (a multi-line COPY, or the tmux-install RUN block) then makes
+        # shlex raise "No escaped character", failing provisioning for every sibling in
+        # the group. Joining "\"+newline into a space is exactly what Docker does, so
+        # the built image is unchanged.
+        flattened = re.sub(r"\\\r?\n[ \t]*", " ", self.dockerfile)
+        path.write_text(flattened)
         return Image.from_dockerfile(path)
 
     async def __aenter__(self) -> DaytonaSandbox:
@@ -726,10 +734,16 @@ class DaytonaSandbox:
             api_url=_getenv(*self.api_url_env) or None,
             target=_getenv(*self.target_env) or None,
         )
-        cpu = (self.cpu if self.cpu is not None
-               else int(_getenv("TT_DAYTONA_CPU", default="2")))
-        mem = (self.mem_gb if self.mem_gb is not None
-               else int(_getenv("TT_DAYTONA_MEM_GB", default="4")))
+        cpu = (
+            self.cpu
+            if self.cpu is not None
+            else int(_getenv("TT_DAYTONA_CPU", default="2"))
+        )
+        mem = (
+            self.mem
+            if self.mem is not None
+            else int(_getenv("TT_DAYTONA_MEM_GB", default="4"))
+        )
         disk = (
             self.disk_gb
             if self.disk_gb is not None
@@ -757,20 +771,12 @@ class DaytonaSandbox:
             )
         if int(_getenv("TT_DAYTONA_RPC_RETRIES", default="2")) < 0:
             raise ValueError("TT_DAYTONA_RPC_RETRIES must be non-negative")
-        create_kwargs = {}
-        if _getenv("TT_DAYTONA_EPHEMERAL", default="0") == "1":
-            # Some Daytona regions reject non-ephemeral creates outright
-            # ("Only ephemeral sandboxes are permitted in this region").
-            # Opt-in: ephemeral also implies delete-on-stop, which the
-            # auto_stop/auto_delete TTLs below already arrange.
-            create_kwargs["ephemeral"] = True
         params = CreateSandboxFromImageParams(
             image=self._declarative_image() if self.dockerfile else self.image,
             resources=Resources(cpu=cpu, memory=mem, disk=disk),
             labels=HARNESS_LABELS,
             auto_stop_interval=auto_stop,
             auto_delete_interval=auto_delete,
-            **create_kwargs,
         )
         # Daytona create transiently 401s a valid key under a concurrent boot burst.
         # Retry with jittered backoff so a wide fanout does not retry in lockstep.

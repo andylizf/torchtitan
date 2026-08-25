@@ -154,6 +154,12 @@ class TrainingBatch:
     """Trainer policy version this batch is reserved for."""
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
+    # Count of valid tokens ACTUALLY packed (excludes zero-advantage samples the
+    # batch shed under skip_zero_advantage_samples). num_global_valid_tokens keeps
+    # counting those (for the loss scale); this is the denominator for per-trained-
+    # token METRICS so they are not diluted by the skipped tokens. None = no skipping,
+    # metrics fall back to num_global_valid_tokens.
+    num_packed_valid_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

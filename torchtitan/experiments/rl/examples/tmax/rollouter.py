@@ -700,6 +700,24 @@ class TMaxRollouter(Rollouter):
                 f"infrastructure failures excluded from the advantage baseline"
             )
 
+        # Group reward-shape metrics -- also exactly what online evolution acts on: a
+        # zero-variance group produces no gradient and is the one re-tuned, 0/k ("too
+        # hard") made easier and k/k ("too easy") made harder. Logging the split here
+        # puts the evolve loop's input rate on the training wandb (frac of groups per
+        # step, so frac * groups-per-step = count). Filter to scored rollouts
+        # (is_scored) so an infra-failed sibling's NaN reward is excluded -- statistics
+        # .pstdev raises on NaN under Python 3.12. Training groups only (group_id >= 0).
+        if group_id >= 0:
+            ev_rewards = [r.reward for r in rollouts if is_scored(r)]
+            ev_zero_std = len(ev_rewards) >= 2 and statistics.pstdev(ev_rewards) == 0.0
+            ev_all_pass = ev_zero_std and ev_rewards[0] > 0
+            ev_all_fail = ev_zero_std and not ev_all_pass
+            group_metrics += [
+                m.Metric("rollout/zero_std_group_frac", m.Mean(float(ev_zero_std))),
+                m.Metric("rollout/all_fail_group_frac", m.Mean(float(ev_all_fail))),
+                m.Metric("rollout/all_pass_group_frac", m.Mean(float(ev_all_pass))),
+            ]
+
         group = RolloutGroup(
             group_id=group_id,
             rollouts=rollouts,
@@ -792,12 +810,11 @@ class TMaxRollouter(Rollouter):
             return
         if rollouts and rollouts[0].group_id < 0:  # validation prompts, never trained
             return
+        # is_scored (not "is not None"): an infra-failed sibling carries a NaN
+        # reward, and statistics.pstdev raises on NaN under Python 3.12. Matches
+        # _maybe_annotate_zero_std, so the same groups are annotated and evolved.
         try:
-            # float() first: backends hand back plain floats, numpy scalars or
-            # bools depending on the agent path, and statistics.pstdev on a
-            # mixed-type list raises AttributeError (.numerator). The whole
-            # emit is inside one guard so it keeps its never-raises contract.
-            rewards = [float(r.reward) for r in rollouts if r.reward is not None]
+            rewards = [r.reward for r in rollouts if is_scored(r)]
             if len(rewards) < 2 or statistics.pstdev(rewards) != 0.0:
                 return
             # An all-fail group in which no attempt ever took a turn is an
@@ -813,8 +830,10 @@ class TMaxRollouter(Rollouter):
             os.makedirs(dump_dir, exist_ok=True)
             safe = sample.instance_id.replace("/", "_")
             with open(os.path.join(dump_dir, f"{safe}.json"), "w") as f:
-                json.dump(self._evolution_signal(sample, rollouts, rewards, renderer), f)
-        except Exception as e:
+                json.dump(
+                    self._evolution_signal(sample, rollouts, rewards, renderer), f
+                )
+        except Exception as e:  # noqa: BLE001 -- token decode etc. must not kill rollout
             logger.warning(
                 f"[tmax] evolution signal failed for {sample.instance_id}: {e}"
             )
@@ -982,9 +1001,9 @@ class TMaxRollouter(Rollouter):
                     dockerfile=sample.dockerfile,
                     build_context=sample.build_context,
                     install_claude=False,
-                    disk_gb=sample.daytona_disk_gb,
-                    mem_gb=sample.daytona_mem_gb,
                     cpu=sample.daytona_cpu,
+                    memory=sample.daytona_mem_gb,
+                    disk_gb=sample.daytona_disk_gb,
                     issue_tracker=issue_tracker,
                 ) as sandbox:
                     # Force every tool command to run as root (tmax tasks touch
