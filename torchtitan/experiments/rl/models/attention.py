@@ -13,6 +13,7 @@ import torch
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
+    list_flash_attention_impls,
 )
 from torch.nn.attention.varlen import AuxRequest
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
@@ -98,6 +99,14 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
             # and re-run register function, so we want to only call it once.
             if current_flash_attention_impl() != "FA3":
                 activate_flash_attention_impl("FA3")
+        elif has_cuda_capability(10, 0) and "FA4" in list_flash_attention_impls():
+            # LOCAL (andy-rl-tb 2026-08-26): on Blackwell (SM 10.x) torch's varlen
+            # already dispatches to FA4, but leaves current_flash_attention_impl()
+            # at None -- so forward() takes the FA2 path and builds cu_seqlens_k,
+            # which FA4 rejects alongside a page_table. Activate it explicitly so
+            # the reported impl matches the kernel actually being dispatched to.
+            if current_flash_attention_impl() != "FA4":
+                activate_flash_attention_impl("FA4")
         else:
             warn_once(
                 logger, "FA3 not available (requires SM 9.0+), falling back to FA2. "
@@ -213,9 +222,9 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
 
-        # FA3 can infer cu_seqlens_k from block_table + seqused_k.
+        # FA3 / FA4 can infer cu_seqlens_k from block_table + seqused_k.
         # FA2 requires cu_seqlens_k to be explicitly set.
-        if current_flash_attention_impl() == "FA3":
+        if current_flash_attention_impl() in ("FA3", "FA4"):
             cu_seqlens_k = None
         else:
             num_seqs = seqused_k.shape[0]
