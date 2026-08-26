@@ -210,8 +210,15 @@ def _tmax_9b_validation() -> ValidationConfig:
         top_p=top_p,
         max_tokens=_TB2_VAL_MAX_TOKENS if _TB2_VAL_DATA else None,
         # Async needs somewhere else to run; without eval generators it would just
-        # contend with rollout collection for the training ones.
-        run_async=int(os.environ.get("SWE_NUM_EVAL_GENERATORS", "0")) > 0,
+        # contend with rollout collection for the training ones. SWE_VAL_ASYNC=1
+        # overrides that coupling deliberately: on a restart-heavy tuning cycle the
+        # blocking pre-training pass costs a serial ~1h per boot, while sharing the
+        # training generators turns that into max(assembly, validation) at the price
+        # of some contention. Default (unset) keeps the historical behavior.
+        run_async=(
+            int(os.environ.get("SWE_NUM_EVAL_GENERATORS", "0")) > 0
+            or os.environ.get("SWE_VAL_ASYNC", "0") == "1"
+        ),
         trace=ValidationTraceRecorder.Config(
             enable=os.environ.get("SWE_VAL_TRACES", "1") == "1"
         ),
