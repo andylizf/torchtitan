@@ -745,6 +745,12 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
         checkpoint=dataclasses.replace(
             config.trainer.checkpoint,
             interval=int(os.environ.get("SWE_CKPT_INTERVAL", "20")),
+            # Cap disk the way the sibling recipes do (dapo_math, search_r1 both
+            # pin 3). Left at the framework default of 10, a 9B run parks
+            # 10 x 102 GiB = 1 TiB of checkpoints and eventually takes the whole
+            # job down with `OSError: [Errno 122] Disk quota exceeded` mid-save,
+            # which also leaves a truncated checkpoint behind.
+            keep_latest_k=int(os.environ.get("SWE_CKPT_KEEP", "3")),
         ),
     )
     # Optional trainer FSDP width override for a fwd/bwd speed experiment. The mast_rl
