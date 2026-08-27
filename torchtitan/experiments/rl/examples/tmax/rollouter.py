@@ -1158,7 +1158,20 @@ class TMaxRollouter(Rollouter):
                     f"no_trainable_turns: captured={n_cap} empty_completions={n_empty}"
                 )
         else:
-            turns[-1].env_rewards = {TMAX_REWARD_KEY: float(reward)}
+            # Wrong-submit penalty (SWE_WRONG_SUBMIT_PENALTY, default 0 = off).
+            # The unshaped reward gives +1 for a correct submit and 0 for BOTH a
+            # wrong submit and a timeout, so submitting costs nothing and the
+            # policy drifts toward eager submission: measured on a 64-task
+            # held-out set, 45 steps moved submit-rate +31% while submit
+            # precision fell 82%->56% and net reward DROPPED below the base
+            # model. A negative reward for a graded-wrong submit makes the
+            # within-group ordering correct-submit > keep-working > wrong-submit,
+            # which is the missing gradient toward "explore until sure".
+            shaped = float(reward)
+            _pen = float(os.environ.get("SWE_WRONG_SUBMIT_PENALTY", "0") or "0")
+            if _pen > 0 and submitted and shaped <= 0.0:
+                shaped = -_pen
+            turns[-1].env_rewards = {TMAX_REWARD_KEY: shaped}
 
         if diagnostics.issue_counts:
             logger.warning(
