@@ -90,17 +90,46 @@ class RendererConfig(Configurable.Config):
             and getattr(self, field.name) is not None  # Only consider provided fields
             and field.name in config_type.model_fields  # Config supports this field
         }
-        # `preserve_all_thinking` / `preserve_thinking_between_tool_calls` are
-        # TorchTitan-level knobs; the `renderers` configs express that intent as a
-        # single `thinking_retention` enum, so the name-match filter above dropped
-        # them silently (tmax sets preserve_all_thinking=True yet the renderer
-        # logged `args {}`, leaving the qwen3.5 bridge on its implied policy and
-        # re-rendering mid-trajectory on every turn). Translate explicitly.
+        consumed = set(args) | {"name"}
+
+        # `renderers` expresses both preserve_* intents as one `thinking_retention`
+        # enum, so a name-match filter alone drops them. Translate explicitly.
         if "thinking_retention" in config_type.model_fields:
-            if self.preserve_all_thinking:
-                args["thinking_retention"] = "all"
-            elif self.preserve_thinking_between_tool_calls:
-                args["thinking_retention"] = "tool_cycle"
+            if self.preserve_all_thinking is not None:
+                consumed.add("preserve_all_thinking")
+                if self.preserve_all_thinking:
+                    args["thinking_retention"] = "all"
+            if self.preserve_thinking_between_tool_calls is not None:
+                consumed.add("preserve_thinking_between_tool_calls")
+                if (
+                    self.preserve_thinking_between_tool_calls
+                    and "thinking_retention" not in args
+                ):
+                    args["thinking_retention"] = "tool_cycle"
+
+        # A knob that was set but reached nothing is the failure mode this guard
+        # exists for. `renderers` renames knobs across versions -- 0.1.10 replaced
+        # preserve_all_thinking with thinking_retention -- and guards the old names
+        # with a validator that raises and names the replacement. The filter above
+        # drops unknown names BEFORE that validator can see them, converting the
+        # library's deliberate hard failure into a silent no-op. One such drop ran
+        # for weeks: the tmax recipe set preserve_all_thinking=True (correct when
+        # written, the day before the rename landed in the pinned build), it never
+        # reached the qwen3.5 renderer, and every agent turn re-rendered from
+        # scratch instead of continuing the previous turn's tokens.
+        dropped = sorted(
+            field.name
+            for field in fields(self)
+            if getattr(self, field.name) is not None and field.name not in consumed
+        )
+        if dropped:
+            raise ValueError(
+                f"RendererConfig set {dropped}, which {config_type.__name__} does "
+                f"not accept and this method does not translate. Supported: "
+                f"{sorted(config_type.model_fields)}. Silently ignoring a knob the "
+                f"caller deliberately set has cost this project weeks of training; "
+                f"either map it here or stop setting it."
+            )
         logger.info(
             f"Using renderer {renderer_name}, of type {config_type}, with args {args}"
         )
