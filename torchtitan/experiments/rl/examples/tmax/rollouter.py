@@ -1173,7 +1173,15 @@ class TMaxRollouter(Rollouter):
                 shaped = -_pen
             turns[-1].env_rewards = {TMAX_REWARD_KEY: shaped}
 
-        if diagnostics.issue_counts:
+        # `or not turns`: a rollout that never took a turn is the one case where
+        # the task is named nowhere else. The sandbox created fine, so there are no
+        # issue_counts to trip this, and the per-rollout `[tmax] group=N/rollout=M`
+        # line carries no instance_id -- so a task that kills every rollout in its
+        # group leaves no record of which task it was, and an all-error group is
+        # dropped before it can even emit an evolution signal (NaN rewards are not
+        # scored). Observed: 16 rollouts lost to an image that could neither install
+        # tmux nor build it, with nothing in any log naming the task.
+        if diagnostics.issue_counts or not turns:
             logger.warning(
                 "[tmax_sandbox_summary] %s",
                 json.dumps(
