@@ -698,12 +698,24 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # SWE_GEN_CUDAGRAPH=0 reverts to eager decode (smaller gen/train logprob mismatch,
     # ~3x slower). The SWE_GDN_BI block below also forces it on (bitwise-safe there).
     _cudagraph_on = os.environ.get("SWE_GEN_CUDAGRAPH", "1") == "1"
+    # Prefix caching is a separate axis from cudagraph and aimed at a different half
+    # of the clock. The cudagraph note above is about DECODE, which the step-0
+    # measurement puts at ~2% of a TB-2.0 pass; PREFILL is not in that 2%, and a
+    # 120-turn episode re-prefills a context that grows every turn. vLLM leaves this
+    # off for hybrid GDN (is_prefix_caching_supported is False) and runs it in
+    # experimental `align` mode when forced; a local smoke measured ~2x prefill with
+    # byte-identical outputs. Unset keeps vLLM's choice, so training is unchanged and
+    # only a run that asks for it (the eval host, where latency is the whole point)
+    # gets it. SWE_GDN_BI below sets it independently, and still wins.
+    _prefix_cache_env = os.environ.get("SWE_GEN_PREFIX_CACHE", "")
+    _prefix_cache = None if _prefix_cache_env == "" else _prefix_cache_env == "1"
     config.generator = dataclasses.replace(
         config.generator,
         sampling=dataclasses.replace(
             config.generator.sampling, max_tokens=_TMAX_9B_PER_TURN_TOKENS
         ),
         cudagraph=VLLMCudagraphConfig(enable=_cudagraph_on, mode="FULL_DECODE_ONLY"),
+        enable_prefix_caching=_prefix_cache,
         salt_prefix_cache_on_weight_sync=_salt_kv,
         reset_prefix_cache_on_weight_sync=not _salt_kv,
         reset_running_requests_on_weight_sync=not _salt_kv,
