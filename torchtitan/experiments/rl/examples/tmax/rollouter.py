@@ -363,6 +363,47 @@ _ENTRYPOINT_SETTLE_SEC = 2.0
 _ENTRYPOINT_LOG = "/tmp/.titan_entrypoint.log"
 
 
+def _note_image_without_tmux(sample) -> None:
+    """Record an image that reached a running sandbox without tmux in it.
+
+    The injected preinstall ends in `|| echo ... (non-fatal)`, so a build where it
+    failed is indistinguishable from one where it worked, and the consequence shows
+    up much later and somewhere else: Terminus self-installs at session bring-up,
+    and on an image whose package lists were cleaned and which carries no compiler
+    it cannot, so every rollout in the group ends having taken zero turns.
+
+    Making the preinstall strict again is the real fix and is already a TODO in
+    prepare_rts_data -- but strict turns these into build failures, which cost a
+    Daytona create each and are retried, which is the problem that made it
+    non-fatal in the first place. So neither blocks nor guesses here: one cheap
+    exec turns "this image has no tmux" into a fact recorded against the task,
+    available after one rollout instead of after a whole group has died.
+    """
+    root = os.environ.get("SWE_TASK_EVOLUTION_DIR", "")
+    if not root:
+        return
+    try:
+        d = os.path.join(os.path.dirname(root), "no_tmux")
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, f"{sample.instance_id.replace('/', '_')}.json")
+        seen = 0
+        if os.path.exists(f):
+            with open(f) as fh:
+                seen = int(json.load(fh).get("occurrences", 0))
+        with open(f, "w") as fh:
+            json.dump(
+                {
+                    "instance_id": sample.instance_id,
+                    "image": sample.image,
+                    "occurrences": seen + 1,
+                    "last_seen": time.time(),
+                },
+                fh,
+            )
+    except Exception as e:  # noqa: BLE001 -- bookkeeping must not kill a rollout
+        logger.warning(f"[tmax] no-tmux record failed for {sample.instance_id}: {e}")
+
+
 async def _start_entrypoint(sb: Sandbox, command: str, *, workdir: str) -> None:
     """Start the image ENTRYPOINT in the background, as PID 1 would.
 
@@ -1052,6 +1093,14 @@ class TMaxRollouter(Rollouter):
                     # seed-bearing tasks are unsolvable (inputs absent during rollout).
                     # Grading fixtures (tests/*) are uploaded later by grade_tmax.
                     await seed_workspace(root_sb, sample.tmax)
+                    try:
+                        _rc, _o, _e = await root_sb.exec(
+                            "command -v tmux >/dev/null 2>&1", check=False
+                        )
+                        if _rc != 0:
+                            _note_image_without_tmux(sample)
+                    except Exception:  # noqa: BLE001 -- never fail a rollout on this
+                        pass
                     agent_run = await get_agent(self._agent_name)(
                         AgentTask(
                             sandbox=root_sb,
