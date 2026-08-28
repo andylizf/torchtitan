@@ -470,6 +470,10 @@ class DaytonaSandbox:
                                                Fallback when no per-task ``memory``.
       ``TT_DAYTONA_DISK_GB``               -- disk GiB per sandbox (default 6).
                                                Fallback when no per-task ``disk_gb``.
+      ``TT_DAYTONA_MAX_MEM_GB``            -- per-sandbox memory cap the platform
+                                               enforces (default 8). A larger
+                                               per-task request is clamped to it
+                                               rather than refused at create.
       ``TT_DAYTONA_CREATE_TIMEOUT``        -- snapshot-build/boot wait (default 900s).
       ``TT_DAYTONA_EXEC_TIMEOUT_MIN``       -- SDK request timeout floor; does not
                                                extend the command runtime limit.
@@ -744,6 +748,20 @@ class DaytonaSandbox:
             if self.mem is not None
             else int(_getenv("TT_DAYTONA_MEM_GB", default="4"))
         )
+        # Clamp to what the platform allows per sandbox. Daytona rejects an
+        # oversized request at CREATE, so a task declaring more than the cap never
+        # starts, scores an infra failure, and does so on every single attempt --
+        # five TerminalWorld tasks declare 16 GiB against an 8 GiB cap, three of
+        # them live, and they had burned 704 rollout slots between them before this.
+        # Running at the cap may still OOM, but an OOM is a measurement the
+        # `oom_suspect` flag already reports; a refused create measures nothing.
+        mem_cap = int(_getenv("TT_DAYTONA_MAX_MEM_GB", default="8"))
+        if mem > mem_cap:
+            logger.warning(
+                "sandbox memory request %d GiB exceeds the per-sandbox cap "
+                "(%d GiB); requesting the cap instead", mem, mem_cap
+            )
+            mem = mem_cap
         disk = (
             self.disk_gb
             if self.disk_gb is not None
