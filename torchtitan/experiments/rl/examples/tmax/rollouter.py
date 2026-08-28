@@ -68,6 +68,7 @@ import math
 import os
 import shlex
 import statistics
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
@@ -826,6 +827,36 @@ class TMaxRollouter(Rollouter):
                     f"[tmax] evolution signal suppressed for "
                     f"{sample.instance_id}: all-fail group with zero turns"
                 )
+                # Suppressing the signal is right -- this measured the
+                # infrastructure, not the task -- but returning here used to throw
+                # the finding away with it. The task stays in the pool and destroys
+                # a whole group every time it is drawn, and the only trace is one
+                # warning in a log nobody greps. Record it where a filter can read
+                # it: one file per task, rewritten each time, so the count says how
+                # often it has happened and the pool can be masked against the
+                # directory listing.
+                try:
+                    qdir = os.path.join(os.path.dirname(dump_dir), "infra_quarantine")
+                    os.makedirs(qdir, exist_ok=True)
+                    qf = os.path.join(qdir, f"{sample.instance_id.replace('/', '_')}.json")
+                    seen = 0
+                    if os.path.exists(qf):
+                        with open(qf) as fh:
+                            seen = int(json.load(fh).get("occurrences", 0))
+                    with open(qf, "w") as fh:
+                        json.dump(
+                            {
+                                "instance_id": sample.instance_id,
+                                "reason": "all_fail_zero_turns",
+                                "occurrences": seen + 1,
+                                "rollouts_lost": seen * len(rollouts) + len(rollouts),
+                                "image": sample.image,
+                                "last_seen": time.time(),
+                            },
+                            fh,
+                        )
+                except Exception as e:  # noqa: BLE001 -- never kill a rollout over bookkeeping
+                    logger.warning(f"[tmax] infra quarantine write failed: {e}")
                 return
             os.makedirs(dump_dir, exist_ok=True)
             safe = sample.instance_id.replace("/", "_")
