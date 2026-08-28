@@ -20,12 +20,15 @@ logger = logging.getLogger(__name__)
 # back to "auto" (renderers resolves from the tokenizer)
 # https://github.com/PrimeIntellect-ai/renderers/blob/942449c37ab6e9fab26d59b40336514c8baa6b13/renderers/configs.py#L404
 _RENDERER_BY_MODEL = {
+    # Map explicitly so a local/renamed checkpoint path resolves; "auto" only
+    # matches known HF repo ids and would raise for this family.
+    "qwen3_5": "qwen3.5",
     "qwen3": "qwen3",
     "qwen3_vl": "qwen3-vl",
     "gpt_oss": "gpt-oss",
     "deepseek_v3": "deepseek-v3",
     "default": "default",  # llama3
-    "auto": "auto",  # ignores knobs, resolves from tokenizer,
+    "auto": "auto",  # resolves from tokenizer; carries only thinking_retention
 }
 
 
