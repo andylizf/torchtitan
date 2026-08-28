@@ -522,7 +522,7 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
     # tmax's single-user + tool-loop structure makes preserve_all_thinking the
     # clean match (every past turn stays in the current cycle). Trade-off: prompts
     # grow with retained thinking, so the 65536 context fills sooner.
-    config.renderer = dataclasses.replace(config.renderer, preserve_all_thinking=True)
+    config.renderer = dataclasses.replace(config.renderer, thinking_retention="all")
     num_groups_per_train_step = int(
         os.environ.get("SWE_NUM_GROUPS_PER_TRAIN_STEP", "8")
     )
