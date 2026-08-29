@@ -1,0 +1,203 @@
+# Task evolution
+
+You are re-tuning one task from a reinforcement-learning training pool. A task
+earns its place by producing a learning signal: an agent attempts it 16 times,
+and what teaches the model is the *spread* between attempts. A task solved 16/16
+or 0/16 has no spread, so it teaches nothing and it is your job to move it back
+toward roughly half.
+
+Your working directory is the task package itself.
+
+## The package
+
+| path | what it is |
+|---|---|
+| `instruction.md` | what the agent is told. Nothing else is shown to it. |
+| `environment/Dockerfile` | how the container is built |
+| `solution/solve.sh` | the reference solution, run to prove the task is solvable |
+| `tests/test_state.py` or `tests/test.sh` | the verifier that grades an attempt |
+| anything else in the tree | the rest of the real package — entrypoints, fixtures, helper modules, `task.toml`. Present because the package has to actually run. |
+| `traces/` | transcripts of real attempts, when the caller had them |
+| `run/` | scratch space for you, and where you write the two files below |
+
+**You may edit any of them, and you may add new ones.** A file you create in the
+package travels back with it, so an axis that needs a fixture, a config or a data
+file is a normal thing to do rather than something to work around. `AGENTS.md`,
+`validate` and `traces/` are the harness and do not travel. Which files you
+*should* touch depends on the job in your prompt, and that prompt says so.
+
+Two files in `run/` are read by the caller rather than by you:
+
+| `run/operator.txt` | the id of the axis you chose, alone on one line. Only the harder job offers a choice; write it before you start editing, so the record survives a session that later times out. |
+| `run/verdict.txt` | written only when you stop without finishing — see *Giving up* below. |
+
+The caller rebuilds the pool's axis balance by reading `run/operator.txt` off
+every task that comes back. A task folded in without it is invisible to that
+count, so a session that finishes the work but never declares the axis is
+discarded rather than kept.
+
+## What each file has to hold
+
+These are properties of the files themselves, so they apply whichever job you were
+given. They are the requirements the pipeline that built these tasks applies one
+per step; you are doing all of those steps in one session, so they all land on you.
+
+**`solution/solve.sh`** completes the whole workflow from the original starting
+state, the way a strong agent's successful run would. Inspect inputs before
+transforming them rather than overwriting final artifacts blindly, and validate
+the intermediate ones before writing the final. Keep it deterministic, safe to run
+twice, and runnable non-interactively from any working directory. Above all,
+**derive every output from the inputs as they are at run time** — this single
+property decides whether the reference passes its own verifier, because a
+`no_shortcut` check that perturbs an input and re-runs will catch an answer that
+was written once and never recomputed.
+
+**The verifier** grades the user-visible goal, the seed behaviour that was
+preserved, and every artifact the task promises — not incidental details of how
+`solve.sh` happens to do it. It carries four roles, as four separate test
+functions, because merging them loses the dense signal the task exists for:
+
+- `required_evidence` — the agent had to find something, not guess it;
+- `intermediate_artifact` — it produced the middle of the workflow, not only the end;
+- `final_semantics` — the end state means what it should, checked by content;
+- `no_shortcut` — an answer that was copied, hardcoded, or written for the verifier
+  is caught.
+
+`no_shortcut` is the one usually missing and it has to be earned in behaviour: change
+an input the answer depends on and re-run the workflow, asserting the output followed
+and restoring what you changed; or recompute the expected answer inside the verifier
+from the current inputs; or require an intermediate artifact whose content must agree
+with the final one. Asserting a file is non-empty, or lacks the word "placeholder", is
+not this check. Never invoke `solution/solve.sh` from the verifier — it is not there
+when the agent runs. Invoke the workflow the way the instruction tells a user to.
+
+**`instruction.md`** is a fair public request from someone who wants the work done.
+The solution already exists and the verifier is not a rubric to transcribe. Dumping
+absolute paths, schema fields, exact formats or numbered operational steps is what
+teaches an agent to shortcut instead of work: prefer a compact goal plus pointers to
+what is in the workspace, and put discoverable detail in the workspace itself. Roughly
+three absolute paths is the budget — the entry point and the main deliverable — and
+never an inventory of intermediate artifacts.
+
+## What breaks a task in this corpus
+
+Every item here was paid for. They are the ways a rewritten task has actually been
+lost, with what it cost, because an environment that looks reasonable and fails on
+the platform is the most expensive mistake available to you: it passes review, gets
+folded back in, and burns rollouts every time it is sampled.
+
+**The sandbox has to be able to run a terminal agent.** The harness needs `tmux`
+inside the container. It tries the package manager first and falls back to building
+from source, so an image with neither `tmux` in its repositories nor a C compiler
+leaves the agent unable to take a single turn — every rollout in the group scores
+zero having done nothing. If you change the base image or strip packages, keep one
+of those two routes open.
+
+**Base images.** Keep the seed's. A pinned, currently-supported base is worth more
+than a convenient one:
+
+- End-of-life distributions (`vault.centos.org`, `archive.debian.org`, Ubuntu
+  14.04/16.04) serve from archive mirrors that are slow and intermittently gone.
+  113 tasks in this corpus are marked fragile for this alone.
+- `:latest` or an untagged base moves under you and several are amd64-only. 26 more.
+- A rolling distribution upgraded at build time (`pacman -Syu`) fails every build
+  for as long as any upstream breakage lasts. 7 more.
+
+**Dockerfile forms that do not mean what they look like.**
+
+- `RUN python3 << 'EOF'` with a space before the delimiter: Docker only recognises
+  the form with no space, so it reads the heredoc body as build instructions and
+  refuses to build. 22 tasks in this corpus had it.
+- A comment line inside a `RUN` continuation. The backslash continues into the
+  comment and the rest of the command disappears. 40 packages.
+
+**Resources are a request the platform can refuse, not a hint.** An oversized ask
+is rejected when the sandbox is created, so the task never starts and never earns a
+verdict — five tasks declaring 16 GiB against an 8 GiB cap produced 704 refused
+creates before anyone noticed. Do not raise memory, disk or timeout above what the
+seed already needed.
+
+**Building is not starting.** 25 tasks in one run built correctly and then never
+reached running state, costing 1,172 creates between them. If your environment does
+anything unusual at startup — a service that must bind, an entrypoint that waits —
+prefer the form the seed already proved.
+
+**When you cannot satisfy one of these**, say so rather than working around it:
+`BLOCKED: <reason>` in `run/verdict.txt`. A task that only builds on a lucky day is
+worse than the task you started from.
+
+## Verify your own work
+
+```
+./validate
+```
+
+This builds the package, runs `solution/solve.sh` inside it, and grades the
+result with the package's own verifier — the same path the training harness
+uses. It prints `VERDICT: pass` or `VERDICT: fail` with the run's output, and it
+is the only thing that decides whether your rewrite is accepted.
+
+`./validate` is your mirror, not the judge. The caller re-runs the same checks
+afterwards from files you cannot reach, and adds a probe that tries to pass the
+task without doing the work. A rewrite that only satisfies the copy in this
+directory is caught there and thrown away, so editing `validate`, or shaping the
+task around it, costs you the whole session and gains nothing.
+
+**Run it before you finish.** A rewrite that has not passed `./validate` is
+discarded whole, and the task goes back into training exactly as it was, so an
+edit you were confident about but did not verify is worth nothing. Each run
+takes a few minutes because it boots a real container; budget for two or three,
+not for guessing.
+
+When it fails, read the output before editing. It tells you which check failed
+and what the run printed. Editing on an impression of what the code should do is
+what produced most failures here.
+
+## Giving up is a real answer
+
+Some tasks cannot be moved where they need to go. The instruction may already be
+minimal, the verifier may check exactly one thing, the environment may not
+support a harder variant. When that is the case, write
+
+```
+GIVE UP: <what you tried, and what stopped it>
+```
+
+to `run/verdict.txt`, leave the files as you found them, and stop.
+
+This is a good outcome, not a failed one. The task returns to training exactly as
+it was, which costs one round and nothing else. Nobody is counting your successes.
+
+The outcome that actually damages the pool is a task that passes because the
+check got weaker: it looks like a win, it is folded back in, and nothing
+downstream can tell that the verifier used to demand more. Weeks later it is
+still there, teaching the model that less is enough. If your only route to
+`VERDICT: pass` runs through making the verifier ask for less, take the give-up
+instead — that is what it is for.
+
+## Rules that always hold
+
+**Never reveal the verifier in `instruction.md`.** No test file paths, no test or
+function names, no `pytest` or `test.sh` command. You are shown the verifier so
+you know what must *not* appear. Point at the behaviour, never at the check that
+grades it. A task whose instruction names its verifier is rejected.
+
+**The task must stay solvable from the workspace alone.** Someone reading only
+`instruction.md` and exploring the container must be able to get there. Never
+leave it ambiguous between several plausible outcomes, and never remove a fact
+the verifier depends on that nothing in the workspace reveals — that is unfair
+rather than hard, and it fails a capable agent as surely as a weak one.
+
+**Difficulty lives in the task, not in the grading.** Weakening the verifier to
+fit a solution that does not work makes the task worthless; that is the one
+change that cannot be undone by later re-tuning, because nothing downstream
+knows the check used to be stronger.
+
+**If the container cannot build or a tool is missing**, say so rather than coding
+around it: write `BLOCKED: <reason>` to `run/verdict.txt` and stop. A task that
+only passes because the solution avoided the environment is not a task.
+
+## Finishing
+
+Your edits in place are the entire output. Do not print the files. Stop once
+`./validate` prints `VERDICT: pass`, or once you have written `run/verdict.txt`.

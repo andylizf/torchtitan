@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""The feedback pipeline: adjust a task pool from a solver's rollouts.
+
+This is the training pipeline's task-adjustment stage, and it does one thing:
+read a solver's rollouts and move each task toward the usable band per the
+project algorithm:
+
+    0 of k solved   easier, with a hint read off a failing trajectory
+    k of k solved   harder, one operator, the RST way
+    in between      already discriminating; leave it
+
+It does NOT run rollouts. That is the training side's job — RL produces them on
+the model being trained — and folding a solver into this stage would weld the
+wrong model into it and blur the line the rest of this project draws: the data
+side does not measure difficulty, it consumes the measurement. So the input is a
+rollout file (`--rollouts`), and swapping the solver that produced it — GPT now,
+Qwen once training returns its own — changes the input, not this loop.
+
+To bootstrap before training rollouts exist, produce the file with
+`solve_eval.py --keep-trace`: a GPT solve pass standing in for the training
+model, in exactly the shape training will hand back.
+
+Per task, given its rollout record:
+  1. route on the solve count (above)
+  2. re-validate whatever changed: build, oracle, shortcut execution — an
+     adjustment can break a task, and shipping a broken one is worse than not
+     adjusting it. (This builds, but it does not solve: checking a task is
+     well-formed is the data side's job; solving it is not.)
+  3. write the adjusted package and a per-task record
+
+Resumable (ids already in --results are skipped), observable (per-item log),
+reproducible (the rollout that drove each decision is named in the record).
+
+Usage:
+  feedback_loop.py --rollouts results/solve_seed_trace.jsonl \\
+      --pool data/synth-v24/round_1 --out data/feedback-r1 \\
+      --results results/feedback_r1.jsonl [--workers 4]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import synth_loop as sl
+import synth_client as llm
+import evolve as ev
+
+log = logging.getLogger("feedback")
+
+# Daytona revalidation (hosts without docker, e.g. della). The probe runs in
+# the training venv with the Daytona env sourced -- the same platform, harness
+# and grading contract the rollouts use, so passing it is a STRONGER build+
+# oracle check than the local docker shim it stands in for. Both paths are
+# env-overridable; when either is absent this host simply has no build story
+# and structural retunes are declined as before.
+DAYTONA_VENV_PY = os.environ.get(
+    "TRL_VENV_PY", "/scratch/gpfs/TRIDAO/al9080/titan-rl/bin/python")
+DAYTONA_ENV_FILE = os.environ.get(
+    "DAYTONA_ENV_FILE", os.path.expanduser("~/.config/daytona/env"))
+
+
+_INFRA_RE = re.compile(
+    r"Timeout|Bad ?Gateway|InternalServer|50[234]|[Cc]onnection|timed? ?out|"
+    r"no stdout|TooManyRequests|429")
+
+
+def daytona_probe(work: Path, shortcut: str | None = None) -> dict | None:
+    """Run daytona_revalidate.py on this package; None when unconfigured."""
+    script = Path(__file__).resolve().parent / "daytona_revalidate.py"
+    if not (os.path.exists(DAYTONA_VENV_PY) and os.path.exists(DAYTONA_ENV_FILE)
+            and script.exists()):
+        return None
+    cmd = ["bash", "-c", '. "$1" && shift && exec "$@"', "-",
+           DAYTONA_ENV_FILE, DAYTONA_VENV_PY, str(script), str(work)]
+    if shortcut:
+        cmd += ["--shortcut", shortcut]
+    # One retry, only for infra-shaped failures. The platform is measurably
+    # flaky (DaytonaTimeout/BadGateway bursts), and a probe that fails for the
+    # platform's sake discards a perfectly good retune: in one window 79
+    # oracle-failures + 25 wrapper errors threw away ~2/3 of the successful
+    # evolve output. A genuine reject (oracle can't solve the rewrite) does not
+    # match the pattern and still fails fast.
+    last: dict = {"ok": False, "stage": "daytona_error", "why": "not run"}
+    for attempt in (1, 2):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=2400)
+            lines = p.stdout.strip().splitlines()
+            if not lines:
+                # The script died before its JSON verdict; splitlines()[-1]
+                # used to raise a bare IndexError here and eat the real cause.
+                last = {"ok": False, "stage": "daytona_error",
+                        "why": (f"no stdout (exit {p.returncode}): "
+                                f"{p.stderr.strip()[-160:]}")}
+            else:
+                last = json.loads(lines[-1])
+        except Exception as e:  # noqa: BLE001
+            last = {"ok": False, "stage": "daytona_error",
+                    "why": f"{type(e).__name__}: {e}"[:200]}
+        if last.get("ok") or not _INFRA_RE.search(str(last.get("why", ""))):
+            return last
+        if attempt == 1:
+            time.sleep(20)
+    return last
+
+
+def image_tag(prefix: str, tid: str) -> str:
+    """A Docker-legal image name. A repository name may not begin or end with a
+    separator, and pool directory ids often end in a truncation underscore."""
+    name = re.sub(r"[^a-z0-9_.-]", "", tid.lower()).strip("_.-")
+    return f"{prefix}-{name or 'task'}"
+
+
+def format_trace(attempts: list[dict], keep: int = 3) -> str:
+    """Turn rollout transcripts into the text a hint is drawn from.
+
+    Prefer failing attempts — a hint aims at where the agent got stuck, and a
+    success shows nothing stuck. Several are kept: one attempt can fail in a way
+    the others do not. Collection is lossless; simplify() trims at consumption.
+    Falls back to a plain reward/turns summary when a rollout carried no
+    transcript (a pass@k-only file), which routes fine but gives a vague hint.
+    """
+    graded = [a for a in attempts if str(a.get("reward")) in ("0", "1")]
+    fails = [a for a in graded if str(a.get("reward")) == "0"]
+    picks = (fails or graded or attempts)[:keep]
+    out = []
+    for a in picks:
+        out.append(f"--- attempt reward={a.get('reward')} "
+                   f"turns={a.get('turns')} ---")
+        for step in a.get("transcript", []) or []:
+            out.append(f"$ {step.get('cmd', '')}")
+            out.append(f"  {str(step.get('out', ''))[:600]}")
+        out.append(f"verifier tail: {str(a.get('test_tail', ''))[:400]}")
+    return "\n".join(out)
+
+
+def revalidate(work: Path, image: str, tid: str, task: dict,
+               orig: dict | None = None, changed: list[str] | None = None) -> dict:
+    """After an adjustment: still builds, still self-consistent, still not
+    passable by a shortcut. Building here checks the task is well-formed; it
+    never runs the solver.
+
+    Instruction-only fast path. When the only file the retune touched is the
+    instruction, nothing that affects the build, the verifier, or the reference
+    solution moved: the package still builds and its oracle still passes exactly
+    as when it entered the pool, so rebuilding to re-confirm that is the loop's
+    most expensive step spent on a known answer — and for an SWE package, the
+    one flaminio can least afford. What an instruction edit CAN introduce is
+    instruction<->verifier drift, so that is what gets checked: a newly-leaked
+    verifier path, or a path the instruction stopped revealing that the verifier
+    still needs. Judged before/after, so an SWE test.sh that always references
+    repo internals is not mistaken for a fresh dark path."""
+    if changed == ["instruction"] and orig is not None:
+        if not task["instruction"].strip():
+            return {"ok": False, "stage": "empty", "why": "instruction emptied"}
+        before, after = sl.audit(orig), sl.audit(task)
+        new_leaks = [x for x in after["leaks"] if x not in before["leaks"]]
+        new_dark = [p for p in after["dark_paths"] if p not in before["dark_paths"]]
+        if new_leaks or new_dark:
+            return {"ok": False, "stage": "audit",
+                    "why": f"leaks={new_leaks} dark={new_dark}"[:200]}
+        return {"ok": True, "fast_path": "instruction_only"}
+    # A structural change (a stage cut, the verifier tightened) has to be re-run
+    # to be trusted, and that needs a build. On a host without docker -- della,
+    # where the evolution loop runs beside the training -- the build runs on
+    # Daytona instead: same platform, harness and grading contract as the
+    # training rollouts, so an oracle pass there is trust earned on the very
+    # environment the task will be solved in. Only when neither docker nor the
+    # Daytona probe is available does the change stay unshipped.
+    if not shutil.which("docker"):
+        dv = daytona_probe(work)
+        if dv is None:
+            return {"ok": False, "stage": "no_docker",
+                    "why": "structural change needs a build; neither docker "
+                           "nor Daytona is configured here"}
+        if not dv.get("ok"):
+            return {"ok": False, "stage": dv.get("stage", "daytona"),
+                    "why": str(dv.get("why") or f"reward={dv.get('reward')} "
+                               f"solve_exit={dv.get('solve_exit')}")[:200]}
+        diag = llm.diagnose_unsolved(task)
+        shortcut = str(diag.get("shortcut") or "").strip()
+        if shortcut:
+            hack = daytona_probe(work, shortcut=shortcut) or {}
+            if hack.get("passed"):
+                return {"ok": False, "stage": "shortcut",
+                        "why": f"passed on: {shortcut[:150]}"}
+        return {"ok": True, "fast_path": "daytona_oracle",
+                "reward": dv.get("reward")}
+    sl.sh(["docker", "rmi", "-f", image], 300)
+    ok, tail = sl.build_image(work, image)
+    if not ok:
+        return {"ok": False, "stage": "build", "why": tail[-200:]}
+    oracle = sl.oracle_check(work, image, tid)
+    if not oracle.get("ok"):
+        return {"ok": False, "stage": "oracle",
+                "why": oracle.get("test_tail", "")[-200:]}
+    diag = llm.diagnose_unsolved(task)
+    shortcut = str(diag.get("shortcut") or "").strip()
+    if shortcut:
+        hack = sl.shortcut_check(work, image, tid, shortcut)
+        if hack.get("passed"):
+            return {"ok": False, "stage": "shortcut",
+                    "why": f"passed on: {shortcut[:150]}"}
+    return {"ok": True}
+
+
+def process_one(rollout: dict, src_dir: Path, out_root: Path) -> dict:
+    tid = rollout["task_id"]
+    solved = rollout.get("solved", 0)
+    graded = rollout.get("graded", len([r for r in rollout.get("rewards", [])
+                                        if str(r) in ("0", "1")]))
+    attempts = rollout.get("attempts", [])
+    rec: dict = {"task_id": tid, "t_start": time.time(),
+                 "solved": solved, "graded": graded,
+                 "rollout_source": str(rollout.get("_source", ""))}
+    work = out_root / tid
+    image = image_tag("fb", tid)
+    mark = dict(llm.USAGE)
+    try:
+        if not graded:
+            return {**rec, "status": "ungraded",
+                    "why": "rollout produced no graded attempt"}
+        if not src_dir.exists() or not (src_dir / "instruction.md").exists():
+            return {**rec, "status": "no_pool_dir",
+                    "why": f"no task package at {src_dir}"}
+        if work.exists():
+            shutil.rmtree(work)
+        shutil.copytree(src_dir, work)
+
+        task = ev.load(work)
+        if solved == 0:                                   # 0/k -> easier
+            # Retune arm, selectable per run. "chat" (default): one gpt-5.6 call
+            # with the trace in the prompt. "codex": agentic, full traces as
+            # files + AGENTS.md role (evolve_codex). "none": structural only,
+            # ignore the transcript (the no-rollout-info mode). All three feed
+            # the SAME downstream leak/dark audit -- only the writing differs.
+            arm = os.environ.get("SWE_RETUNE_AGENT", "chat")
+            trace = format_trace(attempts)
+            # SWE_SIMPLIFY_HINT selects how much guidance a simplify may write
+            # into the instruction (none|vague|specific). Default is now vague:
+            # the specific level bakes "where to look" hints into hundreds of
+            # instructions, and the holdout experiment showed the policy learns
+            # hint-following that does not transfer to unhinted tasks.
+            hint_lvl = os.environ.get("SWE_SIMPLIFY_HINT", "vague")
+            if arm == "codex":
+                try:
+                    import evolve_codex as ec
+                    new = ec.simplify_codex(task, solved=0, attempts=graded,
+                                            trajectory=trace, hint=hint_lvl)
+                except Exception as e:  # noqa: BLE001 -- fall back to chat
+                    log.warning("codex retune failed (%s); chat fallback", e)
+                    new = ev.simplify(task, solved=0, attempts=graded,
+                                      trajectory=trace, hint=hint_lvl)
+            else:
+                new = ev.simplify(task, solved=0, attempts=graded,
+                                  trajectory=("" if arm == "none" else trace),
+                                  hint=("none" if arm == "none" else hint_lvl))
+            rec["action"], rec["hint"] = "simplify", new.get("_hint")
+        elif solved == graded:                            # k/k -> harder
+            # Which axis to evolve along is not the agent's call. The choice is
+            # scored against the whole pool -- L(o) for whether this seed has a
+            # foothold at all, D(f) for family balance, P(o) for how often the
+            # operator has been used -- and letting a model that sees only this
+            # one task pick from all forty collapses the pool onto whichever
+            # transformation is easiest to write. The scan also raises Blocked
+            # when the seed supports nothing, which is worth knowing BEFORE
+            # spending a session and two container builds on it.
+            uo, uf = ev.history_from_pool(
+                [p for p in out_root.glob("*") if p.is_dir()])
+            try:
+                shortlist = llm.operator_shortlist(
+                    {"task_id": tid, "instruction": task["instruction"],
+                     "dockerfile": task["dockerfile"],
+                     "solution": task["solve_sh"], "env_files": {}}, uo, uf)
+            except llm.Blocked as e:
+                return {**rec, "status": "evolve_blocked", "action": "evolve",
+                        "why": str(e)[:200]}
+            # The head of the list is what the chat operator below gets, since
+            # it cannot choose; the agent gets the whole list and reports back
+            # which one it used.
+            fam, operator, definition = shortlist[0]
+            rec["operator"], rec["family"] = operator, fam
+
+            if os.environ.get("SWE_RETUNE_AGENT", "chat") == "codex":
+                try:
+                    import evolve_codex as ec
+                    from evolve_codex import Blocked as ec_Blocked
+                    agent_task = {**task, "_solved": solved, "_attempts": graded}
+                    new = ec.evolve_agentic(
+                        agent_task, "harder", trajectory=format_trace(attempts),
+                        operator=shortlist)
+                    rec["action"], rec["hint"] = "evolve", new.get("_hint")
+                    rec["agent_validated"] = new.get("_agent_validated")
+                    weaker = _verifier_weakened(
+                        task, new,
+                        next((k for k, r in ev.file_map(task).items()
+                              if r == task.get("_verifier_rel")), None))
+                    if weaker:
+                        raise RuntimeError(f"verifier weakened: {weaker}")
+                except ec_Blocked as e:
+                    # It read the package and said the axis does not fit, or
+                    # that it cannot be made harder honestly. Take the answer:
+                    # falling through to the chat operator asks a weaker method
+                    # the same question, which is what offering the exit was
+                    # meant to avoid.
+                    rec["action"] = "keep"
+                    return {**rec, "status": "kept", "why": str(e)[:200],
+                            "out_dir": str(work)}
+                except Exception as e:  # noqa: BLE001 -- chat operator below
+                    log.warning("agent evolve failed (%s); chat fallback", e)
+                    new = None
+            else:
+                new = None
+
+            if new is None:
+                try:
+                    new = ev.evolve(task, seed_id=tid, operator=operator)
+                except llm.Blocked as e:
+                    return {**rec, "status": "evolve_blocked",
+                            "action": "evolve", "why": str(e)[:200]}
+                rec["action"] = "evolve"
+            rec["operator"], rec["family"] = (new.get("_operator", operator),
+                                              new.get("_family", fam))
+        else:                                             # in band -> keep
+            rec["action"] = "keep"
+            return {**rec, "status": "kept", "out_dir": str(work)}
+
+        changed = [key for key in ev.file_map(new) if new[key] != task[key]]
+        for key, rel in ev.file_map(new).items():
+            (work / rel).write_text(new[key])
+        # Files the agent added or edited outside the four that round-trip. The
+        # agent validated the package WITH them, so writing only the four here
+        # ships something it never ran: a Dockerfile whose COPY sources are not
+        # in the build context. Their paths count as changes too, or a package
+        # whose only edit was a new fixture takes the instruction-only fast path
+        # and never rebuilds.
+        for rel, blob in (new.get("_extra_files") or {}).items():
+            dest = work / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(blob)
+            if rel not in changed:
+                changed.append(rel)
+        if rec["action"] == "evolve":
+            (work / ".provenance.json").write_text(json.dumps(
+                {"operator": new.get("_operator"),
+                 "family": new.get("_family"), "parent": tid}))
+
+        v = revalidate(work, image, tid, new, orig=task, changed=changed)
+        rec["revalidate"] = v
+        if (
+            not v["ok"]
+            and rec["action"] == "evolve"
+            and v.get("stage") == "daytona_oracle"
+        ):
+            # The structural operator regenerates instruction, solution and
+            # verifier together, and the hard part is making the three agree:
+            # a sampled package had a 537-line solve.sh and a 518-line
+            # test_state.py, and the solution did not pass its own verifier
+            # (reward=0.0, solve_exit=1). About 60% of TW evolutions die this way,
+            # which is why the k/k direction stalled once SWE left the mix.
+            #
+            # synthesize already runs a blind oracle-repair pass, but it only
+            # reads the files -- it has never seen the task execute. This run
+            # has: the verdict carries the real exit code and output tail. Feed
+            # that back for one more repair and revalidate again. Repairing the
+            # task is the point; rewriting the instruction instead would leave
+            # the verifier as weak as it was.
+            tail, code = v.get("tail", ""), int(v.get("solve_exit") or 1)
+            fixed = None
+            if os.environ.get("SWE_RETUNE_AGENT", "chat") == "codex":
+                # The agentic repair is the one that fits this job: both files
+                # are on disk at full length and it can grep between them,
+                # rather than holding a 500-line solution and a 500-line
+                # verifier in a single prompt and guessing which side is wrong.
+                try:
+                    import evolve_codex as ec
+                    fixed = ec.repair_oracle_codex(new, tail, code)
+                except Exception as e:  # noqa: BLE001 -- fall back to chat
+                    log.warning("codex oracle repair failed (%s); chat fallback", e)
+            if fixed is None:
+                try:
+                    fixed = ev.repair_oracle(new, tail, code)
+                except Exception:  # noqa: BLE001 -- repair is best-effort
+                    fixed = None
+            if fixed is not None:
+                repaired = [k for k in ev.file_map(fixed) if fixed[k] != new[k]]
+                if repaired:
+                    for key, rel in ev.file_map(fixed).items():
+                        (work / rel).write_text(fixed[key])
+                    v2 = revalidate(work, image, tid, fixed, orig=task,
+                                    changed=[k for k in ev.file_map(fixed)
+                                             if fixed[k] != task[k]])
+                    rec["oracle_repair"] = {"files": repaired, "ok": v2["ok"]}
+                    if v2["ok"]:
+                        rec["revalidate"] = v2
+                        return {**rec, "status": "ok", "out_dir": str(work)}
+                    v = v2
+                    rec["revalidate"] = v2
+        if not v["ok"]:
+            return {**rec, "status": f"revalidate_{v['stage']}_failed",
+                    "why": v.get("why", "")}
+        return {**rec, "status": "ok", "out_dir": str(work)}
+    except Exception as e:  # noqa: BLE001
+        return {**rec, "status": "error", "why": f"{type(e).__name__}: {e}"[:200]}
+    finally:
+        rec["usage"] = llm.usage_since(mark)
+        rec["t_end"] = time.time()
+        # The instruction-only fast path builds nothing, so there is no image to
+        # remove; and on a docker-less host the call itself would raise out of
+        # the finally and mask the real result. Clean up only when docker is
+        # actually present.
+        if shutil.which("docker"):
+            sl.sh(["docker", "rmi", "-f", image], 300)
+
+
+
+def _verifier_weakened(before: dict, after: dict, vkey: str | None) -> str:
+    """Describe how the verifier got weaker, or "" when it did not.
+
+    An evolve is allowed to rewrite the verifier -- that is often the only way to
+    ask for more -- so this cannot compare text. It compares how much the file
+    checks: the count of assertions and test functions. Those can legitimately
+    move a little when checks are merged or restructured, so only a real drop
+    counts, and only in the direction that matters.
+    """
+    if not vkey or vkey not in before or vkey not in after:
+        return ""
+    def strength(text: str) -> tuple[int, int]:
+        return (len(re.findall(r"\bassert\b|\bassertEqual\b|\bassertTrue\b"
+                               r"|\[ +-[a-z] |\bexit 1\b", text)),
+                len(re.findall(r"^\s*def test_|^\s*check_", text, re.M)))
+    a_asserts, a_tests = strength(before[vkey])
+    b_asserts, b_tests = strength(after[vkey])
+    if a_asserts >= 4 and b_asserts < a_asserts * 0.6:
+        return f"checks {a_asserts} -> {b_asserts}"
+    if a_tests >= 2 and b_tests < a_tests:
+        return f"test functions {a_tests} -> {b_tests}"
+    return ""
+
+
+def load_rollouts(path: Path) -> dict:
+    """task_id -> rollout record, from a solve_eval (or training-side) file."""
+    out = {}
+    for line in path.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r.get("task_id") and r.get("status") in (None, "solved", "unsolved"):
+            r["_source"] = path.name
+            out[r["task_id"]] = r
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rollouts", required=True,
+                    help="a solver's rollouts (solve_eval --keep-trace, or the "
+                         "training side's returned trace); one task per line")
+    ap.add_argument("--pool", required=True,
+                    help="directory holding each task's package, by task id")
+    ap.add_argument("--out", default="data/feedback-r1")
+    ap.add_argument("--results", required=True)
+    ap.add_argument("--workers", type=int, default=4)
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(Path(args.results).with_suffix(".log")),
+                  logging.StreamHandler()])
+
+    rollouts = load_rollouts(Path(args.rollouts))
+    done = set()
+    out_path = Path(args.results)
+    if out_path.exists():
+        for line in out_path.read_text().splitlines():
+            if line.strip():
+                done.add(json.loads(line)["task_id"])
+    todo = [tid for tid in rollouts if tid not in done]
+
+    out_root = Path(args.out)
+    out_root.mkdir(parents=True, exist_ok=True)
+    pool = Path(args.pool)
+    log.info("rollouts %d tasks, %d already done, workers=%d",
+             len(todo), len(done), args.workers)
+
+    counts: dict[str, int] = {}
+    actions: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=args.workers) as ex, \
+            open(out_path, "a") as fh:
+        futs = [ex.submit(process_one, rollouts[t], pool / t, out_root)
+                for t in todo]
+        for n, fut in enumerate(as_completed(futs), 1):
+            rec = fut.result()
+            fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+            counts[rec["status"]] = counts.get(rec["status"], 0) + 1
+            actions[rec.get("action", "-")] = actions.get(rec.get("action", "-"), 0) + 1
+            log.info("[%d/%d] %s solved=%s/%s -> %s (%s) | %s",
+                     n, len(todo), rec["task_id"], rec.get("solved"),
+                     rec.get("graded"), rec.get("action", "-"), rec["status"],
+                     counts)
+    log.info("done. status=%s actions=%s", counts, actions)
+
+
+if __name__ == "__main__":
+    main()
