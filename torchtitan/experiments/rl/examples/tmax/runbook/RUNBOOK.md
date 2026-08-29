@@ -6,10 +6,13 @@ Everything here is the configuration that ran on `della-tridao`, copied from the
 run's own dump rather than retyped: paths, versions and numbers are the real
 ones. Where your machine differs (paths, credentials) substitute your own.
 
-**Code version.** Everything below is `andylizf/torchtitan`, branch
-`andy/online-integration`, commit `f7747008d6c63911e40bc5d2b403b6e6246fc47c`.
-That is the exact commit the reference run executed. The branch and `main` point
-at the same commit.
+**Code version.** Everything below is `yichuan-w/torchtitan`, branch
+`yichuan/qwen35-port-cotrain` -- the collaboration's single canonical branch.
+The reference run described here executed commit
+`f7747008d6c63911e40bc5d2b403b6e6246fc47c` (since merged into the canonical
+branch); reproducing on the current branch head gets that run plus later
+stability fixes (orphaned-request aborts, sandbox boot allowance, ephemeral
+TTL), all default-compatible.
 
 **What is in this directory**
 
@@ -82,7 +85,7 @@ export TRL_MODEL=/scratch/gpfs/TRIDAO/al9080/models/Qwen3.5-9B
 export TRL_VENV=/scratch/gpfs/TRIDAO/al9080/titan-rl         # virtualenv
 
 # 1. Code, at the exact commit that ran.
-git clone https://github.com/andylizf/torchtitan "$TRL_TT"
+git clone -b yichuan/qwen35-port-cotrain https://github.com/yichuan-w/torchtitan "$TRL_TT"
 git -C "$TRL_TT" checkout f7747008d6c63911e40bc5d2b403b6e6246fc47c
 
 # 2. Environment. torchtitan is NOT installed -- it goes on PYTHONPATH.
