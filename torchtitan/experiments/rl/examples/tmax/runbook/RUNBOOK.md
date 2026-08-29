@@ -60,7 +60,7 @@ Non-obvious requirements, all verified:
   is bundled"`. Without a key the job boots and then fails every rollout.
 - **Disk for checkpoints.** One 9B checkpoint is **98 GiB** (measured on the
   live run's `step-5`). The reference config keeps 24 of them
-  (`SWE_CKPT_KEEP=24`, saved every 5 steps), which is ~2.3 TiB. The code default
+  (`SWE_CKPT_KEEP=8`, saved every 5 steps), which is ~0.8 TiB. The code default
   is 3. Size the filesystem or lower the number — the failure mode when you run
   out is `OSError: [Errno 122] Disk quota exceeded` partway through a save,
   which also leaves a truncated checkpoint behind.
@@ -499,7 +499,7 @@ default, both are shown.
 | `SWE_INITIAL_ACTIVE_GROUPS` | `64` | computed | cold-start admission. |
 | `SWE_SELECTION_WINDOW_GROUPS` | `64` | unset (take-any) | sliding-prefix batch selection. |
 | `SWE_GPU_MEM_LIMIT` | `0.85` | `0` (keep `0.8`) | vLLM's **total** budget: weights + activations + KV. |
-| `SWE_MAX_NUM_SEQS` | `256` | derived (cap 512) | per-engine decode batch cap. |
+| `SWE_MAX_NUM_SEQS` | `512` | derived (cap 512) | per-engine decode batch cap. |
 | `SWE_GEN_PREFIX_CACHE` | `1` | unset (vLLM's choice) | prefix caching. ~2x prefill on this hybrid, byte-identical outputs in a local smoke. |
 | `SWE_GEN_CUDAGRAPH` | unset | `1` in tmax, `0` in swe_r2e | ~3x GDN decode. Note the families disagree. |
 | `SWE_DISABLE_CUSTOM_ALL_REDUCE` | `1` | unset | falls back to NCCL. |
@@ -508,7 +508,11 @@ default, both are shown.
 | `TMAX_TERMINUS_MAX_TURNS` | `120` | `64` | turn ceiling. |
 | `TMAX_TURN_MAX_TOKENS` | `32768` | `16384` (terminus) | per-turn generation cap. |
 | `SWE_CKPT_INTERVAL` | `5` | `20` | steps between saves. |
-| `SWE_CKPT_KEEP` | `24` | `3` | checkpoints retained. 24 x 98 GiB ~= 2.3 TiB. |
+| `SWE_CKPT_KEEP` | `8` | `3` | checkpoints retained. 8 x 98 GiB ~= 0.8 TiB. |
+| `SWE_LMHEAD_TF32` | `1` | `0` | TF32 tensor cores for the fp32 lm_head matmuls (loss). |
+| `SWE_AC` | `selective` | FullAC | per-op selective activation checkpointing. |
+| `SWE_LOSS_CHUNKS` | `8` | `32` | chunked-loss width; fewer = larger lm_head GEMMs. |
+| `SWE_MAX_NUM_SEQS` | `512` | `256` | vLLM decode slots per engine; engines are host-bound, batch amortizes. |
 | `SWE_VAL_SAMPLES` | `0` | 89 or 32 | `0` disables validation entirely. |
 | `SWE_VAL_INTERVAL` | `20` | `20` | steps between validation passes. |
 | `SWE_NUM_EVAL_GENERATORS` | `0` | `0` | dedicated eval GPUs; `>0` also makes validation async. |
