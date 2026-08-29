@@ -8,7 +8,7 @@ enough. What follows is the record of what it took, because every failure below
 is a trap the next person will otherwise re-discover.
 
 Reference for comparison: the della-tridao run documented in
-`runbook/RUNBOOK.md` (andylizf/torchtitan) and the ops runbook in the private
+`runbook/RUNBOOK.md` (this repo) and the ops runbook in the private
 `andylizf/terminalworld-seeds` repo.
 
 ---
