@@ -305,6 +305,29 @@ def _is_missing_file_error(error: BaseException) -> bool:
     )
 
 
+def _strip_comments_in_continuation(dockerfile: str) -> str:
+    """Drop whole-line comments that sit inside an open line-continuation.
+
+    Docker strips every whole-line comment before it joins backslash
+    continuations, so a comment between two continued lines does not end the
+    join. Callers that flatten continuations textually have to do the same, or
+    the RUN block ends at the comment and its remaining lines each parse as a
+    fresh instruction. Comments outside a continuation are left alone: they are
+    harmless, and the leading block can carry a parser directive.
+    """
+    kept: list[str] = []
+    continued = False
+    for line in dockerfile.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            if not continued:
+                kept.append(line)
+            continue
+        kept.append(line)
+        continued = stripped.endswith("\\")
+    return "".join(kept)
+
+
 _PROXY_ENV_NAMES = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 _proxy_patch_done = False
 
@@ -723,7 +746,15 @@ class DaytonaSandbox:
         # shlex raise "No escaped character", failing provisioning for every sibling in
         # the group. Joining "\"+newline into a space is exactly what Docker does, so
         # the built image is unchanged.
-        flattened = re.sub(r"\\\r?\n[ \t]*", " ", self.dockerfile)
+        # Docker removes whole-line comments BEFORE joining continuations, so a
+        # comment inside a backslash-continued RUN keeps the join alive. This regex does
+        # not, and such a comment ends the join early: every following physical line
+        # of that RUN then parses as its own instruction and the server-side build
+        # fails with "unknown instruction: <first word>" (6 of 667 TerminalWorld
+        # rows, each burning its create retries and landing as reward-0 infra
+        # failures inside a live group). Drop those lines first, matching Docker.
+        source = _strip_comments_in_continuation(self.dockerfile)
+        flattened = re.sub(r"\\\r?\n[ \t]*", " ", source)
         path.write_text(flattened)
         return Image.from_dockerfile(path)
 
