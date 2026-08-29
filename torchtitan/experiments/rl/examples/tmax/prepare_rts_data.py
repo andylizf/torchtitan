@@ -56,6 +56,18 @@ import sys
 
 from torchtitan.experiments.rl.examples.tmax.prepare_tmax_data import _REWARD_PATH
 
+# TerminalWorld/harbor ships a canary comment in instruction.md so a model trained
+# on the corpus can be detected. The dataset card asks consumers to keep it in the
+# build and grading files (which no model sees) and strip it from what the policy
+# actually reads, so it is removed from the instruction here and nowhere else.
+_CANARY_RE = re.compile(r"^.*harbor-canary.*$\n?", re.MULTILINE)
+
+
+def _strip_canary(text: str) -> str:
+    """Drop the harbor canary comment lines from an agent-visible instruction."""
+    return _CANARY_RE.sub("", text)
+
+
 # A COPY/ADD whose source is local needs the task's ``environment/`` shipped with
 # the row; ``--from=`` pulls from another image or stage and needs nothing. Matched
 # against the backslash-JOINED Dockerfile (see ``_join_continuations``), so a
@@ -389,7 +401,7 @@ def _to_row(
         dockerfile = dockerfile.rstrip("\n") + "\n" + _AGENT_RUNTIME_BLOCK
 
     with open(paths["instruction"], encoding="utf-8") as f:
-        instruction = f.read()
+        instruction = _strip_canary(f.read())
     with open(paths["test_sh"], encoding="utf-8") as f:
         test_sh = f.read()
     if not instruction.strip() or not test_sh.strip():

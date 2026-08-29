@@ -190,7 +190,7 @@ def _install_fp32_native_lm_head() -> None:
     torchtitan_wrapper generator reuses it, so both sides are fp32. The
     vllm_native generator instead uses vLLM's own ParallelLMHead, whose matmul
     is bf16 (only the sampler log_softmax upcasts to fp32) -> a per-logit bf16
-    rounding difference vs the trainer. Patch LogitsProcessor._get_logits to
+    rounding difference vs the trainer. Patch LogitsProcessor._apply_head to
     upcast hidden_states + lm_head weight to fp32 before the matmul so the
     native generator's logits match the trainer's fp32 lm_head.
     """
@@ -199,16 +199,30 @@ def _install_fp32_native_lm_head() -> None:
 
     if getattr(LogitsProcessor, "_tt_fp32_lm_head", False):
         return
+    # Patch the matmul alone and leave TP gather, vocab-padding and skip_gather to
+    # vLLM: _get_logits has already gained a parameter once, and re-implementing
+    # its body here made the generator die on the new signature. Older builds
+    # (e.g. the della Aug-7 nightly) predate _apply_head and still take the
+    # 4-arg _get_logits, so fall back to patching that -- raising here would
+    # kill every vllm_native generator on those builds at first forward.
+    if hasattr(LogitsProcessor, "_apply_head"):
 
-    def _fp32_get_logits(self, hidden_states, lm_head, embedding_bias):
-        bias = None if embedding_bias is None else embedding_bias.float()
-        logits = F.linear(hidden_states.float(), lm_head.weight.float(), bias)
-        logits = self._gather_logits(logits)
-        if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
-        return logits
+        def _fp32_apply_head(self, lm_head, hidden_states, embedding_bias):
+            bias = None if embedding_bias is None else embedding_bias.float()
+            return F.linear(hidden_states.float(), lm_head.weight.float(), bias)
 
-    LogitsProcessor._get_logits = _fp32_get_logits
+        LogitsProcessor._apply_head = _fp32_apply_head
+    else:
+
+        def _fp32_get_logits(self, hidden_states, lm_head, embedding_bias):
+            bias = None if embedding_bias is None else embedding_bias.float()
+            logits = F.linear(hidden_states.float(), lm_head.weight.float(), bias)
+            logits = self._gather_logits(logits)
+            if logits is not None:
+                logits = logits[..., : self.org_vocab_size]
+            return logits
+
+        LogitsProcessor._get_logits = _fp32_get_logits
     LogitsProcessor._tt_fp32_lm_head = True
 
 
@@ -1240,6 +1254,16 @@ class VLLMGenerator(Actor, Configurable):
             # SWE_GEN_NATIVE_FP32_LMHEAD=0 to disable for A/B).
             if os.environ.get("SWE_GEN_NATIVE_FP32_LMHEAD", "1") == "1":
                 _install_fp32_native_lm_head()
+            # SWE_GEN_VLLM_ATTENTION pins the backend on the native path too.
+            # vLLM's auto-selection prefers FLASHINFER on Blackwell, whose decode
+            # kernel (trtllm_batch_decode_with_kv_cache) is JIT-compiled on first
+            # use and needs an nvcc that can target the local arch; where there is
+            # none the engine dies mid-generation with "Ninja build failed".
+            _backend_override = os.environ.get("SWE_GEN_VLLM_ATTENTION", "")
+            if _backend_override:
+                engine_kwargs["attention_config"] = AttentionConfig(
+                    backend=AttentionBackendEnum[_backend_override],
+                )
             # vLLM reads config.json + resolves its native model class.
             # Forward our cudagraph config on the native path too. Without this, vLLM
             # defaults to O2 (inductor VLLM_COMPILE + FULL_AND_PIECEWISE); we want the
@@ -1914,7 +1938,11 @@ class VLLMGenerator(Actor, Configurable):
             timing: dict[str, float] = {}
 
             async def _fetch() -> None:
-                _, timing["get_secs"], timing["gib"] = await self._fetch_model_state_dict(
+                (
+                    _,
+                    timing["get_secs"],
+                    timing["gib"],
+                ) = await self._fetch_model_state_dict(
                     version, overlap_safe=False, staged=staged
                 )
 

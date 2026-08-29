@@ -13,6 +13,7 @@ import torch
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
+    list_flash_attention_impls,
 )
 from torch.nn.attention.varlen import AuxRequest
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
@@ -98,6 +99,14 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
             # and re-run register function, so we want to only call it once.
             if current_flash_attention_impl() != "FA3":
                 activate_flash_attention_impl("FA3")
+        elif has_cuda_capability(10, 0) and "FA4" in list_flash_attention_impls():
+            # LOCAL (andy-rl-tb 2026-08-26): on Blackwell (SM 10.x) torch's varlen
+            # already dispatches to FA4, but leaves current_flash_attention_impl()
+            # at None -- so forward() takes the FA2 path and builds cu_seqlens_k,
+            # which FA4 rejects alongside a page_table. Activate it explicitly so
+            # the reported impl matches the kernel actually being dispatched to.
+            if current_flash_attention_impl() != "FA4":
+                activate_flash_attention_impl("FA4")
         else:
             warn_once(
                 logger, "FA3 not available (requires SM 9.0+), falling back to FA2. "
@@ -176,7 +185,19 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
         # LOCAL (terminal-rl 2026-08-08): mirror the installed vLLM FA
         # backend split (v1/attention/backends/flash_attn.py) - K/V are packed
         # along the last dim in this build; older layouts kept for fallback.
-        if kv_cache.ndim >= 2 and kv_cache.shape[0] == 2:
+        #
+        # Probe the packed layout FIRST. vLLM lays the cache out as
+        # [num_blocks, num_kv_heads, block_size, 2 * head_size], so dim 1 IS
+        # num_kv_heads and the shape[1] == 2 probe below claims it whenever a
+        # rank ends up with 2 KV heads (Qwen3-0.6B's 8 KV heads under generator
+        # TP=4, say). unbind(1) then hands varlen_attn a 3D cache and it reads
+        # Hkv off the wrong dim: "Expect number of query heads to be a multiple
+        # of kv heads for GQA but got Hq=4 and Hkv=256".
+        if kv_cache.ndim == 4 and kv_cache.shape[-1] == 2 * self.head_size:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+        elif kv_cache.ndim >= 2 and kv_cache.shape[0] == 2:
             key_cache, value_cache = kv_cache.unbind(0)
         elif kv_cache.ndim >= 2 and kv_cache.shape[1] == 2:
             key_cache, value_cache = kv_cache.unbind(1)
@@ -213,9 +234,9 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
 
-        # FA3 can infer cu_seqlens_k from block_table + seqused_k.
+        # FA3 / FA4 can infer cu_seqlens_k from block_table + seqused_k.
         # FA2 requires cu_seqlens_k to be explicitly set.
-        if current_flash_attention_impl() == "FA3":
+        if current_flash_attention_impl() in ("FA3", "FA4"):
             cu_seqlens_k = None
         else:
             num_seqs = seqused_k.shape[0]

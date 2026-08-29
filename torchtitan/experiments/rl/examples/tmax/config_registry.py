@@ -789,13 +789,14 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                 config.trainer.parallelism, **_dp_overrides
             ),
         )
-    # LOCAL (terminal-rl 2026-08-08): generator VRAM fraction override for
-    # shared boxes where other users hold GPU memory. Default keeps base 0.9.
+    # Generator VRAM fraction override for a shared box where other users hold GPU
+    # memory. Default (0) keeps the base fraction.
     _gml = float(os.environ.get("SWE_GPU_MEM_LIMIT", "0"))
     if _gml:
         config.generator = dataclasses.replace(config.generator, gpu_memory_limit=_gml)
-    # LOCAL (terminal-rl 2026-08-08): generator engine count override (base bakes
-    # DP-8 = 8 TP-1 engines = 8 GPUs; shared box may not have them).
+    # Generator engine-count override. The base bakes DP-8 x TP-1 = 8 engines = 8
+    # GPUs, which leaves nothing for the trainer on a single 8-GPU host; pair this
+    # with SWE_DP_SHARD so the two sum to the GPUs available.
     _gdp = int(os.environ.get("SWE_GEN_DP", "0"))
     if _gdp:
         config.generator = dataclasses.replace(
