@@ -1828,7 +1828,11 @@ class VLLMGenerator(Actor, Configurable):
             timing: dict[str, float] = {}
 
             async def _fetch() -> None:
-                _, timing["get_secs"], timing["gib"] = await self._fetch_model_state_dict(
+                (
+                    _,
+                    timing["get_secs"],
+                    timing["gib"],
+                ) = await self._fetch_model_state_dict(
                     version, overlap_safe=False, staged=staged
                 )
 
