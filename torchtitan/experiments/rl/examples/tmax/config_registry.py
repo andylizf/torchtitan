@@ -836,6 +836,17 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                 ),
             ),
         )
+    # Optional chunked-loss width override (SWE_LOSS_CHUNKS). The base is 32 (per-chunk
+    # fp32 logits ~1 GiB, sized for 80GB cards). Fewer chunks = larger lm_head GEMMs
+    # (better tensor-core efficiency, esp. with SWE_LMHEAD_TF32) and fewer chunk-loop
+    # iterations, at ~32/N GiB of per-chunk logits. Loss math is unchanged: chunking is
+    # along the sequence and CE has no cross-token reduction inside a chunk.
+    _lchunks = int(os.environ.get("SWE_LOSS_CHUNKS", "0"))
+    if _lchunks:
+        config.trainer = dataclasses.replace(
+            config.trainer,
+            loss=dataclasses.replace(config.trainer.loss, num_chunks=_lchunks),
+        )
     # Optional learning-rate override (SWE_LR). Rebuild through the TMax helper so
     # changing lr preserves the open-instruct betas, eps, weight decay, fp32 states,
     # and fused implementation.

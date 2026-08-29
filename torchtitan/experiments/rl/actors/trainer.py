@@ -146,6 +146,22 @@ class PolicyTrainer(Actor, Configurable):
         )
         sl.log_trace_instant("structured_logger_started")
 
+        # SWE_LMHEAD_TF32=1: run the trainer's fp32 matmuls (in practice only the
+        # CastLinear lm_head -- the decoder body is bf16) with TF32 tensor cores.
+        # CastLinear exists to avoid rounding each OUTPUT logit to bf16; TF32 keeps
+        # fp32 accumulation and fp32 outputs and only rounds matmul INPUTS to a
+        # 10-bit mantissa. Measured motive: the chunked DPPO loss runs ~400 TFLOP
+        # of fp32 lm_head fwd+bwd per 65536-token microbatch, which at B300's
+        # non-tensor-core fp32 rate is ~9s of the 24s microbatch. Scoped to the
+        # trainer process; generators are separate actor processes.
+        if os.environ.get("SWE_LMHEAD_TF32", "0") == "1":
+            try:
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+            except (AttributeError, ValueError):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("[trainer] TF32 enabled for fp32 matmuls (SWE_LMHEAD_TF32=1)")
+
         self.config = config
         self.compile_config = compile_config
         self.loss_fn = config.loss.build()
