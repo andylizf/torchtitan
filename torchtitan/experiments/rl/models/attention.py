@@ -185,7 +185,19 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
         # LOCAL (terminal-rl 2026-08-08): mirror the installed vLLM FA
         # backend split (v1/attention/backends/flash_attn.py) - K/V are packed
         # along the last dim in this build; older layouts kept for fallback.
-        if kv_cache.ndim >= 2 and kv_cache.shape[0] == 2:
+        #
+        # Probe the packed layout FIRST. vLLM lays the cache out as
+        # [num_blocks, num_kv_heads, block_size, 2 * head_size], so dim 1 IS
+        # num_kv_heads and the shape[1] == 2 probe below claims it whenever a
+        # rank ends up with 2 KV heads (Qwen3-0.6B's 8 KV heads under generator
+        # TP=4, say). unbind(1) then hands varlen_attn a 3D cache and it reads
+        # Hkv off the wrong dim: "Expect number of query heads to be a multiple
+        # of kv heads for GQA but got Hq=4 and Hkv=256".
+        if kv_cache.ndim == 4 and kv_cache.shape[-1] == 2 * self.head_size:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+        elif kv_cache.ndim >= 2 and kv_cache.shape[0] == 2:
             key_cache, value_cache = kv_cache.unbind(0)
         elif kv_cache.ndim >= 2 and kv_cache.shape[1] == 2:
             key_cache, value_cache = kv_cache.unbind(1)
