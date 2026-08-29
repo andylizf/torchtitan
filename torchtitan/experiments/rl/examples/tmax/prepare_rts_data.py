@@ -458,7 +458,14 @@ def _to_row(
         metadata["daytona_mem_gb"] = daytona_mem_gb
     if daytona_cpu:
         metadata["daytona_cpu"] = daytona_cpu
-    if agent_timeout_sec:
+    # Off by default for TRAINING rows: declared budgets are sized ~3x an
+    # EXPERT's time, and the policy is not an expert -- when 692 backfilled
+    # rows went live on 08-29 (mostly 600-1800s, floored to 900), 75-85% of
+    # rollouts started dying at the budget with few or zero turns (the boot
+    # before: 7108 completed / 30 errors; every boot after: 3-25% completion).
+    # Training rows keep the launcher's SWE_TIME_BUDGET_SEC, exactly as the
+    # rollouter's budget note says; the TB-2.0 eval prep opts in.
+    if agent_timeout_sec and os.environ.get("SWE_EMIT_AGENT_TIMEOUT", "0") == "1":
         metadata["agent_timeout_sec"] = agent_timeout_sec
     entrypoint = _entrypoint_command(dockerfile)
     if entrypoint:
