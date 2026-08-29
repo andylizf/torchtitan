@@ -562,7 +562,14 @@ class RequestDispatcher:
         """
         entry = self._rank0_generation_futures.pop(request_id, None)
         if entry is not None and not entry.future.done():
-            entry.future.cancel()
+            # NOT .cancel(): the generate() endpoint is `await`ing this future
+            # inside the actor, and a CancelledError escaping an endpoint is an
+            # actor-fatal BaseException to monarch ("actor explicitly aborted",
+            # taking every descendant with it -- observed 08-29 16:16, one
+            # settle killed generator 0/3 and all generation with it). None is
+            # generate()'s documented "no completion" return; the caller that
+            # requested the cancel is gone anyway.
+            entry.future.set_result(None)
 
     def rank0_settle_aborted(self, request_id: str) -> bool:
         """RANK 0: settle the future + DP reservation of an engine-aborted request.
@@ -576,7 +583,8 @@ class RequestDispatcher:
         if entry is None:
             return False
         if not entry.future.done():
-            entry.future.cancel()
+            # See rank0_discard_future: .cancel() here is actor-fatal.
+            entry.future.set_result(None)
         if self._rank0_dp_router is not None:
             self._rank0_dp_router.release(request_id)
         return True
