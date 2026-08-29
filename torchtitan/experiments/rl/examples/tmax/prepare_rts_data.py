@@ -403,13 +403,25 @@ def _to_row(
     # cpus / memory_mb in task.toml). Only emitted when it EXCEEDS the fleet
     # defaults (2 vCPU / 4 GiB): absent fields keep the env-default sizing, so
     # rows for ordinary tasks are byte-identical to before.
-    daytona_mem_gb = daytona_cpu = None
+    daytona_mem_gb = daytona_cpu = agent_timeout_sec = None
     toml_path = os.path.join(task_dir, "task.toml")
     if os.path.exists(toml_path):
         try:
             import tomllib
             with open(toml_path, "rb") as f:
-                env = tomllib.load(f).get("environment", {})
+                _toml = tomllib.load(f)
+            env = _toml.get("environment", {})
+            # The task's own agent budget. TerminalWorld declares one for every
+            # task ([agent] timeout_sec: 600s for the short ones, 3600s for the
+            # long), sized at roughly 3x the expert_time_estimate_min it also
+            # carries. Dropping it made every task take the flat
+            # SWE_TIME_BUDGET_SEC, which is 2x the corpus total and lets an agent
+            # burn 40 minutes on a task the benchmark allots 10 -- and a rollout
+            # that runs long also ages its whole group toward the batcher's
+            # staleness drop, since group age is measured from its OLDEST turn.
+            _ts = (_toml.get("agent") or {}).get("timeout_sec")
+            if isinstance(_ts, (int, float)) and _ts > 0:
+                agent_timeout_sec = float(_ts)
             mb = env.get("memory_mb")
             if isinstance(mb, (int, float)) and mb > 4096:
                 daytona_mem_gb = -(-int(mb) // 1024)
@@ -446,6 +458,8 @@ def _to_row(
         metadata["daytona_mem_gb"] = daytona_mem_gb
     if daytona_cpu:
         metadata["daytona_cpu"] = daytona_cpu
+    if agent_timeout_sec:
+        metadata["agent_timeout_sec"] = agent_timeout_sec
     entrypoint = _entrypoint_command(dockerfile)
     if entrypoint:
         metadata["entrypoint"] = entrypoint
