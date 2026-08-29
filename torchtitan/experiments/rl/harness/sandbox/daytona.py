@@ -759,7 +759,9 @@ class DaytonaSandbox:
         if mem > mem_cap:
             logger.warning(
                 "sandbox memory request %d GiB exceeds the per-sandbox cap "
-                "(%d GiB); requesting the cap instead", mem, mem_cap
+                "(%d GiB); requesting the cap instead",
+                mem,
+                mem_cap,
             )
             mem = mem_cap
         disk = (
