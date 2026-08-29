@@ -764,6 +764,22 @@ def rl_grpo_qwen3_5_9b_tmax() -> Controller.Config:
                 config.trainer.parallelism, **_dp_overrides
             ),
         )
+    # Generator VRAM fraction override for a shared box where other users hold GPU
+    # memory. Default (0) keeps the base fraction.
+    _gml = float(os.environ.get("SWE_GPU_MEM_LIMIT", "0"))
+    if _gml:
+        config.generator = dataclasses.replace(config.generator, gpu_memory_limit=_gml)
+    # Generator engine-count override. The base bakes DP-8 x TP-1 = 8 engines = 8
+    # GPUs, which leaves nothing for the trainer on a single 8-GPU host; pair this
+    # with SWE_DP_SHARD so the two sum to the GPUs available.
+    _gdp = int(os.environ.get("SWE_GEN_DP", "0"))
+    if _gdp:
+        config.generator = dataclasses.replace(
+            config.generator,
+            parallelism=dataclasses.replace(
+                config.generator.parallelism, data_parallel_degree=_gdp
+            ),
+        )
     # Optional AC-policy override for a fwd/bwd speed experiment. The base is FullAC
     # (recompute the whole forward -- needed to fit seq 65536). SWE_AC=selective swaps
     # in per-op SAC, which saves the expensive aten op outputs (projections, flash-attn
