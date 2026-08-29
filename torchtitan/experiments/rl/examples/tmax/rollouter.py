@@ -822,6 +822,16 @@ class TMaxRollouter(Rollouter):
         """Whole-rollout wall-clock guard for an agent budget: + verifier + boot."""
         return budget_sec + self._eval_timeout_sec + 300
 
+    # Extra initial guard headroom for the sandbox-creation queue. After a restart
+    # every rollout boots a sandbox at once and the creation queue runs tens of
+    # minutes deep; measured on the 04:05 08-29 boot, 931 of 1008 rollouts burned
+    # their entire guard in that queue and died with turns=0 at secs=2701. The
+    # guard is rescheduled back down to _guard_for(budget) the moment the sandbox
+    # is up, so this allowance never extends a rollout that actually started.
+    _SANDBOX_BOOT_ALLOWANCE_SEC: int = int(
+        os.environ.get("SWE_SANDBOX_BOOT_ALLOWANCE_SEC", "2700")
+    )
+
     def _agent_budget_sec(self, sample: TMaxSample) -> int:
         """Wall-clock budget for this task's agent, in seconds.
 
@@ -1076,7 +1086,9 @@ class TMaxRollouter(Rollouter):
                 routing_session_id=rollout_id,
                 max_context_tokens=self._max_context_tokens,
             )
-            async with asyncio.timeout(self._guard_for(budget_sec)) as rollout_timeout:
+            async with asyncio.timeout(
+                self._guard_for(budget_sec) + self._SANDBOX_BOOT_ALLOWANCE_SEC
+            ) as rollout_timeout:
                 # host_loop drives the sandbox with bash directly; it never runs the
                 # Claude Code CLI, so skip the curl-based install (the tmax task
                 # images have no curl, which would otherwise fail every boot).
@@ -1090,6 +1102,14 @@ class TMaxRollouter(Rollouter):
                     disk_gb=sample.daytona_disk_gb,
                     issue_tracker=issue_tracker,
                 ) as sandbox:
+                    # Sandbox is up: shrink the guard back to the agent's own
+                    # envelope. Boot-queue time must not eat the agent's budget --
+                    # the deadline restarts here, exactly like the agent's own
+                    # deadline (set at agent start in the harness).
+                    rollout_timeout.reschedule(
+                        asyncio.get_running_loop().time()
+                        + self._guard_for(budget_sec)
+                    )
                     # Force every tool command to run as root (tmax tasks touch
                     # system paths); the faithful Vanillux loop dispatches bash here.
                     root_sb = _RootSandbox(sandbox)
