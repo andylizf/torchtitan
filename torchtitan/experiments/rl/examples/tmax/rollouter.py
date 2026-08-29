@@ -378,6 +378,15 @@ def _note_image_without_tmux(sample) -> None:
     non-fatal in the first place. So neither blocks nor guesses here: one cheap
     exec turns "this image has no tmux" into a fact recorded against the task,
     available after one rollout instead of after a whole group has died.
+
+    **This list is a warning, not a verdict, and must not be used to mask the
+    pool.** Terminus usually installs tmux successfully at runtime; an image
+    without it is only fatal when the runtime install ALSO fails, which needs
+    both no package and no compiler. Measured on the first pass: 78 tasks landed
+    here while `infra_quarantine/` -- the list of groups that actually died at
+    zero turns -- held none of them. Filtering on this one would drop 78 healthy
+    tasks. `infra_quarantine/` is the list with a verdict behind it; this one
+    says where to look first when a group does die.
     """
     root = os.environ.get("SWE_TASK_EVOLUTION_DIR", "")
     if not root:
