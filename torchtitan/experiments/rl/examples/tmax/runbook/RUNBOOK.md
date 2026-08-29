@@ -493,7 +493,7 @@ default, both are shown.
 
 | variable | ours | code default | controls |
 |---|---|---|---|
-| `SWE_ROLLOUT_CONCURRENCY` | `3072` | `16` | global cap on live rollouts (and sandboxes). |
+| `SWE_ROLLOUT_CONCURRENCY` | `1536` | `16` | global cap on live rollouts (and sandboxes). |
 | `SWE_NUM_ROLLOUT_WORKERS` | `16` | `8` | rollout worker processes. |
 | `SWE_MAX_ACTIVE_GROUPS` | `512` | `40` | run-ahead group buffer. |
 | `SWE_INITIAL_ACTIVE_GROUPS` | `64` | computed | cold-start admission. |
