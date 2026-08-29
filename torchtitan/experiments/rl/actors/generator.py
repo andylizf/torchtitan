@@ -564,6 +564,23 @@ class RequestDispatcher:
         if entry is not None and not entry.future.done():
             entry.future.cancel()
 
+    def rank0_settle_aborted(self, request_id: str) -> bool:
+        """RANK 0: settle the future + DP reservation of an engine-aborted request.
+
+        An aborted request never comes back through ``process_finished_requests``,
+        so its future and router reservation must be settled here. Whoever pops
+        the future owns the release: if the engine finished the request in the
+        same burst (race), the future is already gone and nothing is done.
+        """
+        entry = self._rank0_generation_futures.pop(request_id, None)
+        if entry is None:
+            return False
+        if not entry.future.done():
+            entry.future.cancel()
+        if self._rank0_dp_router is not None:
+            self._rank0_dp_router.release(request_id)
+        return True
+
     def rank0_route(
         self, requests: list[GenerationRequest]
     ) -> list[list[GenerationRequest]]:
@@ -1308,6 +1325,9 @@ class VLLMGenerator(Actor, Configurable):
 
         # Engine-loop INBOX (rank 0): requests the controller submits; the loop reads them to decide.
         self._queued_generation_requests: list[GenerationRequest] = []
+        # RANK 0: ids cancelled after admission; drained into the next STEP
+        # decision's abort_request_ids broadcast.
+        self._pending_abort_request_ids: list[str] = []
         self._model_state_dict_pull_request: ModelStateDictPullRequest | None = None
         self._close_request: CloseRequest | None = None
 
@@ -1450,6 +1470,11 @@ class VLLMGenerator(Actor, Configurable):
             if dropped:
                 self._queued_generation_requests = kept
                 self._request_dispatcher.rank0_discard_future(request_id)
+            else:
+                # Already admitted into an engine: queue a lockstep abort. The
+                # engine-side abort is what actually frees the decode slot.
+                self._pending_abort_request_ids.append(request_id)
+                self._engine_loop_condition.notify()
         return bool(dropped)
 
     async def _ensure_engine_loop(self) -> None:
@@ -1532,6 +1557,27 @@ class VLLMGenerator(Actor, Configurable):
                     continue
 
                 if decision.action is LoopAction.STEP:
+                    if decision.abort_request_ids:
+                        # Every rank aborts; each engine ignores ids it does not
+                        # hold. Rank 0 also settles the futures + DP-router
+                        # reservations for ids the engine had not yet finished.
+                        try:
+                            self._engine.abort_request(
+                                list(decision.abort_request_ids)
+                            )
+                        except Exception:  # noqa: BLE001 -- abort is best-effort
+                            logger.exception("engine abort_request failed")
+                        if self._rank == 0:
+                            settled = sum(
+                                self._request_dispatcher.rank0_settle_aborted(rid)
+                                for rid in decision.abort_request_ids
+                            )
+                            logger.info(
+                                "[generator] aborted %d orphaned requests "
+                                "(%d still pending futures)",
+                                len(decision.abort_request_ids),
+                                settled,
+                            )
                     # Rank 0 owns all futures, so it stamps the admitted (min) version for the whole decision.
                     # TODO: move under the engine_step call (register at generation_start, not admission).
                     # The way to do it is probably to change to RequestOutputKind.CUMULATIVE and mark per token.
@@ -1644,9 +1690,14 @@ class VLLMGenerator(Actor, Configurable):
                 self._queued_generation_requests,
                 [],
             )
+            aborts, self._pending_abort_request_ids = (
+                self._pending_abort_request_ids,
+                [],
+            )
             return LoopDecision(
                 action=LoopAction.STEP,
                 requests_per_dp_rank=self._request_dispatcher.rank0_route(queued),
+                abort_request_ids=aborts or None,
             )
 
     def _fail_outstanding_futures(self, exc: BaseException) -> None:
@@ -2000,3 +2051,10 @@ class LoopDecision:
 
     pull_version: int | None = None
     # set iff action is PULL_MODEL_STATE_DICT
+
+    abort_request_ids: list[str] | None = None
+    # Requests whose caller gave up (rollout death) that were ALREADY admitted
+    # into the engines. Broadcast so every rank aborts its own engine's copy in
+    # lockstep. An orphaned RUNNING request is not benign: it decodes to its
+    # full max_tokens (32K on this recipe) for nobody, squatting a decode slot
+    # for hours -- measured 08-29, ~500 orphans against 768 slots.
