@@ -1207,6 +1207,16 @@ class VLLMGenerator(Actor, Configurable):
             # SWE_GEN_NATIVE_FP32_LMHEAD=0 to disable for A/B).
             if os.environ.get("SWE_GEN_NATIVE_FP32_LMHEAD", "1") == "1":
                 _install_fp32_native_lm_head()
+            # SWE_GEN_VLLM_ATTENTION pins the backend on the native path too.
+            # vLLM's auto-selection prefers FLASHINFER on Blackwell, whose decode
+            # kernel (trtllm_batch_decode_with_kv_cache) is JIT-compiled on first
+            # use and needs an nvcc that can target the local arch; where there is
+            # none the engine dies mid-generation with "Ninja build failed".
+            _backend_override = os.environ.get("SWE_GEN_VLLM_ATTENTION", "")
+            if _backend_override:
+                engine_kwargs["attention_config"] = AttentionConfig(
+                    backend=AttentionBackendEnum[_backend_override],
+                )
             # vLLM reads config.json + resolves its native model class.
             # Forward our cudagraph config on the native path too. Without this, vLLM
             # defaults to O2 (inductor VLLM_COMPILE + FULL_AND_PIECEWISE); we want the
