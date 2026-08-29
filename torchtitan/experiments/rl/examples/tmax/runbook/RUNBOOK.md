@@ -499,7 +499,7 @@ default, both are shown.
 | `SWE_INITIAL_ACTIVE_GROUPS` | `64` | computed | cold-start admission. |
 | `SWE_SELECTION_WINDOW_GROUPS` | `64` | unset (take-any) | sliding-prefix batch selection. |
 | `SWE_GPU_MEM_LIMIT` | `0.85` | `0` (keep `0.8`) | vLLM's **total** budget: weights + activations + KV. |
-| `SWE_MAX_NUM_SEQS` | `512` | derived (cap 512) | per-engine decode batch cap. |
+| `SWE_MAX_NUM_SEQS` | `256` | derived (cap 512) | per-engine decode batch cap. |
 | `SWE_GEN_PREFIX_CACHE` | `1` | unset (vLLM's choice) | prefix caching. ~2x prefill on this hybrid, byte-identical outputs in a local smoke. |
 | `SWE_GEN_CUDAGRAPH` | unset | `1` in tmax, `0` in swe_r2e | ~3x GDN decode. Note the families disagree. |
 | `SWE_DISABLE_CUSTOM_ALL_REDUCE` | `1` | unset | falls back to NCCL. |
@@ -512,7 +512,9 @@ default, both are shown.
 | `SWE_LMHEAD_TF32` | `1` | `0` | TF32 tensor cores for the fp32 lm_head matmuls (loss). |
 | `SWE_AC` | `selective` | FullAC | per-op selective activation checkpointing. |
 | `SWE_LOSS_CHUNKS` | `8` | `32` | chunked-loss width; fewer = larger lm_head GEMMs. |
-| `SWE_MAX_NUM_SEQS` | `512` | `256` | vLLM decode slots per engine; engines are host-bound, batch amortizes. |
+| `SWE_MAX_NUM_SEQS` | `256` | `256` | decode slots per engine. 512 collapsed the pipeline: per-seq decode halved, turns stopped fitting agent budgets. |
+| `SWE_SANDBOX_BOOT_ALLOWANCE_SEC` | `2700` | `2700` | extra initial rollout-guard headroom for the sandbox boot queue; rescheduled away once the sandbox is up. |
+| `TT_DAYTONA_CREATE_CONCURRENCY` | `128` | `8` | parallel sandbox creates; 32 left a restart's create queue tens of minutes deep. |
 | `SWE_VAL_SAMPLES` | `0` | 89 or 32 | `0` disables validation entirely. |
 | `SWE_VAL_INTERVAL` | `20` | `20` | steps between validation passes. |
 | `SWE_NUM_EVAL_GENERATORS` | `0` | `0` | dedicated eval GPUs; `>0` also makes validation async. |
