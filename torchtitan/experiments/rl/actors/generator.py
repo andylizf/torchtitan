@@ -552,6 +552,18 @@ class RequestDispatcher:
         """
         return bool(self._rank0_generation_futures)
 
+    def rank0_discard_future(self, request_id: str) -> None:
+        """RANK 0: drop the future of a request that will never be admitted.
+
+        Only for requests removed from the queue BEFORE routing: an admitted
+        request's future must stay registered, because
+        ``process_finished_requests`` pops it unconditionally when the engine
+        finishes the request.
+        """
+        entry = self._rank0_generation_futures.pop(request_id, None)
+        if entry is not None and not entry.future.done():
+            entry.future.cancel()
+
     def rank0_route(
         self, requests: list[GenerationRequest]
     ) -> list[list[GenerationRequest]]:
@@ -1410,6 +1422,35 @@ class VLLMGenerator(Actor, Configurable):
 
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         return await generation_future
+
+    @endpoint
+    async def cancel_generation(self, *, request_id: str) -> bool:
+        """Best-effort cancel for a caller that has given up on its request.
+
+        A rollout dying at its budget/guard only cancels the caller's await;
+        the queued ``GenerationRequest`` would still be admitted and generated
+        at full cost for nobody. Measured 08-29: thousands of such orphans
+        queued across the engines (Waiting ~1083/engine against a 1536-rollout
+        cap) starved every live first turn past its budget -- a self-feeding
+        avalanche that no restart knob could stop. This drops the request while
+        it is still QUEUED (where orphans do their damage); one already inside
+        an engine finishes naturally, bounded by max_num_seqs.
+
+        Returns True when a queued request was dropped. Rank 0 owns the queue.
+        """
+        if self._rank != 0:
+            return False
+        async with self._engine_loop_condition:
+            kept = [
+                r
+                for r in self._queued_generation_requests
+                if r.request_id != request_id
+            ]
+            dropped = len(self._queued_generation_requests) - len(kept)
+            if dropped:
+                self._queued_generation_requests = kept
+                self._request_dispatcher.rank0_discard_future(request_id)
+        return bool(dropped)
 
     async def _ensure_engine_loop(self) -> None:
         """Start the single background engine loop on first use (idempotent); runs until `close()`."""
