@@ -1062,6 +1062,10 @@ class TMaxRollouter(Rollouter):
         )
         sandbox: Sandbox | None = None
         rollout_timeout = None
+        # Hoisted out of the try so the completion line can report them whatever
+        # path the rollout takes out of it. Both are pure reads of `sample`.
+        budget_sec = self._agent_budget_sec(sample)
+        started_at = time.monotonic()
         await self._rollout_gate.acquire_sibling((group_id, rollout_idx))
         try:
             # open_session is inside the try so a failure still releases the slot.
@@ -1072,7 +1076,6 @@ class TMaxRollouter(Rollouter):
                 routing_session_id=rollout_id,
                 max_context_tokens=self._max_context_tokens,
             )
-            budget_sec = self._agent_budget_sec(sample)
             async with asyncio.timeout(self._guard_for(budget_sec)) as rollout_timeout:
                 # host_loop drives the sandbox with bash directly; it never runs the
                 # Claude Code CLI, so skip the curl-based install (the tmax task
@@ -1306,13 +1309,22 @@ class TMaxRollouter(Rollouter):
             for turn in turns
             for msg in turn.env_messages
         )
+        # secs/budget are what tells a budget change apart from a no-op. Nothing
+        # else records how long a rollout ran: the trace dump carries turns but no
+        # clock, and only the rollout that overruns its guard leaves a mark
+        # (error_timeout -- 1 of 5,687 in the run this was added from). Without
+        # these two numbers, "how many rollouts run long enough for the budget to
+        # matter" is unanswerable, and the budget gets picked by feel.
         logger.info(
-            "[tmax] %s: status=%s reward=%.2f turns=%d oom_suspect=%d",
+            "[tmax] %s: status=%s reward=%.2f turns=%d oom_suspect=%d "
+            "secs=%.0f budget=%d",
             rollout_id,
             status,
             reward,
             len(turns),
             int(oom_suspect),
+            time.monotonic() - started_at,
+            budget_sec,
         )
         self._maybe_dump_trace(
             rollout_id=rollout_id,
