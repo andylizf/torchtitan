@@ -36,17 +36,24 @@ When running performance tests, use at least 10 training steps (for example,
 
 ### TMax Daytona Capacity
 
-As of 2026-07-21, the Daytona account limits are 5000 vCPU, 20000 GiB memory,
-and 25000 GiB storage. Do not use the older 1500 vCPU / 3000 GiB assumptions
-when sizing TMax runs. The observed live usage when these limits were recorded
-was 568 vCPU, 1136 GiB memory, and 1420 GiB storage; live usage is shared and
-must be checked again before increasing concurrency.
+As of 2026-08-29, the Daytona account limits are 20000 vCPU, 80000 GiB memory,
+and 80000 GiB storage. Do not use the older 5000 vCPU / 20000 GiB / 25000 GiB
+figures (or the 1500 vCPU / 3000 GiB ones before them) when sizing TMax runs --
+both under-count by enough to make storage look like a binding constraint when
+it is not. The account is SHARED: 1024 sandboxes belonging to another run were
+live when these limits were recorded, so check current usage before raising
+concurrency rather than assuming the whole account.
 
-The 9B TMax launcher currently allocates 2 vCPU, 4 GiB memory, and 10 GiB storage
-per Daytona sandbox. Ignoring other jobs, the account-level sandbox ceiling is
-therefore `min(5000/2, 20000/4, 25000/10) = 2500`. For reference,
-`SWE_ROLLOUT_CONCURRENCY=1024` requests 2048 vCPU, 4096 GiB memory, and 10240 GiB
-storage, so it fits the account limits. This does not guarantee a speedup: check
+Per-sandbox resources come from the DATA ROW, not from `TT_DAYTONA_CPU` /
+`TT_DAYTONA_MEM_GB` / `TT_DAYTONA_DISK_GB` -- those apply only where a row
+declares nothing. Measured over the 667-row TerminalWorld mix, the data-weighted
+averages are 1.16 vCPU, 2.61 GiB memory and 10.0 GiB storage per sandbox (474
+rows, 71%, declare 1 vCPU / 2 GiB), so budgeting at the env fallbacks
+over-counts vCPU and memory by roughly 2x. Storage is the tightest axis because
+every row in that corpus declares 10 GiB, which no env value can lower -- but at
+these limits the ceiling is still ~7000 concurrent sandboxes alongside another
+run's 1024. Daytona capacity is therefore not what bounds TMax concurrency;
+the generator side is. This does not guarantee a speedup either way: check
 Daytona failures/rate limits, generator queue and inflight metrics, rollout-worker
 CPU load, and trainer batch-wait time.
 
