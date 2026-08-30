@@ -666,7 +666,10 @@ class GatedDeltaNet(Module):
         return self.out_proj(output)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.inference_core is not None:
             return self._forward_generation(x)
@@ -677,9 +680,20 @@ class GatedDeltaNet(Module):
         # sample; derive cu_seqlens so the conv AND recurrent state reset at each
         # boundary. A single sample yields cu=[0, L] (one segment) so the trainer
         # uses the SAME fla+cu path as the per-request generator (bitwise parity).
-        cu_seqlens = (
-            _cu_seqlens_from_positions(positions) if positions is not None else None
-        )
+        # Prefer the caller-precomputed tensor: deriving here runs torch.nonzero
+        # (a blocking device sync) INSIDE every layer's forward -- and under
+        # activation checkpointing, inside every backward recompute, where a
+        # sync racing FSDP's backward all-gathers deadlocked the trainer
+        # (hang captures 08-29 20:52 and 21:32, both parked in
+        # cudaStreamSynchronize under checkpoint unpack_hook). The top-level
+        # model forward now computes it once, outside any checkpointed region;
+        # recompute then replays with the SAVED tensor and never syncs.
+        if cu_seqlens is None:
+            cu_seqlens = (
+                _cu_seqlens_from_positions(positions)
+                if positions is not None
+                else None
+            )
         # cu_seqlens is kept under TP as well: SP allgathers the sequence at this
         # layer's boundary (in_dst_shardings maps x to Replicate), so the boundaries
         # it names are intact on every rank, and _causal_conv now runs its varlen
@@ -856,6 +870,7 @@ class Qwen35TransformerBlock(Module):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = self.attention_norm(x)
         if self.full_attn:
@@ -863,7 +878,9 @@ class Qwen35TransformerBlock(Module):
         else:
             # GatedDeltaNet needs positions to reset conv/recurrent state at packed
             # sample boundaries (softmax uses attention_masks instead).
-            h = self.attn(h, positions)
+            # cu_seqlens is precomputed once per model forward; see
+            # GatedDeltaNet.forward for why deriving it per layer deadlocks.
+            h = self.attn(h, positions, cu_seqlens)
         # fp32 residual add to match vLLM's fused_add_rms_norm (which upcasts the
         # residual add to fp32); a plain bf16 add here compounds a hidden-state
         # drift over all layers -> a floor on the gen/train logprob mismatch.
@@ -1158,8 +1175,12 @@ class Qwen35Model(Decoder):
         # 3D MRoPE positions for multimodal batches, else 2D text positions.
         rope_positions = mrope_positions if mrope_positions is not None else positions
         assert rope_positions is not None
+        # Packed-row boundaries, ONCE per forward and outside any checkpointed
+        # region. The single unavoidable device sync (torch.nonzero) happens
+        # here; layers and their AC recomputes consume the saved tensor.
+        cu_seqlens = _cu_seqlens_from_positions(rope_positions)
         for layer in self.layers.values():
-            x = layer(x, attention_masks, rope_positions)
+            x = layer(x, attention_masks, rope_positions, cu_seqlens)
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:
