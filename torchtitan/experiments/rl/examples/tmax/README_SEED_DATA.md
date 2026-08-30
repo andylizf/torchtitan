@@ -99,6 +99,16 @@ jsonl `label` and keep the subset you want.
 | `verdict_flipped` | True 54 | flaky (network/timing); drop for stability |
 | `reference_partial` | True 55 | reference is deliberately incomplete (mostly already `fail`) |
 
+The dataset also ships the settled filter as id lists under `metadata/`:
+**`train_ready_ids.txt` (669) is the canonical training subset** -- the
+oracle-passed tasks minus the fragile-build, policy-blocked and
+oversized-memory ids. Prefer joining on it over re-deriving from the columns.
+Clean-for-training means exactly three things: the reference solution passes
+its verifier, the task builds and runs inside the sandbox platform's limits,
+and the metadata reflects the task. Audit flags (instruction text quoting
+verifier literals, reward-hackability) ship as measurements, not filters --
+they do not gate this list.
+
 ### SWE-Smith-Seeds-Clean
 
 | column | values | use |
@@ -109,7 +119,9 @@ jsonl `label` and keep the subset you want.
 | `bug_family` | pr / lm_rewrite / procedural / combine_file / combine_module / lm_modify | pr / lm_rewrite / procedural are the sweet spot; combine_* bundle multiple bugs (all-or-nothing reward, harder); lm_modify (`func_basic`) is often over-specified/easy |
 
 Recommended subsets:
-- TerminalWorld: `reward_verdict == "pass"` -> ~859 tasks.
+- TerminalWorld: `metadata/train_ready_ids.txt` -> 669 tasks (equivalently:
+  `reward_verdict == "pass"` minus the fragile-build, policy-blocked and
+  oversized-memory id lists).
 - SWE-Smith: `in_main_pool and not network_required` -> 1,408 tasks.
 
 ### On instruction sufficiency (SWE-Smith)

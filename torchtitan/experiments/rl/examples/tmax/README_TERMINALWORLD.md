@@ -52,8 +52,12 @@ adapt, and filter by the datasets' own quality columns -- is documented in
 
 3. Filter each JSONL by joining `metadata/tasks.parquet` on `task_id` (see
    `README_SEED_DATA.md` for the exact pandas snippet):
-   - TerminalWorld: keep `reward_verdict == "pass"` (~859 tasks) -- the fail/unknown
-     36% have a reference solution that cannot even earn reward 1.
+   - TerminalWorld: keep the ids in `metadata/train_ready_ids.txt` (669) -- the
+     oracle-passed tasks minus the fragile-build, policy-blocked and
+     oversized-memory lists (see `README_SEED_DATA.md`). `reward_verdict ==
+     "pass"` alone (~859) also keeps tasks whose builds are fragile on the
+     sandbox platform; the fail/unknown 36% have a reference solution that
+     cannot even earn reward 1.
    - SWE-Smith: keep `in_main_pool and not network_required` (~1,408 tasks) -- the
      authors' stratified, repo-balanced pool; the grader runs `--network none`.
 
@@ -74,7 +78,12 @@ DAYTONA_API_KEY=dtn_... python torchtitan/experiments/rl/examples/tmax/local_smo
 
 ## 2. Launch training
 
-The recommended 9B parameter set (the current run). The trainer spans the HSDP-32
+The 9B parameter set of the recorded multi-host run (its results are in section
+6). It is kept exactly as that run used it, so some values below have since
+moved -- the inline notes say which. For the settings the current single-host run uses, see
+[`runbook/RUNBOOK.md`](runbook/RUNBOOK.md) and its `rltrain.env`.
+
+The trainer spans the HSDP-32
 degrees below; each generator is a separate single-GPU vLLM engine (TP-1),
 data-parallel, so more generators means more concurrent decode for the hundreds of
 live agents.
@@ -125,7 +134,8 @@ export MONARCH_SUPERVISION_WATCHDOG_TIMEOUT=1000s  # tolerate slow Daytona ops (
                                       # auto-resumes from the latest checkpoint on failure.
 
 # --- rollout wall-clock + sandbox tuning (recipe defaults; listed for reproducibility) ---
-export SWE_GDN=1                      # GDN (Gated DeltaNet) hybrid model path
+# (SWE_GDN=1 was exported here historically; no code reads it -- it is inert.
+# The recipe itself selects the GDN model path.)
 export SWE_DISABLE_CUSTOM_ALL_REDUCE=1  # required for the GDN generator under vLLM
 export SWE_TIME_BUDGET_SEC=2400       # per-rollout wall-clock budget (40 min)
 export TMAX_EXEC_TIMEOUT_SEC=120      # per-command timeout inside the sandbox
@@ -135,6 +145,12 @@ export TT_DAYTONA_MEM_GB=4
 export TT_DAYTONA_DISK_GB=10
 export TT_DAYTONA_HEARTBEAT_SEC=180   # sandbox keep-alive
 export TT_DAYTONA_CREATE_CONCURRENCY=8  # per-worker create parallelism; lower if the provider 429s
+# NOTE (2026-08-29): the sandbox values above are what this recorded run used.
+# The live run has since moved to a 1 vCPU / 2 GB RAM / 2 GB disk fleet default
+# with per-row daytona_cpu/mem_gb/disk_gb overrides (Daytona hard caps: 4 vCPU /
+# 8 GB / 10 GB per sandbox), TT_DAYTONA_CREATE_CONCURRENCY=128, and
+# SWE_ROLLOUT_CONCURRENCY=1536 (sized against the LLM decode slots). See
+# runbook/RUNBOOK.md.
 
 # --- INLINE Terminal-Bench 2.0 eval (see section 3): scored on a dedicated async eval
 #     generator every SWE_VAL_INTERVAL steps, logged to the training W&B run. The step-0

@@ -70,8 +70,12 @@ filter by the datasets' own quality columns -- is documented in
 
 3. Filter each JSONL by joining `metadata/tasks.parquet` on `task_id` (see
    `README_SEED_DATA.md` for the exact pandas snippet):
-   - TerminalWorld: keep `reward_verdict == "pass"` (~859 tasks) -- the fail/unknown
-     36% have a reference solution that cannot even earn reward 1.
+   - TerminalWorld: keep the ids in `metadata/train_ready_ids.txt` (669) -- the
+     oracle-passed tasks minus the fragile-build, policy-blocked and
+     oversized-memory lists (see `README_SEED_DATA.md`). `reward_verdict ==
+     "pass"` alone (~859) also keeps tasks whose builds are fragile on the
+     sandbox platform; the fail/unknown 36% have a reference solution that
+     cannot even earn reward 1.
    - SWE-Smith: keep `in_main_pool and not network_required` (~1,408 tasks) -- the
      authors' stratified, repo-balanced pool; the grader runs `--network none`.
 
@@ -139,7 +143,8 @@ export SWE_CKPT_INTERVAL=20           # checkpoint every 20 steps. 27B DCP is ~3
                                       # writes ~2.3TB; interval 5 (the 9B default) would be ~10TB.
 
 # --- rollout wall-clock + sandbox tuning (recipe defaults; listed for reproducibility) ---
-export SWE_GDN=1                      # GDN (Gated DeltaNet) hybrid model path
+# (SWE_GDN=1 was exported here historically; no code reads it -- it is inert.
+# The recipe itself selects the GDN model path.)
 export SWE_TIME_BUDGET_SEC=2400       # per-rollout wall-clock budget (40 min)
 export TMAX_EXEC_TIMEOUT_SEC=120      # per-command timeout inside the sandbox
 export SWE_MAX_NUM_SEQS=32            # vLLM engine max concurrent sequences
@@ -148,6 +153,11 @@ export TT_DAYTONA_MEM_GB=4
 export TT_DAYTONA_DISK_GB=10
 export TT_DAYTONA_HEARTBEAT_SEC=180   # sandbox keep-alive
 export TT_DAYTONA_CREATE_CONCURRENCY=8  # per-worker create parallelism; lower if the provider 429s
+# NOTE (2026-08-29): the sandbox values above mirror the recorded 9B run. The
+# live setup has since moved to a 1 vCPU / 2 GB RAM / 2 GB disk fleet default
+# with per-row daytona_cpu/mem_gb/disk_gb overrides (Daytona hard caps: 4 vCPU /
+# 8 GB / 10 GB per sandbox) and TT_DAYTONA_CREATE_CONCURRENCY=128. See
+# runbook/RUNBOOK.md.
 
 # --- INLINE Terminal-Bench 2.0 eval (see section 3): scored on a dedicated async eval
 #     generator every SWE_VAL_INTERVAL steps, logged to the training W&B run. The step-0

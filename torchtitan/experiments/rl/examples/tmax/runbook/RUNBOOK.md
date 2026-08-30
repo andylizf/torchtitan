@@ -121,9 +121,11 @@ Anything exported before the script wins over `rltrain.env`, so a one-off change
 needs no edit: `RL_DATA=/path/other.jsonl ./launch_9b.sh`.
 
 To run it under systemd the way we do, `EnvironmentFile=` the same `rltrain.env`
-and `ExecStart=` the same script. Our unit uses `Restart=on-failure` with
-`RestartSec=30`, so a crash resumes from the latest checkpoint while a clean exit
-at the step limit does not restart.
+and `ExecStart=` the same script. Our unit uses `Restart=always` with
+`RestartSec=30`: a trainer NCCL abort exits with code 0, which `on-failure` read
+as a clean stop and left the service down. With `always` a crash resumes from
+the latest checkpoint, and reaching the step limit restarts too -- stop the unit
+explicitly when a run is meant to end.
 
 ### What the first ten minutes look like
 
@@ -139,6 +141,9 @@ Verified against the reference run's log. These lines appear in this order:
 4. `Building device mesh with parallelism: pp=1, dp_replicate=1, dp_shard=2, cp=1, tp=1, ep=1`
 5. `Applied FullAC activation checkpointing to the model`
 6. `Spawned 16 RolloutWorker(s) (requested 16), concurrency by worker=[192, ...] (global target 3072)`
+   -- that line is from the reference boot; `rltrain.env` has since halved
+   `SWE_ROLLOUT_CONCURRENCY` to 1536 to match the ~768 LLM decode slots, so
+   expect `global target 1536`.
 7. `Optimizer AdamW (model_part=0): 523 params ... {'fused': True, 'lr': 3e-06, ...}`
 8. `Loading HF safetensors from --model.hf_assets_path: <your model dir>`
 9. Trainer: `Finished loading the checkpoint in 54.49 seconds.`
@@ -322,10 +327,16 @@ verified against the loader (`examples/tmax/data.py`) and against the live file:
     "dockerfile": "FROM ubuntu:22.04\n...",   # or "image"
     "build_context": {"WorldCup.csv": "<base64>"},
     "workdir": "/app",
-    "agent_timeout_sec": 900.0,
     "tmax": {"test_sh": "#!/bin/bash\n...", "fixtures": ..., "reward_path": ...},
     "oracle_commands": 11}}
 ```
+
+Training rows carry no `agent_timeout_sec`: the launcher's flat
+`SWE_TIME_BUDGET_SEC=2400` governs the rollout budget. `prepare_rts_data` emits
+a task's declared `[agent] timeout_sec` only under `SWE_EMIT_AGENT_TIMEOUT=1`,
+an eval-only opt-in -- declared budgets are sized for oracle solvers, and a
+backfill of them into training rows killed 75-85% of rollouts for the 9B policy
+before it was reverted.
 
 Hard requirements — the loader raises without them:
 
@@ -376,9 +387,10 @@ Two consequences worth internalising:
 
 Every rollout runs in its own cloud sandbox: **one sandbox per rollout**, never
 reused, never shared across a group, deleted on exit. A group of 16 is 16
-sandboxes. At `SWE_ROLLOUT_CONCURRENCY=3072` that is a lot of sandbox churn, and
-`TT_DAYTONA_CREATE_CONCURRENCY` (32 in the reference config) is what keeps the
-create rate under the platform's throttle.
+sandboxes. At `SWE_ROLLOUT_CONCURRENCY=1536` that is a lot of sandbox churn, and
+`TT_DAYTONA_CREATE_CONCURRENCY` (128 in the reference config; 32 left a
+restart's create queue tens of minutes deep) is what keeps the create rate
+under the platform's throttle.
 
 Credentials: `DAYTONA_API_KEY` is required and hard-checked —
 `RuntimeError("DAYTONA_API_KEY is not set; required for the daytona sandbox
@@ -452,6 +464,16 @@ Memory: `TT_DAYTONA_MEM_GB` (4) is the fallback when a row declares nothing;
 synonyms. The clamp exists because five TerminalWorld tasks declare 16 GiB
 against an 8 GiB platform cap and had burned 704 rollout slots between them.
 
+Sizing has since moved under the run: the live fleet default is now **1 vCPU /
+2 GB RAM / 2 GB disk** per sandbox, with per-row `daytona_cpu` /
+`daytona_mem_gb` / `daytona_disk_gb` overrides for the tasks measured to need
+more. Daytona's hard per-sandbox caps are **4 vCPU / 8 GB RAM / 10 GB disk**
+(daytona.io/docs/en/limits) -- the `TT_DAYTONA_MAX_MEM_GB=8` clamp is that cap,
+not a tunable. A full-corpus disk measurement (real block usage, not apparent
+size -- a sparse `truncate -s 10G` file is not 10 GB of usage) found every task
+in the current mix builds inside the 10 GB cap; an earlier "tier-unrunnable"
+verdict on four tasks was a sparse-file measurement artifact and was retracted.
+
 ---
 
 ## 6. Environment variable reference
@@ -517,12 +539,11 @@ default, both are shown.
 | `SWE_LOSS_CHUNKS` | `8` | `32` | chunked-loss width; fewer = larger lm_head GEMMs. |
 | `SWE_MAX_NUM_SEQS` | `256` | `256` | decode slots per engine. 512 collapsed the pipeline: per-seq decode halved, turns stopped fitting agent budgets. |
 | `SWE_SANDBOX_BOOT_ALLOWANCE_SEC` | `2700` | `2700` | extra initial rollout-guard headroom for the sandbox boot queue; rescheduled away once the sandbox is up. |
-| `TT_DAYTONA_CREATE_CONCURRENCY` | `128` | `8` | parallel sandbox creates; 32 left a restart's create queue tens of minutes deep. |
+| `TT_DAYTONA_CREATE_CONCURRENCY` | `128` | `16` | parallel sandbox creates; 32 left a restart's create queue tens of minutes deep. |
 | `SWE_VAL_SAMPLES` | `0` | 89 or 32 | `0` disables validation entirely. |
 | `SWE_VAL_INTERVAL` | `20` | `20` | steps between validation passes. |
 | `SWE_NUM_EVAL_GENERATORS` | `0` | `0` | dedicated eval GPUs; `>0` also makes validation async. |
 | `SWE_DATA_HOT_RELOAD` | `1` | `0` | re-read the JSONL on mtime change. Required for evolution. |
-| `TT_DAYTONA_CREATE_CONCURRENCY` | `32` | `16` | create-rate semaphore. Raising it trips the throttle. |
 | `TT_DAYTONA_CREATE_RETRIES` | `8` | `5` | create retries. |
 | `TT_DAYTONA_MEM_GB` | `4` | `4` | per-sandbox memory when the row declares none. |
 | `TT_DAYTONA_MAX_MEM_GB` | `8` | `8` | clamp on a row's declared request. |
@@ -732,7 +753,7 @@ admits a gap.
   behaviour described in section 5, this is the most likely source of a silent
   behavioural difference between your run and ours.
 - **Checkpoint resume was not exercised.** `RL_RESUME_DUMP` is wired through the
-  launcher and the systemd unit restarts on failure, but no resume was performed
-  during this work.
+  launcher and the systemd unit restarts automatically, but no resume was
+  performed during this work.
 - **Evolution cost figures are derived from the code paths**, not from a billing
   statement.
